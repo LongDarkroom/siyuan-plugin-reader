@@ -1,0 +1,156 @@
+/* Copyright 2014 Mozilla Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+.textLayer {
+  color-scheme: only light;
+
+  position: absolute;
+  text-align: initial;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 0;
+
+  &.highlighting {
+    touch-action: none;
+  }
+
+  :is(span, br) {
+    color: transparent;
+    position: absolute;
+    white-space: pre;
+    cursor: text;
+    transform-origin: 0% 0%;
+  }
+
+  /* We multiply the font size by --min-font-size, and then scale the text
+   * elements by 1/--min-font-size. This allows us to effectively ignore the
+   * minimum font size enforced by the browser, so that the text layer <span>s
+   * can always match the size of the text in the canvas. */
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+
+  > :not(.markedContent),
+  .markedContent span:not(.markedContent) {
+    z-index: 1;
+
+    --font-height: 0; /* set by text_layer.js */
+    font-size: calc(var(--text-scale-factor) * var(--font-height));
+
+    --scale-x: 1;
+    --rotate: 0deg;
+    transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+      scale(var(--min-font-size-inv));
+  }
+
+  .markedContent {
+    display: contents;
+  }
+
+  span[role="img"] {
+    user-select: none;
+    cursor: default;
+  }
+
+  .highlight {
+    /*REword 改动（2026-10-07）：pdf.js 原默认是
+       `--highlight-selected-bg-color: rgb(0 100 0 / 0.25)` —— **半透明深绿**。
+       用户反馈「鼠标划词有深色透明背景」（PDF 模式下该色随鼠标逐词移动）。
+
+       为什么不能在外面用 CSS 覆盖：
+        - 这段 CSS 由 foliate 的 pdf.js 以**内联 <style>** 写进PDF 页的
+          独立 HTML 文档（pdf.js:555 `const data = \`<html>...<style>${textLayerBuilderCSS}\``），
+          主文档注入的任何样式表都进不去那个 iframe；
+       - 而 `textLayerBuilderCSS` 是 pdf.js 的模块内私有 `let`，无 export，
+          外部无法赋值。
+
+       故只能直接改这里的默认值。改成跟随思源主色（用 color-mix 是安全的：
+       这段 CSS 位于 :root 下，var() 能正常解析到注入的思源变量）。
+       浅色底 40% / 深色底 55%（深底上 40% 几乎不可见）。 */
+    --highlight-bg-color: color-mix(in srgb, var(--b3-theme-primary, #378add) 70%, transparent);
+    --highlight-selected-bg-color: color-mix(in srgb, var(--b3-theme-primary, #378add) 45%, transparent);
+    --highlight-backdrop-filter: none;
+    --highlight-selected-backdrop-filter: none;
+
+    @media screen and (forced-colors: active) {
+      --highlight-bg-color: transparent;
+      --highlight-selected-bg-color: transparent;
+      --highlight-backdrop-filter: var(--hcm-highlight-filter);
+      --highlight-selected-backdrop-filter: var(
+        --hcm-highlight-selected-filter
+      );
+    }
+
+    margin: -1px;
+    padding: 1px;
+    background-color: var(--highlight-bg-color);
+    backdrop-filter: var(--highlight-backdrop-filter);
+    border-radius: 4px;
+
+    &.appended {
+      position: initial;
+    }
+
+    &.begin {
+      border-radius: 4px 0 0 4px;
+    }
+
+    &.end {
+      border-radius: 0 4px 4px 0;
+    }
+
+    &.middle {
+      border-radius: 0;
+    }
+
+    &.selected {
+      background-color: var(--highlight-selected-bg-color);
+      backdrop-filter: var(--highlight-selected-backdrop-filter);
+    }
+  }
+
+  ::selection {
+    /* REword 改动（2026-10-07）：pdf.js 原值是 `AccentColor` 25% 蓝，
+       在浅色纸上偏灰、且与主文档选区色不一致。改为跟随思源主色（同上，
+       无法从外部覆盖的原因见文件上方 .highlight 处的说明）。 */
+    background: color-mix(in srgb, var(--b3-theme-primary, #378add) 45%, transparent);
+  }
+
+  /* Avoids https://github.com/mozilla/pdf.js/issues/13840 in Chrome */
+  /*#if !MOZCENTRAL*/
+  br::selection {
+    background: transparent;
+  }
+  /*#endif*/
+
+  .endOfContent {
+    display: block;
+    position: absolute;
+    inset: 100% 0 0;
+    z-index: 0;
+    cursor: default;
+    user-select: none;
+  }
+
+  &.selecting .endOfContent {
+    top: 0;
+  }
+}

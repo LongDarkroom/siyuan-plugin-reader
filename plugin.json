@@ -1,0 +1,23 @@
+{
+  "name": "siyuan-plugin-reader",
+  "author": "LongDarkroom",
+  "url": "https://github.com/LongDarkroom/siyuan-plugin-reader",
+  "version": "0.1.0",
+  "minAppVersion": "3.7.0",
+  "backends": ["all"],
+  "frontends": ["desktop", "browser-desktop", "mobile", "browser-mobile"],
+  "disabledInPublish": false,
+  "displayName": {
+    "default": "RE Reader",
+    "zh-CN": "RE 阅读器"
+  },
+  "description": {
+    "default": "RE Reader: a standalone EPUB/PDF reader for SiYuan. Shelf, PDF & EPUB rendering, word lookup with offline MDX dictionaries, AI translation, bilingual parallel reading, ink annotations, reading stats and TTS — Readest-style reading experience.",
+    "zh-CN": "RE 阅读器：思源笔记的独立 EPUB/PDF 阅读器。书架管理、PDF 与 EPUB 渲染、离线 MDX 词典划词查词、AI 译文与双语对照、本地墨迹批注、阅读时长统计与朗读（TTS），对标 Readest 阅读体验。批注数据本地独立存储，无需依赖其他插件；与「RE word」主插件配合可获得词库收藏与 AI 精读等增强能力。"
+  },
+  "readme": {
+    "default": "README.md",
+    "zh-CN": "README.md"
+  },
+  "keywords": ["reader", "epub", "pdf", "dictionary", "阅读器", "电子书", "词典", "划词", "双语", "墨迹"]
+}

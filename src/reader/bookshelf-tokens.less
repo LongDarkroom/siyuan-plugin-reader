@@ -1,0 +1,66 @@
+/**
+ * 书架高度层令牌（2026-10-11 · 层次方案 §三 / B0）
+ * ----------------------------------------------------------------
+ * 思源**没有** `--b3-shadow-*` 这一族令牌（实测七套主题都不定义），
+ * 所以自建一组 `--reword-*`，规则只有三条：
+ *
+ *  1. **深浅成对**。深色主题下黑阴影几乎不可见，高度必须靠
+ *     `inset 0 0 0 1px rgba(255,255,255,.06)` 这圈内描边来表达，
+ *     不能只把 alpha 调大了事。
+ *  2. **深色判定用 `:root[data-theme-mode="dark"]`，并兼容挂类的版本**。
+ *     `data-theme-mode` 是思源自己样式用的钩子（实测 `stage/build/app/base.css` 里就写着
+ *     `:root[data-theme-mode=dark]{color-scheme:dark}`），值由 `appearance.mode` / `modeOS`
+ *     决定；仓里已有的先例：`ui/theme-bridge.ts:7-10` 三处一起监听，`ReaderView.svelte:1388`
+ *     读的就是这个属性。另外某些版本会在 html/body 上挂 `theme--dark`（**没有 `b3-` 前缀**），
+ *     所以那一组选择器排在 `:root` 之后，命中谁都能生效。
+ *     ⚠️ 两种常见写法都是错的：
+ *       · `@media (prefers-color-scheme: dark)` 按 **macOS 外观**判定 ——
+ *         OS 深色 + 思源浅色会拿错阴影（书架里原来真有这样一块，B0 已删）。
+ *       · `.b3-theme--dark` 在这个运行时里**根本不存在**：stage 的 JS/CSS 和用户在用的
+ *         五套主题（Neo/Asri/QYL/Savor/Tsundoku）全部零命中。
+ *         `src/index.less` 顶部原来那条 `.b3-theme--dark { --hw-hover-bg }` 就是死规则
+ *         （B0 一并删了：那个令牌同样零消费方，留着只会被照抄）。
+ *  3. **一个元素只属于一层**。组件里不再现写 box-shadow 的 rgba，
+ *     一律 `var(--reword-elev-N)`，否则深浅两套迟早分叉。
+ *
+ * 层号就是令牌号。L0 = 页面底（`--b3-theme-background`）、L1 = 常驻面
+ * （搜索框、侧栏块、卡片文字区）—— 这两层**只靠底色和 1px 边框区分，不该有阴影**，
+ * 所以从 elev-2 起才有令牌。L2 = 悬浮物（封面、浮层按钮、toast、菜单）。
+ * L3 = hover / 聚焦 / 模态（配 `translateY(-2px)` 一起用）。
+ */
+
+:root {
+  --reword-elev-2: 0 1px 2px rgba(0, 0, 0, 0.06), 0 4px 12px rgba(0, 0, 0, 0.1);
+  --reword-elev-3: 0 2px 6px rgba(0, 0, 0, 0.1), 0 12px 28px rgba(0, 0, 0, 0.16);
+
+  /* 无封面书的那块占位渐变、浮层底部那道 scrim：两个都是**图形**，
+     不吃主题令牌，所以得自己配深色，否则深色主题下和界面底色糊成一片。 */
+  --reword-cover-grad: linear-gradient(160deg, #185fa5, #0c447c);
+  --reword-cover-scrim: linear-gradient(
+    to top,
+    rgba(0, 0, 0, 0.55) 0%,
+    rgba(0, 0, 0, 0.22) 45%,
+    transparent 80%
+  );
+}
+
+/* 三个钩子按「谁挂谁」并列：data-theme-mode 在 <html>，某些版本改成在 html/body 挂类。
+   刻意写死 html-/body-级而不是裸 `.theme--dark` —— 第三方主题可能把同名类挂在某个内部
+   容器上，那会让一本书的封面在浅色界面里突然用深色阴影。 */
+:root[data-theme-mode="dark"],
+html.theme--dark,
+body.theme--dark {
+  --reword-elev-2: 0 1px 2px rgba(0, 0, 0, 0.45), 0 4px 14px rgba(0, 0, 0, 0.55),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --reword-elev-3: 0 2px 8px rgba(0, 0, 0, 0.5), 0 12px 28px rgba(0, 0, 0, 0.6),
+    inset 0 0 0 1px rgba(255, 255, 255, 0.1);
+
+  /* 深色下压暗一档：亮蓝占位块是暗色书架里最亮的一块，会抢过内容 */
+  --reword-cover-grad: linear-gradient(160deg, #0c447c, #062f56);
+  --reword-cover-scrim: linear-gradient(
+    to top,
+    rgba(0, 0, 0, 0.7) 0%,
+    rgba(0, 0, 0, 0.35) 45%,
+    transparent 80%
+  );
+}

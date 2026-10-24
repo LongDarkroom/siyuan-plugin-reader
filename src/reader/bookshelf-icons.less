@@ -1,0 +1,90 @@
+/**
+ * 书架图标槽（2026-10-11 · 美化方案 §3.2 P1）
+ * ----------------------------------------------------------------
+ * 为什么是**全局** .less 而不是各组件的 <style>：
+ * 图标是 `{@html SEL_ICONS.xxx}` 注入的，Svelte 不会给注入进来的
+ * `svg / path / rect` 加 scope 类 —— 组件内写 `.x svg{}` 必须靠 `:global()`，
+ * 而这套防御规则要在 BookshelfView / 右键菜单 / OPDS / 图谱四个组件里各抄一遍。
+ * 抄四遍的后果是四个组件对宿主 CSS 的抵抗力不一样，改一个忘三个。
+ *
+ * ⚠️ fill:none / stroke:currentColor 这一组**不是可选的美化**。
+ * 思源宿主与部分主题会直接给 `svg` 或 `svg path` 设 `fill: currentColor`，
+ * CSS 声明优先级高于 SVG  presentation attribute，于是 1.8 笔画的线性图标会被
+ * **填成实心黑块**。这个事故 2026-10-08 在划词工具栏上真实发生过
+ * （见 ReaderView.svelte 里 .reader-sel-ico 那段注释），此处按同一口径逐个子元素声明。
+ *
+ * 命名沿用插件的全局前缀约定（.reword-* = 阅读器通用），避免与宿主/他插件撞名。
+ */
+
+.reword-shelf-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  /* 行内块基线：不写这行，图标会把行高撑高 2~3px，按钮里的文字/图标就错位 */
+  line-height: 0;
+  vertical-align: -0.18em;
+  flex-shrink: 0;
+}
+
+/* 图标紧跟文字时用这一档补间距。
+   为什么不靠宿主的 gap：书架侧栏/分组名这类容器带 `text-overflow: ellipsis`，
+   把它们改成 flex 之后匿名文字项就不再截断（长分组名会撑破侧栏），
+   所以只能保持行内上下文，由图标自己让开 5px。 */
+.reword-shelf-ico--t {
+  margin-inline-end: 5px;
+}
+
+/* 生成物本身写死 16×16，尺寸一律由这里覆写（attribute 优先级低于 CSS） */
+.reword-shelf-ico svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  /* 粗细按**渲染后**算，不是按数字算：stroke-width 走 24 单位 viewBox，
+     实际厚度 = stroke-width × 尺寸 / 24。1.5 在 16px 下只有 1.0px、
+     12px 下 0.75px（真机反馈「太纤细」，2026-10-11）。
+     所以下面每一档配一个数，让 12/14/16px 都落在 ~1.1–1.2px：
+       12px → 2.2 = 1.10px   14px → 2.0 = 1.17px   16px → 1.8 = 1.20px
+       18px → 1.8 = 1.35px   20px → 1.8 = 1.50px   32px → 1.8 = 2.40px
+     （大图标按 Tabler 原生的比例走，不再为小尺寸那套补偿加数）
+     ⚠️ 改这里必须同步改 ReaderView 的 .reader-sel-* / .reader-note-* 两处，
+     同一张生成表在三处渲染，粗细不一致比统一偏细更难看。 */
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* 子元素级 fill 挡不住继承，只能逐个点名（与划词工具栏同一套） */
+.reword-shelf-ico svg path,
+.reword-shelf-ico svg rect,
+.reword-shelf-ico svg circle,
+.reword-shelf-ico svg line,
+.reword-shelf-ico svg polyline,
+.reword-shelf-ico svg polygon {
+  fill: none;
+  stroke: currentColor;
+}
+
+/* ---- 尺寸档 ----（每档的 stroke-width 见上面那张换算表，每档都**自己写一遍**：
+   省略就等于继承基准档，读代码的人看不出这一档是「按表配过」还是「忘了配」。 */
+.reword-shelf-ico--xs svg { width: 12px; height: 12px; stroke-width: 2.2; }   /* 侧栏折叠箭头、角标 */
+.reword-shelf-ico--sm svg { width: 14px; height: 14px; stroke-width: 2.0; }   /* 侧栏标签行、搜索框、chip */
+/* 顶栏/工具栏那颗 26→28px 按钮专用：16px 图标在 28px 的按钮里留白过多，
+   看着像「没对齐」（2026-10-11 真机反馈「图标还是缺点分量」）。
+   ⚠️ 这一档**只加尺寸不加粗细** —— 量感不足的另一半在颜色（见方案 §四），
+   继续加 stroke-width 会让 menu / list-check 这种密集图形糊成一团。 */
+.reword-shelf-ico--btn svg { width: 18px; height: 18px; stroke-width: 1.8; }
+.reword-shelf-ico--lg svg { width: 20px; height: 20px; stroke-width: 1.8; }   /* 列表行操作、菜单项 */
+.reword-shelf-ico--xl svg { width: 32px; height: 32px; stroke-width: 1.8; }   /* 拖拽导入 / 空态大图标 */
+
+/* 收藏实心态：Tabler 没有 star-filled，用同一条 path 加 fill 表达「已收藏」。
+   描边一并转 currentColor，并把粗细收到 1.4 —— 实心之后线宽只体现在
+   **外轮廓**上，1.8 会把星形撑胖一圈（尖角处尤其明显）。 */
+.reword-shelf-ico--fill svg,
+.reword-shelf-ico--fill svg path {
+  fill: currentColor;
+}
+.reword-shelf-ico--fill svg {
+  stroke-width: 1.4;
+}

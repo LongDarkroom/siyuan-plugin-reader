@@ -1,0 +1,39 @@
+{
+  "name": "siyuan-plugin-reader",
+  "version": "0.1.0",
+  "description": "RE Reader - standalone EPUB/PDF reader for SiYuan (split from siyuan-plugin-reword)",
+  "scripts": {
+    "dev": "vite build --watch",
+    "icons": "node scripts/gen-sel-icons.mjs",
+    "icons:check": "node scripts/gen-sel-icons.mjs --check",
+    "prebuild": "npm run icons",
+    "build": "vite build && node scripts/copy-dist.mjs",
+    "check": "tsc --noEmit",
+    "lint": "svelte-check --threshold warning",
+    "verify": "npm run check && npm run lint",
+    "make": "npm run check && npm run build && python scripts/make_release.py",
+    "pretest": "npm run icons:check",
+    "test": "node test/run-all.mjs"
+  },
+  "//scripts": "从主插件沿用：build 不串联 tsc（siyuan 包缺 Constants 类型会让 && 链断在 tsc）。发布经 make 强制过一遍 check。",
+  "//icons": "划词工具栏图标来自思源自带 Tabler Icons（MIT），由 scripts/gen-sel-icons.mjs 在**构建期**抽取内联 —— 运行时插件读不到思源的icons 目录（见该脚本头注释）。prebuild 保证产物与源同步；pretest 用 --check 校验生成物没过期，这样「改了图标忘了重跑」会直接失败而不是静默用旧的。",
+  "//deps": "只保留阅读器实际用到的依赖：js-mdict（MDX 词典解析）+ siyuan。刻意不带 @fullcalendar（日历属主插件）、katex/readability/fflate（AI 精读属主插件）。",
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "^3.1.2",
+    "@tsconfig/svelte": "^4.0.1",
+    "@types/node": "^20.0.0",
+    "jsdom": "^30.0.1",
+    "less": "^4.2.0",
+    "sass": "^1.63.3",
+    "svelte": "^4.2.20",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.4.0",
+    "vite": "^5.4.0"
+  },
+  "dependencies": {
+    "construct-style-sheets-polyfill": "^3.1.0",
+    "fflate": "^0.8.3",
+    "js-mdict": "^7.0.0",
+    "siyuan": "^1.0.0"
+  }
+}
