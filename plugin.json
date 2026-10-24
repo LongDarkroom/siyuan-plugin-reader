@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-reader",
   "author": "LongDarkroom",
   "url": "https://github.com/LongDarkroom/siyuan-plugin-reader",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "3.7.0",
   "backends": ["all"],
   "frontends": ["desktop", "browser-desktop", "mobile", "browser-mobile"],
@@ -19,5 +19,7 @@
     "default": "README.md",
     "zh-CN": "README.md"
   },
+  "icon": "icon.png",
+  "preview": "preview.webp",
   "keywords": ["reader", "epub", "pdf", "dictionary", "阅读器", "电子书", "词典", "划词", "双语", "墨迹"]
 }

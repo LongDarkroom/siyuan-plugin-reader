@@ -24,6 +24,7 @@ INCLUDE_FILES = [
     "index.css",
     "icon.png",
     "preview.png",
+    "preview.webp",   # plugin.json 的 preview 字段指向此文件（全分辨率 WebP，208KB）
     "README.md",
     # [2026-08-29 修复] PDF 支持：PDF.js 的 worker 由 copy-dist.mjs 复制到插件根目录，
     # 运行时按 /plugins/siyuan-plugin-reader/pdf.worker.mjs 加载
@@ -45,6 +46,9 @@ INCLUDE_DIRS = [
     # copy-dist 的产物，反而正常，故该缺陷长期未被发现）。
     "cmaps",
     "standard_fonts",
+    # README.md 内嵌 `![RE 阅读器](assets/RE-Reader-preview.webp)`；
+    # 集市详情页从发布包离线渲染 README，图片缺失会显示破图 → 必须随包。
+    "assets",
 ]
 
 # 一律排除（非发布物 / 体积过大 / 废弃）

@@ -380,6 +380,20 @@ export interface ReaderSettings {
    */
   selToolbarEnabled?: boolean;
   /**
+   * 滚轮翻页（2026-10-24 新增）。
+   *
+   * ## 适用范围
+   * 仅**分页模式**（flow === "paginated"）且**非 PDF**时生效：
+   *   - 连续滚动模式下正文本来就能滚，滚轮归原生滚动管，不抢；
+   *   - PDF 的滚轮已被 ⌘/Ctrl+滚轮缩放占用（见 ReaderView.onContentWheel）。
+   *
+   * ## 为什么默认开
+   * 微信读书 / Readest 桌面端都默认「滚轮翻页」，用户肌肉记忆如此；
+   * 关闭后滚轮在分页模式下无任何反应（分页模式没有原生滚动），
+   * 等于把滚轮变成死键 —— 所以默认开，阈值可调（见 wheel-gesture.ts）。
+   */
+  wheelPageTurn?: boolean;
+  /**
    * 划词工具栏是否显示「搜索」按钮（2026-10-08 新增）。
    *
    * 补的是 Readest 有、我们唯一**真正缺**的划词工具项：
@@ -644,6 +658,8 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
   // 「搜索」按钮默认关（加了会让原本 6 项的横向工具栏变挤）；
   // 导出目标默认剪贴板（= 既有 exportAnnots 的行为）。
   selToolbarEnabled: true,
+  // 2026-10-24：滚轮翻页默认开（分页模式）。连续滚动模式自动不生效（原生滚动优先）。
+  wheelPageTurn: true,
   selSearchEnabled: false,
   exportTarget: "clipboard",
   exportDocId: "",

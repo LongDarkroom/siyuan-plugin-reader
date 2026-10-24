@@ -87,6 +87,14 @@ import { getLogger } from "../core/logger.ts";
   import { ZOOM_PRESETS } from "../reader/bookshelf-store";
   // [2026-09-01] Phase 1:PDF 大纲 / 页码提取(对齐 Obsidian PDF++ outline)
   import { extractPdfCurrentPage } from "../reader/pdf-outline";
+  // 2026-10-24 滚轮翻页：手势判定（纯函数，无 DOM 依赖，可单测）。
+  // 阈值/抑制窗口对齐 Readest 0.12.12 的 wheelGesture.ts，理由见该文件头注释。
+  import { createWheelGestureDetector, type WheelGestureDetector } from "./wheel-gesture.ts";
+  // 2026-10-24 统一翻页入口：逻辑方向（滚轮用）/ 物理方向（方向键用）单一真源，
+  // 避免 RTL 书里各处方向判断分叉。详见 page-turn.ts 头注释。
+  import { turnPage } from "./page-turn.ts";
+  // 2026-10-24 跨页选区续接：可见区求交（工具栏/手柄锚点）+ 页边带判定（拖手柄自动翻页）。
+  import { visibleRect, visibleRects, inPageMarginBand, type Rect4 } from "./sel-continuation.ts";
   import {
     READER_DEFAULT_SETTINGS,
     READER_FONT_SIZE_MIN,
@@ -204,6 +212,7 @@ import { getLogger } from "../core/logger.ts";
     normalizeAnnotationStyle,
     normalizeAnnotationColor,
     isPureHighlight,
+    annotationCfis,
     type AnnotationStyle,
     type AnnotationType,
   } from "../annotation/annotation-store.ts";
@@ -1860,7 +1869,9 @@ function applyTopHandleHitHeight() {
     // document.fonts.ready 可能迟迟不触发，导致首次排版仍按书内原样式（段落左缘不齐），
     // 直到窗口缩放 / 打开 DevTools 触发 ResizeObserver→expand 才对齐。
     // 这里直接调用公开的 Paginator.render() 强制重排，不依赖字体就绪。render() 内部
-    // 自带 #views 空值守卫，open 过早时安全空转；用 rAF 等 <style> 文本被解析后再重排。
+    // 自带 #views 空值守卫，open 过早时安全空转；用 rAF 等 style 标签文本被解析后再重排。
+    // ⚠️ 注释里别写原始的 style/script 标签字面量：svelte-check 的 HTML 预扫描会把它们
+    //    当成真标签，误吞脚本结束标签，报「script must have a closing tag」。
     const forceRelayout = () => {
       try {
         const r = view?.renderer as any;
@@ -2047,6 +2058,8 @@ function applyTopHandleHitHeight() {
         }
       } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · applyFlow", "debug"); }
     }
+    // 2026-10-24：滚轮翻页只在分页模式挂监听 ⇒ 模式切换后要重新同步。
+    syncWheelTurnMount();
   }
 
   /**
@@ -2921,6 +2934,8 @@ function applyTopHandleHitHeight() {
       attachAllContentDocs();
       attachTimer1 = setTimeout(attachAllContentDocs, 400);
       attachTimer2 = setTimeout(attachAllContentDocs, 1200);
+      // 2026-10-24：滚轮翻页监听（分页模式才挂；连续滚动模式保持原生滚动的合成器优化）
+      syncWheelTurnMount();
       // 2026-09-01 修复：开书时主动拉一次「本书摘录」数据,这样首点抽屉就有内容
       // 之前完全依赖「删除时刷新」,导致新建/编辑的标注永远不进列表
       refreshAnnotsList();
@@ -4923,6 +4938,100 @@ function applyTopHandleHitHeight() {
     stageWheelBound = true;
   }
 
+  /* ------------------------------------------------------------------ *
+   * 滚轮翻页（2026-10-24）
+   * ------------------------------------------------------------------ *
+   * 口径（对齐微信读书 / Readest）：
+   *  - 只在**分页模式**生效；连续滚动模式正文本来就能滚，滚轮归原生滚动管。
+   *  - 方向用**逻辑方向**（下一段），与书写方向无关 —— RTL 书里滚轮向下仍是"下一页"。
+   *  - 阈值 30px + 200ms 空闲重置：一次滑动只翻一页，惯性尾巴不连翻。
+   *
+   * 为什么要单独一套挂载逻辑（而不是直接在 onStageWheel 里判）：
+   *  ① passive:false 的 wheel 监听会让浏览器放弃滚轮滚动的合成器优化
+   *     （滚动必须等主线程），是实打实的卡顿源。所以**只在真的要用时才挂**，
+   *     连续滚动模式一律不挂 —— 与 PDF 缩放监听同一条纪律。
+   *  ② wheel 事件不跨 iframe 边界 —— 页面本体（iframe 内）必须单独往内容文档挂一份。
+   */
+  const WHEEL_TURN_OPTS: AddEventListenerOptions = { capture: true, passive: false };
+  /** 已挂滚轮翻页监听的内容文档 */
+  const wheelTurnDocs = new Set<Document>();
+  /** 阶段（页面四周留白）监听是否已挂 */
+  let wheelTurnStageBound = false;
+
+  function getWheelDetector(): WheelGestureDetector {
+    if (!wheelDetector) wheelDetector = createWheelGestureDetector();
+    return wheelDetector;
+  }
+
+  /** 滚轮翻页当前是否可用 */
+  function wheelTurnEnabled(): boolean {
+    if (!view) return false;
+    if (isPdfBook()) return false;                  // PDF 有自己的 ⌘+滚轮缩放，不抢
+    if (settings.flow !== "paginated") return false; // 连续滚动模式交给原生滚动
+    if (settings.wheelPageTurn === false) return false;
+    return true;
+  }
+
+  /** 滚轮翻页统一入口（阶段留白 + 页面本体都走这里） */
+  function onReaderWheel(e: WheelEvent): void {
+    if (!wheelTurnEnabled()) return;
+    const dir = getWheelDetector().feed({
+      deltaX: e.deltaX,
+      deltaY: e.deltaY,
+      timeStamp: e.timeStamp,
+      deltaMode: e.deltaMode,
+    });
+    if (!dir) return;
+    // 自己接管 ⇒ 阻止原生滚动/缩放，并止住冒泡（冒到思源宿主会被宿主的滚轮逻辑二次响应）。
+    e.preventDefault();
+    e.stopPropagation();
+    turnPage(view, dir === "next" ? "next" : "prev");
+  }
+
+  function bindWheelTurnOnDoc(doc: Document) {
+    if (wheelTurnDocs.has(doc)) return;
+    wheelTurnDocs.add(doc);
+    doc.addEventListener("wheel", onReaderWheel as EventListener, WHEEL_TURN_OPTS);
+  }
+
+  function unbindWheelTurnOnDoc(doc: Document) {
+    if (!wheelTurnDocs.has(doc)) return;
+    wheelTurnDocs.delete(doc);
+    doc.removeEventListener("wheel", onReaderWheel as EventListener, WHEEL_TURN_OPTS);
+  }
+
+  function unbindWheelTurnDocs() {
+    for (const doc of Array.from(wheelTurnDocs)) unbindWheelTurnOnDoc(doc);
+  }
+
+  function bindWheelTurnStage() {
+    if (wheelTurnStageBound || !readerViewEl) return;
+    readerViewEl.addEventListener("wheel", onReaderWheel as EventListener, WHEEL_TURN_OPTS);
+    wheelTurnStageBound = true;
+  }
+
+  function unbindWheelTurnStage() {
+    if (!wheelTurnStageBound || !readerViewEl) return;
+    readerViewEl.removeEventListener("wheel", onReaderWheel as EventListener, WHEEL_TURN_OPTS);
+    wheelTurnStageBound = false;
+  }
+
+  /**
+   * 按当前模式挂/卸滚轮翻页监听。
+   * 开关条件：分页模式 + 非 PDF + 用户没关。
+   */
+  function syncWheelTurnMount(): void {
+    if (wheelTurnEnabled()) {
+      bindWheelTurnStage();
+      for (const doc of attachedDocs) bindWheelTurnOnDoc(doc);
+    } else {
+      unbindWheelTurnStage();
+      unbindWheelTurnDocs();
+      // 关掉时清零累积量：否则重新打开时残留的 delta 会立刻翻一页。
+      wheelDetector?.reset();
+    }
+  }
+
   // 2026-08-29 Phase 1：双指捏合缩放——实时改字号（不立即持久化，松手即落盘由 store 自行处理）
   function setFontSizeLive(n: number) {
     const clamped = Math.min(36, Math.max(10, Math.round(n)));
@@ -5635,6 +5744,12 @@ function applyTopHandleHitHeight() {
       if (path === "selToolbarEnabled" && value === false) selToolbar.visible = false;
       return;
     }
+    if (path === "wheelPageTurn") {
+      settings = settingsStore.update({ wheelPageTurn: value !== false });
+      // 开关直接决定 passive:false 的 wheel 监听挂不挂 ⇒ 必须重新同步。
+      syncWheelTurnMount();
+      return;
+    }
     if (path === "exportTarget") {
       settings = settingsStore.update({ exportTarget: value === "doc" ? "doc" : "clipboard" });
       return;
@@ -6239,7 +6354,11 @@ function applyTopHandleHitHeight() {
   // 此标志告诉选区路径"本次点击已由 show-annotation 接管，不要弹创建工具栏"。
   let suppressNextCreateToolbar = false;
   // 当前选区的锚点信息（Phase 2 高亮 / 批注 / 导出思源将复用）
-  let selInfo: { index: number; cfi: string | null; range: Range | null; pdfRects?: PdfRect[] | null } | null = null;
+  // segments：跨 section 续接时的分段（每段一个 CFI）；同 section 跨页时为空（一个 CFI 即可覆盖）
+  let selInfo: {
+    index: number; cfi: string | null; range: Range | null;
+    pdfRects?: PdfRect[] | null; segments?: { index: number; cfi: string }[];
+  } | null = null;
   // 当前选区矩形（已换算到主文档坐标），供批注编辑器/查看气泡定位使用
   let lastSelRect: SelRect | null = null;
   // ===== 2026-10-14 P1：选区两端「定位标识」手柄 =====
@@ -6250,6 +6369,43 @@ function applyTopHandleHitHeight() {
     { visible: false, start: { x: 0, y: 0, h: 0 }, end: { x: 0, y: 0, h: 0 } };
   // 拖拽中标志：抑制 iframe/父文档选区路径（scheduleReadSelection）干扰，并驱动手柄 active 样式。
   let selHandleDragging: null | "start" | "end" = null;
+  // ===== 2026-10-24 跨页标注续接 =====
+  // 拖手柄时指针越过可见页边 ⇒ 自动翻到下一页并把选区续过去（对齐 Word / 微信读书）。
+  //
+  // ## 为什么选区能"续"
+  // foliate 分页是**一个 section 一个 iframe + CSS 多列**：iframe 元素被撑成整个 section 的
+  // 宽度（paginator.js expand() 的 expandedSize），列在 iframe 内部横向流动。
+  // ⇒ 同一个 section 内，跨页的文本在 DOM 上是**连续的一段**，
+  //   一个 DOM Range 就能跨过列断 ⇒ 一个 CFI 覆盖整段跨页选区。
+  //
+  // ## 跨 section 不行
+  // 不同 section 是不同 iframe / 不同 Document，Range 无法跨文档 ⇒ 只能按段存
+  // （AnnotationItem.segments），逐段画。
+  //
+  // ## 续接有效期（时间戳）
+  // 翻页是异步的（foliate 内部有动画 + 100ms 等待），relocate 事件会**晚于**翻页请求到达。
+  // 故用「有效期」而非布尔量：翻页后一段时间内 relocate 走「重锚」分支而不是「收起」分支。
+  let selContinuationUntil = 0;
+  /** 探不到「文字列边界」时的兜底内缩（px）：从窗口边往里让这么多当页边带内沿 */
+  const EDGE_TURN_ZONE = 36;
+  /** 页边带容差（px）：手柄本就画在文字末端上，不给容差会「看得见却进不去」 */
+  const EDGE_TURN_TOL = 4;
+  /** 方向性位移门槛（px）：往目标方向**累计**拖过这么多才算「用户想跨页」，
+   *  用累计极值而不是净位移 —— 原地小幅抖动不算，拖出去再抖回来仍算。 */
+  const EDGE_TURN_MIN_MOVE = 12;
+  /** 带内驻留（ms）：Readest 同款防误翻（armDwell）。掠过页边不停 ⇒ 不翻页。 */
+  const EDGE_TURN_DWELL_MS = 350;
+  /** 重进带的最小间隔（ms）：配合 engagement 锁存，防止离开带又立刻擦回来连翻 */
+  const EDGE_TURN_REARM_MS = 200;
+  // ★ 连翻不再用「冷却时间」控制：engagement 锁存（一次按住只翻一页，
+  //   必须把手柄**拉出页边带再拖回来**才允许翻下一页）。锁存位是拖拽闭包内的局部量。
+  //   2026-10-24 定稿依据：Readest 0.12.12 useReader.ts 的 didAutoTurnThisGesture 锁存。
+  /** 页边驻留提示（拖手柄进带后、翻页前出现的方向提示，Readest turnHint 同款） */
+  let selEdgeHint: { visible: boolean; x: number; y: number; dir: "prev" | "next" } = { visible: false, x: 0, y: 0, dir: "next" };
+  /** 翻页后要把按住的指针点回放一次（选区自动延伸进新页）；由 onRelocate 消费一次，松手即作废 */
+  let selDragReplay: (() => void) | null = null;
+  // 2026-10-24 滚轮翻页：手势判定器（懒建，切书/换模式时 reset）
+  let wheelDetector: WheelGestureDetector | null = null;
   // 实时手柄刷新的 rAF 节流句柄（selectionchange 高频触发，一帧最多算一次）。
   let selHandleLiveRaf = 0;
   // 鼠标/触控正在按住拖选中（pointerdown→up 之间）。滚动收起手柄时据此避让：
@@ -6556,6 +6712,9 @@ function applyTopHandleHitHeight() {
     if (isPdfBook()) {
       trackDocListener(doc, "wheel", onContentWheel as EventListener, { capture: true, passive: false });
     }
+    // 2026-10-24：滚轮翻页（仅分页模式）。wheel 事件不跨 iframe 边界，
+    // 页面本体必须在内容文档上单独挂一份；连续滚动模式不挂（保住合成器滚动优化）。
+    if (wheelTurnEnabled()) bindWheelTurnOnDoc(doc);
     // 翻页/分区点击等交互监听（仅注入一次，guard 由 attachedDocs 保证，避免重复绑定导致翻两页）
     injectPageTurn(doc);
     // 2026-08-27 晚（P2.2）：新文档就绪时按当前专注模式状态应用高亮 class
@@ -6573,6 +6732,8 @@ function applyTopHandleHitHeight() {
 
   /** 卸载所有内容文档上的监听（与 attachContentDoc 对称），反复进出阅读 Tab 不泄漏 */
   function detachAllContentDocs() {
+    // 2026-10-24：滚轮翻页监听不走 docCleanups（挂/卸时机与模式相关），单独回收。
+    unbindWheelTurnDocs();
     for (const doc of attachedDocs) {
       const arr = docCleanups.get(doc);
       if (arr) {
@@ -6592,6 +6753,115 @@ function applyTopHandleHitHeight() {
     contents.forEach((c: any) => {
       try { attachContentDoc(c.doc); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · attachAllContentDocs", "debug"); }
     });
+  }
+
+  /**
+   * 取 foliate 的可见容器元素（分页模式下它是 overflow:hidden 的裁剪窗口）。
+   *
+   * 层级：view-light.js 里 `reword-foliate-view` 持有自己的 shadow root，
+   * 渲染器 `reword-foliate-paginator` 挂在其 shadow root 里，**再**有自己的 shadow root，
+   * `#container` 在最里层（paginator.js:1527 `this.#root.getElementById('container')`）。
+   */
+  function getFoliateContainerEl(): HTMLElement | null {
+    const renderer: any = (view as any)?.renderer;
+    if (!renderer) return null;
+    try {
+      const root = renderer.shadowRoot ?? renderer;
+      return (root?.querySelector?.("#container") as HTMLElement | null) ?? null;
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · getFoliateContainerEl", "debug");
+      return null;
+    }
+  }
+
+  /**
+   * 当前可见窗口（**iframe 局部坐标**）。
+   *
+   * ## 为什么需要它
+   * 分页模式下 iframe 元素被撑成**整个 section 的宽度**（多列横向排布），
+   * 真正可见的只有被 `#container`（overflow:hidden）裁出来的那一「页」。
+   * ⇒ 选区矩形、指针位置都必须换算到「可见窗口」这个坐标系里比较，
+   *   否则会出现「工具栏飘到右页、选区却在左页」这类错位。
+   *
+   * @param frame 内容 iframe 元素；缺省时用可见容器本身（无 iframe 语境时的兜底）
+   * @returns 局部坐标下的可见窗口；取不到时返回 null（调用方须回退到旧行为）
+   */
+  function getVisibleWindowLocal(frame?: HTMLElement | null): Rect4 | null {
+    const containerEl = getFoliateContainerEl();
+    let fr: DOMRect | null = null;
+    try { fr = frame?.getBoundingClientRect?.() ?? null; } catch { fr = null; }
+    // 基准矩形：优先 foliate 的可见容器（分页模式的裁剪窗口），退到 .reader-stage
+    let base: DOMRect | null = null;
+    try {
+      base = containerEl?.getBoundingClientRect?.() ?? null;
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · getVisibleWindowLocal container", "debug");
+      base = null;
+    }
+    if (!base) {
+      try { base = readerStageEl?.getBoundingClientRect?.() ?? null; } catch { base = null; }
+    }
+    if (!base) return null;
+    // 与内容 iframe 求交：iframe 在分页模式下被撑成整个 section 的宽度，
+    // 不裁的话「可见窗口」会等于整节，判定全部失真。
+    const left = fr ? Math.max(base.left, fr.left) : base.left;
+    const right = fr ? Math.min(base.right, fr.right) : base.right;
+    const top = fr ? Math.max(base.top, fr.top) : base.top;
+    const bottom = fr ? Math.min(base.bottom, fr.bottom) : base.bottom;
+    if (right <= left || bottom <= top) return null;
+    // 视口坐标 → iframe 局部坐标
+    const ox = fr ? fr.left : 0;
+    const oy = fr ? fr.top : 0;
+    return { left: left - ox, top: top - oy, right: right - ox, bottom: bottom - oy };
+  }
+
+  /**
+   * 找某个内容文档对应的 foliate 分节索引（跨页续接翻到下一节时要用）。
+   * 找不到返回 -1。
+   */
+  function findContentIndex(doc: Document | null | undefined): number {
+    if (!doc || !view?.renderer || typeof view.renderer.getContents !== "function") return -1;
+    let contents: any[] = [];
+    try { contents = view.renderer.getContents() || []; } catch { return -1; }
+    for (const c of contents) {
+      if (c?.doc === doc) return typeof c.index === "number" ? c.index : -1;
+    }
+    return -1;
+  }
+
+  /**
+   * 找指针当前落在哪个内容文档上（跨 section 续接的交接判定）。
+   *
+   * ## 为什么不能用 elementFromPoint
+   * 内容 iframe 埋在**两层 shadow DOM** 里（view-light 的 #root → paginator 的 #root），
+   * 主文档的 elementFromPoint 只会命中最外层的宿主元素，拿不到内层 iframe。
+   *
+   * ## 为什么要额外判「可见窗口」
+   * 分页模式下 iframe 元素被撑成**整个 section 的宽度**，它的 rect 覆盖了很宽的范围，
+   * 但真正可见的只有被 #container 裁出来的那一页。
+   * 直接用 rect 判会误判成"指针在 section 2 上"，实际它可能在 section 1 的第 3 页。
+   */
+  function findDocUnderPointer(clientX: number, clientY: number): { doc: Document; index: number; frame: HTMLElement } | null {
+    if (!view?.renderer || typeof view.renderer.getContents !== "function") return null;
+    let contents: any[] = [];
+    try { contents = view.renderer.getContents() || []; } catch { return null; }
+    for (const c of contents) {
+      const d: Document | undefined = c?.doc;
+      if (!d) continue;
+      const f = (d.defaultView as any)?.frameElement as HTMLElement | null;
+      if (!f) continue;
+      let r: DOMRect | null = null;
+      try { r = f.getBoundingClientRect(); } catch { r = null; }
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+      if (clientX < r.left || clientX > r.right || clientY < r.top || clientY > r.bottom) continue;
+      const vis = getVisibleWindowLocal(f);
+      if (vis) {
+        const lx = clientX - r.left, ly = clientY - r.top;
+        if (lx < vis.left || lx > vis.right || ly < vis.top || ly > vis.bottom) continue;
+      }
+      return { doc: d, index: typeof c.index === "number" ? c.index : -1, frame: f };
+    }
+    return null;
   }
 
   // 从 foliate 内容文档中读取当前选区；返回 null 表示无有效选区
@@ -6622,6 +6892,32 @@ function applyTopHandleHitHeight() {
         fr = frame.getBoundingClientRect();
         left += fr.left; top += fr.top; right += fr.left; bottom += fr.top;
       }
+      // ===== 2026-10-24 D1：可见性判定 + 锚点改用「可见部分」 =====
+      //
+      // 根因（用户截图「工具栏翻页之后定位不准」）：翻页后选区已经不在可视区里，
+      // 但划词工具栏的坐标是**创建时一次性写死**的（absolute 定位于 .reader-floating-layer），
+      // 于是它「留在原地」——看上去像飘到了右页，实际是**过期锚点**，不是坐标公式算错。
+      //
+      // 修法两条：
+      //  ① 选区完全不可见 ⇒ 本 doc 不算有效选区（continue 下一个 doc；
+      //     都没有则返回 null）⇒ 工具栏按「无有效选区」收起，不再留残影；
+      //  ② 选区跨页（横跨两列）⇒ 锚点改用**可见部分**的并集。
+      //     否则包围盒横跨两页中间的空白，工具栏会落在空白里（跨页续接的新场景）。
+      //
+      // ⚠️ PDF 不走这条路径：PDF 走 fixed-layout + 自建覆盖层，坐标系另成一套，
+      //    贸然按 foliate 容器裁剪会把 PDF 的划词工具栏一起弄坏。
+      let anchorLeft = left, anchorTop = top, anchorRight = right, anchorBottom = bottom;
+      if (!isPdfBook()) {
+        const visLocal = getVisibleWindowLocal(frame);
+        if (visLocal) {
+          const vis = visibleRect(rects as unknown as ArrayLike<Rect4>, visLocal);
+          if (!vis) continue; // 选区已滚出可视区
+          anchorLeft = vis.left + (fr?.left ?? 0);
+          anchorRight = vis.right + (fr?.left ?? 0);
+          anchorTop = vis.top + (fr?.top ?? 0);
+          anchorBottom = vis.bottom + (fr?.top ?? 0);
+        }
+      }
       // 2026-09-04 P1：PDF 文本标注归一化矩形（相对当前页 textLayer，0-1），供自建覆盖层重绘
       // 2026-09-08 修复基准：此前用 frame（iframe 框）做基准，但选区 rect 与重绘端参照系
       // 不一致导致高亮整体错位、滚动/缩放后"跑丢"。改为与重绘端（PdfTextHlLayer）统一
@@ -6651,7 +6947,7 @@ function applyTopHandleHitHeight() {
           cfi = view.getCFI(c.index, range);
         }
       } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · try { if (typeof c.index === \"number\" && typeof view.getCFI ===…", "debug"); }
-      return { text, rect: { left, top, right, bottom }, index: c.index, cfi, range, pdfRects };
+      return { text, rect: { left: anchorLeft, top: anchorTop, right: anchorRight, bottom: anchorBottom }, index: c.index, cfi, range, pdfRects };
     }
     return null;
   }
@@ -6859,17 +7155,120 @@ function applyTopHandleHitHeight() {
     let rects: DOMRect[];
     try { rects = Array.from(range.getClientRects()); } catch { return null; }
     if (!rects.length) return null;
-    const first = rects[0];
-    const last = rects[rects.length - 1];
     let fx = 0, fy = 0;
+    let frame: HTMLElement | null = null;
     try {
       const win = range.startContainer?.ownerDocument?.defaultView as (Window & { frameElement?: HTMLElement | null }) | null;
-      const frame = win?.frameElement ?? null;
+      frame = win?.frameElement ?? null;
       if (frame) { const fr = frame.getBoundingClientRect(); fx = fr.left; fy = fr.top; }
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · computeHandlePoints frameOffset", "debug"); }
-    const s = toContainerCoords(first.left + fx, first.top + fy);
-    const en = toContainerCoords(last.right + fx, last.bottom + fy);
+    // ★ 2026-10-24 B1 返工（一）：只用**当前可见页上的片段**的首/末。
+    //   跨页选区在 DOM 上是连续一段，rects[0] / rects[n-1] 可能落在已被推走的那一列，
+    //   Y 跟着对不上文字 ⇒ 「手柄飘在页边、高度不在行上」。
+    //   选区整段都不在可见页 ⇒ 不画手柄（夹 Y 会把窗口外的行拉回边框，制造假手柄）。
+    const vis = getVisibleWindowLocal(frame);
+    const visRects = vis ? visibleRects(rects, vis) : rects;
+    if (!visRects.length) return null;
+    const first = visRects[0];
+    const last = visRects[visRects.length - 1];
+    // ★ 2026-10-24 B1 返工（二）：夹取基准从「裁剪窗口」改成「文字列」。
+    //   foliate 在 #container 里自带页边距，窗口右缘比文字右缘再往外 70~90px。
+    //   按窗口夹 ⇒ 手柄画在空白里；且页边带按窗口往里量 ⇒ 手柄贴着文字末端也进不了带。
+    let sx = first.left, ex = last.right;
+    if (vis) {
+      const eStart = textColumnEdges(range, vis, false, visRects);
+      const eEnd = textColumnEdges(range, vis, true, visRects);
+      const lo = Math.min(eStart ? eStart.left : vis.left + EDGE_TURN_ZONE, eEnd ? eEnd.right : vis.right - EDGE_TURN_ZONE);
+      const hi = Math.max(eStart ? eStart.left : vis.left + EDGE_TURN_ZONE, eEnd ? eEnd.right : vis.right - EDGE_TURN_ZONE);
+      if (sx < lo) sx = lo;
+      if (sx > hi) sx = hi;
+      if (ex < lo) ex = lo;
+      if (ex > hi) ex = hi;
+      if (ex < sx) ex = sx;
+    }
+    const s = toContainerCoords(sx + fx, first.top + fy);
+    const en = toContainerCoords(ex + fx, last.bottom + fy);
     return { start: { x: s.x, y: s.y, h: Math.max(14, first.height) }, end: { x: en.x, y: en.y, h: Math.max(14, last.height) } };
+  }
+
+  /** 是否块级盒：内联类（inline/inline-block/inline-flex/inline-table）的片段宽度就是文字本身，
+   *  会被末行长短带偏，不能拿来当「文字列边界」。 */
+  function isBlockLevelBox(display: string): boolean {
+    if (!display || display === "none" || display === "contents" || display === "run-in") return false;
+    if (display.startsWith("inline")) return false;
+    return true;
+  }
+
+  /** 取元素在 rowY 这一行上的**分栏片段**（Element.getClientRects() 对跨列块盒逐列返回，
+   *  getBoundingClientRect 只给并集）。同行多片段时取离 hintX 更近的那个，避免拿到隔壁列。 */
+  function blockFragmentOnRow(el: HTMLElement, rowY: number, hintX: number, side: "left" | "right"): Rect4 | null {
+    let rs: DOMRect[];
+    try { rs = Array.from(el.getClientRects()); } catch { return null; }
+    let best: Rect4 | null = null;
+    let bestD = Number.POSITIVE_INFINITY;
+    for (const r of rs) {
+      if (r.right <= r.left || r.bottom <= r.top) continue;
+      if (r.top >= rowY || r.bottom <= rowY) continue;
+      const d = Math.abs(r[side] - hintX);
+      if (d < bestD) { bestD = d; best = { left: r.left, top: r.top, right: r.right, bottom: r.bottom }; }
+    }
+    return best;
+  }
+
+  /**
+   * 当前可见页上「文字真正排到哪儿为止」（iframe 局部坐标）。
+   *
+   * 从选区端点所在节点往上走祖先链，只看块级元素，取它在端点所在可见行上那一段分栏
+   * 片段的左右边；对所有块取**最紧**的一组（左边取最大、右边取最小）。缩进的
+   * blockquote/figure 也算数 —— 它的盒边就是用户眼中的「文字边缘」。
+   *
+   * 为什么不用公式算列边界：foliate 的 --_gap 是百分比，要乘 divisor，再和页边距耦合
+   * （paginator.js 里那段 f(x)=x/(1+x) 的收敛推导）。算错一次就是现在这种「差 90px」；
+   * 量 DOM 得到的是排版结果本身。
+   *
+   * @param atEnd 探末端所在行（true）还是起点所在行（false）
+   * @param rowsIn 已算好的可见片段（拖拽时每帧都调，别让 getClientRects 重复跑）
+   * @returns null 表示探不到，调用方回退到「窗口边往里让 EDGE_TURN_ZONE」
+   */
+  function textColumnEdges(range: Range, vis: Rect4, atEnd: boolean, rowsIn?: DOMRect[]): { left: number; right: number } | null {
+    let rows: DOMRect[];
+    if (rowsIn && rowsIn.length) rows = rowsIn;
+    else { try { rows = visibleRects(Array.from(range.getClientRects()), vis); } catch { return null; } }
+    if (!rows.length) return null;
+    const row = atEnd ? rows[rows.length - 1] : rows[0];
+    const rowY = row.top + row.height / 2;
+    const side: "left" | "right" = atEnd ? "right" : "left";
+    let node: Node | null = atEnd ? range.endContainer : range.startContainer;
+    let left = Number.NEGATIVE_INFINITY;
+    let right = Number.POSITIVE_INFINITY;
+    let found = false;
+    let guard = 0;
+    while (node && guard++ < 40) {
+      if (node.nodeType === 1) {
+        const el = node as HTMLElement;
+        try {
+          const disp = el.ownerDocument?.defaultView?.getComputedStyle?.(el)?.display ?? "";
+          if (isBlockLevelBox(disp)) {
+            const frag = blockFragmentOnRow(el, rowY, row[side], side);
+            if (frag) {
+              found = true;
+              if (frag.left > left) left = frag.left;
+              if (frag.right < right) right = frag.right;
+            }
+          }
+        } catch (__swallowErr) {
+          logSwallow(__swallowErr, "ReaderView.svelte · textColumnEdges walk", "debug");
+        }
+        if (el === el.ownerDocument?.body || el === el.ownerDocument?.documentElement) break;
+      }
+      node = node.parentNode;
+    }
+    if (!found) return null;
+    // 片段可能只与窗口挨了 1px 而超出窗口；夹回窗口内，保证页边带不退化成空
+    const safeRight = Math.min(right, vis.right - 6);
+    const safeLeft = Math.max(left, vis.left + 6);
+    if (!(safeRight > safeLeft)) return null;
+    return { left: safeLeft, right: safeRight };
   }
 
   /** 工具栏驱动的手柄刷新（create 态收口）：依赖 selInfo.range + 工具栏可见。拖拽实时刷新走 updateSelHandlesLive。 */
@@ -6921,80 +7320,283 @@ function applyTopHandleHitHeight() {
    * - 落点在正文外 → caret 为 null，保持上一次选区不动（不抖动、不误收）。
    * - 每次更新后重读 range、重算 cfi、重锚工具栏（positionToolbarAbove 内会再刷 updateSelHandles）。
    * - rAF 合并同帧多次 move；拖拽期间 selHandleDragging 抑制 scheduleReadSelection 干扰。
+   *
+   * 2026-10-24 A：跨页续接 —— 指针越过可见页边时**自动翻页**并把选区接到下一页。
+   *   - 同 section 跨页：iframe 内是连续 DOM ⇒ 一个 Range 跨过列断 ⇒ 一个 CFI 覆盖整段。
+   *   - 跨 section：不同 Document，Range 跨不过 ⇒ 分段记录（selInfo.segments），
+   *     每段一个 CFI，落库后逐段绘制。
+   *   - 边缘方向按**书写方向**换算：RTL 书里"右边缘"其实是上一页。
    */
   function onSelHandlePointerDown(e: PointerEvent, which: "start" | "end"): void {
     const range0 = selInfo?.range ?? null;
     if (!range0) return;
     e.preventDefault();
     e.stopPropagation();
-    const doc = range0.startContainer?.ownerDocument ?? null;
-    const win = doc?.defaultView as (Window & { frameElement?: HTMLElement | null }) | null;
-    const frame = win?.frameElement ?? null;
-    const sel = win?.getSelection?.() ?? null;
-    if (!doc || !sel) return;
+    const doc0 = range0.startContainer?.ownerDocument ?? null;
+    const win0 = doc0?.defaultView as (Window & { frameElement?: HTMLElement | null }) | null;
+    const frame0 = win0?.frameElement ?? null;
+    const sel0 = win0?.getSelection?.() ?? null;
+    if (!doc0 || !sel0) return;
     const fixedNode = which === "start" ? range0.endContainer : range0.startContainer;
     const fixedOffset = which === "start" ? range0.endOffset : range0.startOffset;
-    const activeIndex = selInfo?.index ?? 0;
+    // ===== 拖拽期间的可变状态（跨 section 续接时会切换 doc / sel / index）=====
+    let curDoc: Document = doc0;
+    let curSel: Selection = sel0;
+    let curFrame: HTMLElement | null = frame0;
+    let curIndex: number = selInfo?.index ?? 0;
+    let curCfi: string | null = selInfo?.cfi ?? null;
+    /** 已完成的分段（跨 section 时累积；同 section 跨页时为空） */
+    const segs: { index: number; cfi: string }[] = [];
+    /** 跨 section 时累积的选中文本（各段文本之和） */
+    let accText = "";
     selHandleDragging = which;
     const el = e.currentTarget as HTMLElement | null;
     try { el?.setPointerCapture?.(e.pointerId); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle setPointerCapture", "debug"); }
     let lastX = e.clientX, lastY = e.clientY;
+    const startClientX = e.clientX;
     let raf = 0;
-    const apply = () => {
-      raf = 0;
-      let caret: Range | null = null;
+    /** 本次拖拽是否翻过页（决定松手后是否保留工具栏） */
+    let turned = false;
+    // ===== 页边带触发状态（2026-10-24 定稿：方向性位移 + 带内驻留 + engagement 锁存）=====
+    /** 拖拽过程中朝目标方向到达过的**极值**（不是净位移：抖出去再抖回来仍算） */
+    let maxRight = e.clientX, minLeft = e.clientX;
+    /** 进入页边带的时刻（0 = 不在带内）；进带即起计时，离开带就取消 */
+    let bandEnterMs = 0;
+    let bandTimer = 0;
+    /** engagement 锁存：一次按住只翻一页，必须**拉出带子再拖回来**才允许翻下一页 */
+    let latched = false;
+    /** 离开页边带的起始时刻（0 = 还没离开过）；满 EDGE_TURN_REARM_MS 才解锁 */
+    let bandLeftMs = 0;
+
+    /** 书写方向：RTL 书里"右边缘"其实是上一页 */
+    const isRtlBook = (): boolean => {
+      const rtl = (view as any)?.renderer?.rtl;
+      if (typeof rtl === "boolean") return rtl;
+      return (view as any)?.book?.dir === "rtl";
+    };
+
+    /** 页边翻页：开续接窗口 + 记下回放钩子（翻页落地后把选区自动接进新页） */
+    const turnAtEdge = (logical: "prev" | "next") => {
+      const now = performance.now();
+      turned = true;
+      latched = true;
+      if (bandTimer) { clearTimeout(bandTimer); bandTimer = 0; }
+      bandEnterMs = 0;
+      bandLeftMs = 0; // 翻页后「离开过带子」重新计：指针往往还停在带里
+      hideEdgeHint();
+      // 续接窗口：翻页是异步的（foliate 内部有动画 + 100ms 等待），relocate 会**晚于**翻页请求到达
+      // ⇒ 这段时间内 relocate 走「重锚」分支而不是「收起」分支
+      selContinuationUntil = now + 1500;
+      // 翻页后把**同一个指针点**再算一次落点：iframe 元素整体平移了一个列宽，
+      // 这个点相对新页仍停在页边 ⇒ caret 落在新页该行行尾 ⇒ 选区自动延伸进新页，
+      // 用户不用继续动鼠标（对齐 Readest 的 onAutoTurn(() => updateFromDraggedPoint(point))）。
+      selDragReplay = () => { if (!raf) raf = requestAnimationFrame(apply); };
+      turnPage(view, logical);
+    };
+
+    /** 带内驻留提示：翻页前那 350ms 里给用户「再停一下就翻页」的确定感（Readest turnHint 同款） */
+    const showEdgeHint = (dir: "prev" | "next") => {
+      const c = toContainerCoords(lastX, lastY);
+      selEdgeHint = { visible: true, x: c.x, y: c.y, dir };
+    };
+    const hideEdgeHint = () => {
+      if (selEdgeHint.visible) selEdgeHint = { ...selEdgeHint, visible: false };
+    };
+
+    /** 在目标文档上取落点（iframe 局部坐标）；取不到返回 null */
+    const caretAt = (d: Document, x: number, y: number): Range | null => {
       try {
-        const fr = frame?.getBoundingClientRect?.() ?? null;
-        const lx = lastX - (fr?.left ?? 0);
-        const ly = lastY - (fr?.top ?? 0);
-        const anyDoc = doc as Document & {
+        const anyDoc = d as Document & {
           caretRangeFromPoint?: (x: number, y: number) => Range | null;
           caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
         };
-        if (typeof anyDoc.caretRangeFromPoint === "function") {
-          caret = anyDoc.caretRangeFromPoint(lx, ly);
-        } else if (typeof anyDoc.caretPositionFromPoint === "function") {
-          const cp = anyDoc.caretPositionFromPoint(lx, ly);
-          if (cp) { caret = doc.createRange(); caret.setStart(cp.offsetNode, cp.offset); caret.collapse(true); }
+        if (typeof anyDoc.caretRangeFromPoint === "function") return anyDoc.caretRangeFromPoint(x, y);
+        if (typeof anyDoc.caretPositionFromPoint === "function") {
+          const cp = anyDoc.caretPositionFromPoint(x, y);
+          if (cp) { const r = d.createRange(); r.setStart(cp.offsetNode, cp.offset); r.collapse(true); return r; }
         }
       } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle caretFromPoint", "debug"); }
-      if (!caret) return;
+      return null;
+    };
+
+    /** 当前选区 Range：页边带探测要按「正在拖的这一端」所在行找文字列边界 */
+    const selRange = (): Range | null => {
+      const r = selInfo?.range ?? null;
+      if (r) return r;
+      try { return curSel?.rangeCount ? curSel.getRangeAt(0) : null; } catch { return null; }
+    };
+
+    const apply = () => {
+      raf = 0;
+      // ① 指针当前落在哪个内容文档上（跨 section 续接的交接判定）
+      const target = findDocUnderPointer(lastX, lastY);
+      const tDoc = target?.doc ?? curDoc;
+      const tFrame = target?.frame ?? curFrame;
+      const tFr = tFrame?.getBoundingClientRect?.() ?? null;
+      const tlx = lastX - (tFr?.left ?? 0);
+      const tly = lastY - (tFr?.top ?? 0);
+      const vis = getVisibleWindowLocal(tFrame);
+      // ② 页边带判定 → 逻辑方向翻页（2026-10-24 定稿四条，缺一不翻）：
+      //    ① 朝目标方向的**累计**位移 ≥ EDGE_TURN_MIN_MOVE
+      //    ② 指针进入「文字列边缘 ~ 窗口边缘」这段页边带（不是从窗口往里量的带）
+      //    ③ 在带内**驻留** ≥ EDGE_TURN_DWELL_MS（掠过不翻）
+      //    ④ 本次 engagement 还没翻过（锁存；拉出带子再拖回来才解锁 ⇒ 防连翻）
+      //    滚动模式（flow=scrolled）没有页边概念 ⇒ 整段跳过。
+      if (vis && tFr && !isScrollFlow()) {
+        const side: "left" | "right" = which === "end" ? "right" : "left";
+        const logical: "prev" | "next" = side === "right"
+          ? (isRtlBook() ? "prev" : "next")
+          : (isRtlBook() ? "next" : "prev");
+        if (lastX > maxRight) maxRight = lastX;
+        if (lastX < minLeft) minLeft = lastX;
+        const excursion = side === "right" ? maxRight - startClientX : startClientX - minLeft;
+        // 页边带内沿 = 当前拖动端所在行的文字列边界；探不到就退回「窗口边往里让 EDGE_TURN_ZONE」
+        const probe = selRange();
+        const edges = probe ? textColumnEdges(probe, vis, which === "end") : null;
+        const textEdge = edges ? (side === "right" ? edges.right : edges.left)
+          : (side === "right" ? vis.right - EDGE_TURN_ZONE : vis.left + EDGE_TURN_ZONE);
+        const winEdge = side === "right" ? vis.right : vis.left;
+        const lx = lastX - tFr.left;
+        const inBand = excursion >= EDGE_TURN_MIN_MOVE
+          && inPageMarginBand(lx, textEdge, winEdge, side, EDGE_TURN_TOL);
+        const now = performance.now();
+        if (inBand) {
+          // 锁存期间**什么都不做**：停在带里不会连翻，必须先把指针拉出带子。
+          if (!latched) {
+            if (bandEnterMs === 0) {
+              bandEnterMs = now;
+              showEdgeHint(logical);
+              // 驻留必须靠计时器：apply() 是 pointermove 的 rAF 回调，用户「停住不动」就没有下一帧
+              bandTimer = window.setTimeout(() => { bandTimer = 0; turnAtEdge(logical); }, EDGE_TURN_DWELL_MS);
+            } else if (now - bandEnterMs >= EDGE_TURN_DWELL_MS) {
+              turnAtEdge(logical); // 计时器被 rAF 抢在前面的兜底路径
+            }
+          }
+        } else {
+          if (bandEnterMs !== 0) {
+            if (bandTimer) { clearTimeout(bandTimer); bandTimer = 0; }
+            bandEnterMs = 0;
+            hideEdgeHint();
+          }
+          if (bandLeftMs === 0) bandLeftMs = now;
+          // 解锁只发生在「确实离开过带子」之后：翻完页时指针往往还停在带里，
+          // 若按「离开时刻的默认值」判定会立刻解锁 ⇒ 停在原地连翻好几页。
+          else if (latched && now - bandLeftMs >= EDGE_TURN_REARM_MS) {
+            latched = false;
+            bandLeftMs = 0;
+          }
+        }
+      }
+      // ③ 取落点
+      const caret = caretAt(tDoc, tlx, tly);
+      if (!caret) return; // 指针在正文外：保持上一次选区不动（不抖动、不误收）
       const cn = caret.startContainer, co = caret.startOffset;
-      try {
-        if (which === "start") sel.setBaseAndExtent(cn, co, fixedNode, fixedOffset);
-        else sel.setBaseAndExtent(fixedNode, fixedOffset, cn, co);
-      } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle setBaseAndExtent", "debug"); return; }
-      const nr = sel.rangeCount ? sel.getRangeAt(0) : null;
-      if (!nr || !selInfo) return;
-      const text = (sel.toString() || "").trim();
-      let cfi: string | null = selInfo.cfi ?? null;
-      try { if (typeof view?.getCFI === "function") cfi = view.getCFI(activeIndex, nr); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle getCFI", "debug"); }
-      selInfo = { index: activeIndex, cfi, range: nr, pdfRects: null };
-      if (!text) return; // 拖成空选区：保留工具栏上一次状态，只让 updateSelHandles 收起手柄
-      const r = nr.getBoundingClientRect();
-      const fr = frame?.getBoundingClientRect?.() ?? null;
-      const rect: SelRect = {
-        left: r.left + (fr?.left ?? 0), top: r.top + (fr?.top ?? 0),
-        right: r.right + (fr?.left ?? 0), bottom: r.bottom + (fr?.top ?? 0),
+      let tSel = (tDoc.defaultView as any)?.getSelection?.() ?? null;
+      if (!tSel) return;
+      if (tDoc !== curDoc) {
+        // ④ 跨 section 交接：结段上一段，在新文档另起一段
+        if (curCfi) segs.push({ index: curIndex, cfi: curCfi });
+        accText += (curSel?.toString?.() ?? "");
+        curDoc = tDoc; curSel = tSel; curFrame = tFrame;
+        curIndex = typeof target?.index === "number" && target.index >= 0 ? target.index : curIndex;
+        curCfi = null;
+        try {
+          const body = tDoc.body;
+          if (which === "end") tSel.setBaseAndExtent(body, 0, cn, co);
+          else tSel.setBaseAndExtent(cn, co, body, body.childNodes.length);
+        } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle setBaseAndExtent(cross)", "debug"); return; }
+      } else {
+        try {
+          if (which === "start") tSel.setBaseAndExtent(cn, co, fixedNode, fixedOffset);
+          else tSel.setBaseAndExtent(fixedNode, fixedOffset, cn, co);
+        } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle setBaseAndExtent", "debug"); return; }
+      }
+      const nr = tSel.rangeCount ? tSel.getRangeAt(0) : null;
+      if (!nr) return;
+      const text = (tSel.toString() || "").trim();
+      let cfi: string | null = curCfi;
+      try { if (typeof view?.getCFI === "function") cfi = view.getCFI(curIndex, nr); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle getCFI", "debug"); }
+      curCfi = cfi;
+      const fullText = (accText + text).trim();
+      const allSegs = cfi ? [...segs, { index: curIndex, cfi }] : segs.slice();
+      selInfo = {
+        index: curIndex, cfi, range: nr, pdfRects: null,
+        segments: allSegs.length > 1 ? allSegs : undefined,
       };
-      positionToolbarAbove(rect, text, "create", null);
+      if (!fullText) return; // 拖成空选区：保留工具栏上一次状态，只让 updateSelHandles 收起手柄
+      // ⑤ 锚点：跨页时用「可见部分」（D1），否则会落在两页中间的空白里
+      let rect: SelRect;
+      const fr = tFrame?.getBoundingClientRect?.() ?? null;
+      if (vis) {
+        const vr = visibleRect(
+          Array.from(nr.getClientRects()) as unknown as ArrayLike<Rect4>,
+          vis,
+        );
+        if (vr) {
+          rect = {
+            left: vr.left + (fr?.left ?? 0), top: vr.top + (fr?.top ?? 0),
+            right: vr.right + (fr?.left ?? 0), bottom: vr.bottom + (fr?.top ?? 0),
+          };
+        } else {
+          const r = nr.getBoundingClientRect();
+          rect = {
+            left: r.left + (fr?.left ?? 0), top: r.top + (fr?.top ?? 0),
+            right: r.right + (fr?.left ?? 0), bottom: r.bottom + (fr?.top ?? 0),
+          };
+        }
+      } else {
+        const r = nr.getBoundingClientRect();
+        rect = {
+          left: r.left + (fr?.left ?? 0), top: r.top + (fr?.top ?? 0),
+          right: r.right + (fr?.left ?? 0), bottom: r.bottom + (fr?.top ?? 0),
+        };
+      }
+      positionToolbarAbove(rect, fullText, "create", null);
     };
     const onMove = (ev: PointerEvent) => {
       lastX = ev.clientX; lastY = ev.clientY;
       if (!raf) raf = requestAnimationFrame(apply);
     };
+    /** 内容文档里的 pointermove（iframe 自己会吃掉指针事件）：
+     *  坐标是 iframe 视口口径，要加回帧偏移才是主文档 client 坐标。
+     *  setPointerCapture 正常时父窗口已经收得到事件，这里是捕获失败的兜底。 */
+    const onMoveContent = (ev: PointerEvent) => {
+      const fr = curFrame?.getBoundingClientRect?.() ?? null;
+      lastX = ev.clientX + (fr?.left ?? 0); lastY = ev.clientY + (fr?.top ?? 0);
+      if (!raf) raf = requestAnimationFrame(apply);
+    };
     const onUp = (ev: PointerEvent) => {
       if (raf) { cancelAnimationFrame(raf); raf = 0; }
       apply();
+      // 松手收尾：驻留计时/提示/回放钩子一律作废（不能在松手之后才翻出下一页、或延伸选区）
+      if (bandTimer) { clearTimeout(bandTimer); bandTimer = 0; }
+      bandEnterMs = 0;
+      hideEdgeHint();
+      selDragReplay = null;
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", onUp);
+      const cw = doc0.defaultView;
+      cw?.removeEventListener?.("pointermove", onMoveContent as EventListener);
+      cw?.removeEventListener?.("pointerup", onUp as EventListener);
+      cw?.removeEventListener?.("pointercancel", onUp as EventListener);
       try { el?.releasePointerCapture?.(ev.pointerId); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · handle releasePointerCapture", "debug"); }
       selHandleDragging = null;
+      // 续接窗口：翻过页的拖拽松手后仍保留一小段，让随后的 relocate 走「重锚」；
+      // 没翻页则清零 —— 之后的普通翻页应当照常收起工具栏。
+      selContinuationUntil = turned ? Math.max(selContinuationUntil, performance.now() + 600) : 0;
     };
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", onUp);
+    // 兜底绑定：指针进入内容 iframe 后若事件被 iframe 吃掉，父窗口收不到 ⇒ 拖拽会「断流」，
+    // 表现为手柄停在原地、页边驻留永远不触发。
+    {
+      const cw = doc0.defaultView;
+      cw?.addEventListener?.("pointermove", onMoveContent as EventListener);
+      cw?.addEventListener?.("pointerup", onUp as EventListener);
+      cw?.addEventListener?.("pointercancel", onUp as EventListener);
+    }
   }
 
   /**
@@ -7416,11 +8018,49 @@ function applyTopHandleHitHeight() {
 
   function setSelFrom(sel: ReaderSel | null) {
     if (sel) {
-      selInfo = { index: sel.index, cfi: sel.cfi, range: sel.range, pdfRects: sel.pdfRects };
+      // 2026-10-24：跨 section 续接的分段信息要保住 ——
+      // 选区路径重新读取时 cfi 不变（还是同一段），此时不该把 segments 抹掉。
+      const keepSegs = (selInfo?.segments && selInfo.cfi && selInfo.cfi === sel.cfi) ? selInfo.segments : undefined;
+      selInfo = { index: sel.index, cfi: sel.cfi, range: sel.range, pdfRects: sel.pdfRects, segments: keepSegs };
       showToolbarFor(sel);
     } else {
       closeSelToolbar();
     }
+  }
+
+  /**
+   * 2026-10-24 D2/D4：翻页后**重锚**划词工具栏与手柄（跨页续接用）。
+   *
+   * ## 为什么不能沿用「翻页即收起」
+   * 跨页续接时，拖手柄翻页**不是**放弃选区，而是要把选区接到下一页继续标。
+   * 若翻页就收起工具栏，用户每翻一页都要重新点一次「标注」，续接就断了。
+   *
+   * ## 重锚 vs 收起
+   *  - 选区仍可见（哪怕只剩续上去的那一段）⇒ 按**可见部分**重新定位工具栏 + 手柄；
+   *  - 选区已完全不可见 ⇒ 收起（避免留残影）。
+   */
+  function reanchorSelToolbar(): void {
+    const sel = readReaderSelection();
+    if (!sel) {
+      if (selToolbar.visible) closeSelToolbar();
+      if (selHandles.visible) selHandles = { ...selHandles, visible: false };
+      return;
+    }
+    // 分段要保住：跨 section 续接时，relocate 重锚不能把已累积的 segments 抹掉，
+    // 否则松手保存时只剩最后一段，前面的段全丢（同 setSelFrom 的保留口径）。
+    const keepSegs = (selInfo?.segments && selInfo.cfi && selInfo.cfi === sel.cfi) ? selInfo.segments : undefined;
+    selInfo = { index: sel.index, cfi: sel.cfi, range: sel.range, pdfRects: sel.pdfRects, segments: keepSegs };
+    if (!selToolbar.visible || selToolbar.mode !== "create") return;
+    positionToolbarAbove(sel.rect, sel.text, "create", null);
+  }
+
+  /**
+   * 2026-10-24：跨页续接是否仍在有效期内。
+   * 翻页是异步的（foliate 内部动画 + 100ms 等待），relocate 事件会**晚于**翻页请求到达，
+   * 所以不能用「刚刚发起过翻页」的布尔量，要用时间窗。
+   */
+  function isSelContinuationActive(): boolean {
+    return performance.now() < selContinuationUntil;
   }
 
   // 2026-08-24 修复（问题1）：拖动选词过程中**不弹工具栏**（工具栏交由 mouseup 后的 onContentMouseUp）。
@@ -7864,6 +8504,28 @@ function applyTopHandleHitHeight() {
       return;
     }
     dbgHud.relocateCalls++;
+    // 2026-10-24 D2：跨页续接进行中 ⇒ **不收起**划词浮层，改为按新位置重锚。
+    // （续接窗口内用户正在把选区往下一页接，收起会打断"选到一半"的连续动作。）
+    if (isSelContinuationActive() && (selToolbar.visible || selHandles.visible)) {
+      reanchorSelToolbar();
+      // 2026-10-24 批 D：拖手柄翻页落地后，把**按住的指针点**在新页上再算一次落点 ⇒
+      // 选区自动延伸进新页，用户不用继续动鼠标（Readest onAutoTurn→updateFromDraggedPoint 同款）。
+      // 钩子只在按住期间存在：松手时 onUp 会清掉，所以不会在拖拽结束后偷改选区。
+      const replay = selDragReplay;
+      if (replay) {
+        selDragReplay = null;
+        replay();
+      }
+      if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null, place: "below" };
+      if (showFootnote) closeFootnote();
+      if (dictPopup.visible) dictPopup = { ...dictPopup, visible: false };
+      closeImageViewer();
+      if (annotationsDirty) {
+        redrawBookAnnotations();
+        if (annStore && bookId && view) annotationsDirty = false;
+      }
+      return;
+    }
     if (selToolbar.visible) closeSelToolbar();
     // 2026-10-14 P2：翻页/位置变化时手柄立即消失（工具栏走 140ms 收起动画，手柄钉在旧坐标会脱节）。
     if (selHandles.visible) selHandles = { ...selHandles, visible: false };
@@ -8155,10 +8817,17 @@ function applyTopHandleHitHeight() {
   }
 
   /** R3 类型收口：绘制 overlay 所需的最小入参（真源是 annStore，此处只取画图相关字段） */
-  type AnnDrawInput = { id?: string; cfi?: string; color?: string; style?: unknown; note?: string; deletedAt?: string };
+  type AnnDrawInput = { id?: string; cfi?: string; segments?: { index: number; cfi: string }[]; color?: string; style?: unknown; note?: string; deletedAt?: string };
 
-  /** 把单条批注绘制进 foliate（异步；用返回 index 回填 cfi→章节缓存） */
-  async function addReaderAnnotation(it: AnnDrawInput): Promise<void> {
+  /**
+   * 把单条批注绘制进 foliate（异步；用返回 index 回填 cfi→章节缓存）。
+   *
+   * 2026-10-24 跨页续接：一条批注可能是**多段**（每段一个 CFI，跨 section 时尤其如此），
+   * 逐段调用 foliate 的 addAnnotation —— foliate 以 CFI 为单位建 overlayer 记录，
+   * 多段必须分别登记，否则第二段不会画出来。
+   * 单段批注走同一条路径（只有一个元素），行为与旧版完全一致。
+   */
+  async function addReaderAnnotation(it: AnnDrawInput, onlyCfis?: Set<string>): Promise<void> {
     dbgHud.addAnnotationTries++;
     if (!it.cfi || !it.color || !view) return;
     if (it.deletedAt) return; // 软删除项不重绘（最终一致保障：翻页后已删高亮彻底消失）
@@ -8167,25 +8836,36 @@ function applyTopHandleHitHeight() {
     // overlayer 并派发 create-overlay，恢复/改色/撤销等路径会把标注喂进来，
     // 原生 SVG 层与 PDF 文本层的缩放 transform 坐标系不匹配 → 叠一层漂移高亮。
     if (isPdfBook()) return;
+    const color = it.color;
     const style = normalizeAnnotationStyle(it.style) as AnnotationStyle;
+    let cfis = annotationCfis(it);
+    if (onlyCfis) cfis = cfis.filter((c) => onlyCfis.has(c));
+    if (!cfis.length) return;
+    for (const cfi of cfis) {
+      await drawAnnotationCfi(cfi, color, style, it);
+    }
+  }
+
+  /** 绘制单段（单 CFI）批注 */
+  async function drawAnnotationCfi(cfi: string, color: string, style: AnnotationStyle, it: AnnDrawInput): Promise<void> {
     // 2026-10-13 P0-3：绘制前抢占标记（覆盖 await 在途窗口）——60ms 后的 reconcile
     // 见到窗口内的 cfi 直接跳过补绘，不重复喂同一条 CFI 给 foliate
     // （其 addAnnotation 内部是 remove 再 add，双轨命中就是「画了→删→再画」的闪烁）。
-    markDirectDrawn(it.cfi);
+    markDirectDrawn(cfi);
     try {
-      const res: any = await view.addAnnotation({ value: it.cfi, color: it.color, style, note: it.note || "" });
-      if (res && typeof res.index === "number") annIndexCache.set(it.cfi, res.index);
+      const res: any = await view.addAnnotation({ value: cfi, color, style, note: it.note || "" });
+      if (res && typeof res.index === "number") annIndexCache.set(cfi, res.index);
       // annByValue 只存 {id, cfi, color}：note/style 一律以 annStore 为唯一真源，
       // 避免三处 note 拷贝不一致（2026-08-24 重构）。
       // 2026-10-13 P1-5：it.id 可能尚未落库（saveHighlight 改为视觉先行、upsert 并行），
       // 此处不得把已登记的真实 id 覆盖成 undefined。
-      const prev = annByValue.get(it.cfi);
-      annByValue.set(it.cfi, { id: it.id ?? prev?.id, cfi: it.cfi, color: it.color });
+      const prev = annByValue.get(cfi);
+      annByValue.set(cfi, { id: it.id ?? prev?.id, cfi, color });
     } catch (err) {
-      recentDirectDraws.delete(it.cfi); // 绘制失败 ⇒ 收回标记，reconcile 兜底补绘
+      recentDirectDraws.delete(cfi); // 绘制失败 ⇒ 收回标记，reconcile 兜底补绘
       dbgHud.addAnnotationErrors++;
       // 2026-08-25 可靠性：原空 catch 静默吞错，无法排查 CFI 无效/overlay 未就绪等问题。
-      console.warn("[REword] addReaderAnnotation 失败（id=" + it?.id + ", cfi=" + it?.cfi + "）:", err);
+      console.warn("[REword] addReaderAnnotation 失败（id=" + it?.id + ", cfi=" + cfi + "）:", err);
     }
   }
 
@@ -8231,11 +8911,17 @@ function applyTopHandleHitHeight() {
     for (const it of annots) {
       if (!it.cfi || it.deletedAt) continue;
       // 章节索引缓存命中且不匹配当前章节 → 跳过（等该章节 overlay 创建时再画）
-      const cached = annIndexCache.get(it.cfi);
-      if (typeof cached === "number" && typeof idx === "number" && cached !== idx) continue;
+      // 2026-10-24 跨页续接：一条批注可能有多段（分属不同 section），
+      // 必须**逐段**判断 —— 只看首段的缓存会把后一段误判成"别的章节"而永远不画。
+      const cfis = annotationCfis(it);
+      const pending = cfis.filter((c) => {
+        const cached = annIndexCache.get(c);
+        return !(typeof cached === "number" && typeof idx === "number" && cached !== idx);
+      });
+      if (!pending.length) continue;
       // 否则（未缓存或匹配当前章节）交给 foliate 原生 addAnnotation，
       // 内部解析 CFI、缓存章节索引、emit draw-annotation。
-      void addReaderAnnotation(it);
+      void addReaderAnnotation(it, new Set(pending));
     }
   }
 
@@ -8469,11 +9155,16 @@ function applyTopHandleHitHeight() {
       try { annStore = getAnnotationStore(); } catch { annStore = null; }
     }
     if (!annStore || !bookId) { toast(t("批注存储不可用")); return; }
+    // 2026-10-24 跨页续接：选区跨到下一 section 时，selInfo.segments 里有**多段** CFI。
+    // 只在首段与当前 cfi 一致时带上（防止旧选区残留的 segments 误挂到别的标注上）。
+    const segs = (selInfo?.segments && selInfo.cfi === cfi) ? selInfo.segments : undefined;
+    const allCfis = segs && segs.length ? segs.map((s) => s.cfi).filter(Boolean) : [cfi];
     const input: any = {
       blockId: `book:${bookId}`,   // 派生虚拟块 ID，复用现有去重/聚合逻辑
       docId: bookId,
       bookId,
       cfi,
+      segments: segs,
       sentence: selectedText,       // 书籍场景：上下文即选中文本
       selectedText,
       note,
@@ -8497,7 +9188,8 @@ function applyTopHandleHitHeight() {
     // 「点标注 → 高亮出现」的反馈。函数返回前仍 await 落库完成：调用方
     //（onQuickAnnotate）依赖 annByValue 里已登记的真实 id 转 edit 态。
     const upsertP = annStore.upsert(input).then((created: any) => {
-      annByValue.set(cfi, { id: created.id, cfi, color });
+      // 2026-10-24：多段批注的**每一段**都要登记（点哪一段都能查到这条标注）。
+      for (const c of allCfis) annByValue.set(c, { id: created.id, cfi: c, color });
       return created;
     });
     // 预先挂只读观察者：绘制 await 在途时若落库已失败，先抑制 Uncaught (in promise)
@@ -11116,6 +11808,16 @@ function applyTopHandleHitHeight() {
     ></div>
   {/if}
 
+  <!-- 2026-10-24 批 C：页边驻留提示。拖末端手柄进页边带、还没到翻页时间时出现，
+       告诉用户「再停一下就走」；pointer-events:none，不参与拖拽命中。 -->
+  {#if selEdgeHint.visible && selHandles.visible}
+    <div
+      class="reader-edge-hint"
+      class:reader-edge-hint--prev={selEdgeHint.dir === "prev"}
+      style="left:{selEdgeHint.x}px;top:{selEdgeHint.y}px"
+    >{selEdgeHint.dir === "next" ? "›" : "‹"}</div>
+  {/if}
+
   <!-- 2026-10-08 重写：紧凑横向卡片 + 样式/色板折叠悬浮
        · 宽度 268 → 400（NOTE_CARD_W，与 positionPopupNear 共用）
        · **三行**横排：原文 / 工具条（含取消·保存）/ 输入区
@@ -11711,6 +12413,32 @@ function applyTopHandleHitHeight() {
   .reader-sel-handle--start::before { top: 50%; }  /* 起点：竖条从圆心向下探入首行 */
   .reader-sel-handle--end::before { bottom: 50%; }  /* 终点：竖条从圆心向上探入末行 */
   .reader-sel-handle.active { transform: scale(1.25); }
+
+  /* 2026-10-24 批 C：页边驻留提示 —— 手柄拖进页边带、还没到翻页时长时出现的方向提示。
+     只锚在指针旁、不占布局、pointer-events:none（挡住手柄自身命中就麻烦了）；
+     动效只用透明度，不做位移（抖动会干扰正在拖拽的手柄）。 */
+  .reader-edge-hint {
+    position: absolute;
+    width: 26px;
+    height: 26px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 50%;
+    background: rgba(28, 28, 30, 0.78);
+    color: #fff;
+    font-size: 17px;
+    line-height: 1;
+    transform: translate(10px, -50%);
+    pointer-events: none;
+    z-index: 5;
+    animation: reader-edge-hint-pulse 320ms ease-out infinite alternate;
+  }
+  .reader-edge-hint--prev { transform: translate(-10px, -50%) translateX(-100%); }
+  @keyframes reader-edge-hint-pulse {
+    from { opacity: 0.5; }
+    to { opacity: 1; }
+  }
 
   /* 划词工具栏（微信读书式恒深色）：定位到锚点，主栏在上、样式行在**下方**。
      2026-10-11 微信读书化：

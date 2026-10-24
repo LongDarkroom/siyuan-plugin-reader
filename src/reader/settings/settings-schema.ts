@@ -843,6 +843,17 @@ export const TABS: TabDef[] = [
             showIf: (s) => s.flow === "scrolled",
             hint: t("滚动时高亮视口中心段落、其余淡出，帮助回到阅读位置"),
           },
+          {
+            // 2026-10-24 新增：滚轮翻页。
+            // 仅分页模式生效 —— 连续滚动模式下正文本来就能滚，滚轮归原生滚动管。
+            // 判定写在 wheelPageTurn 消费侧（ReaderView.onReaderWheel）：
+            // `settings.flow !== "paginated"` 直接放行不拦截。
+            path: "wheelPageTurn",
+            label: t("滚轮翻页"),
+            ctrl: "switch",
+            showIf: (s) => s.flow === "paginated",
+            hint: t("分页模式下滚动鼠标滚轮翻页（滚到底再滚一次才翻，避免一次滑动连翻好几页）"),
+          },
         ],
       },
       {

@@ -71,6 +71,26 @@ export interface PdfRect {
   page: number;
 }
 
+/**
+ * 批注的一段（跨页 / 跨 section 选区用）。
+ *
+ * ## 为什么需要分段
+ * foliate 的分页渲染是「一个 section 一个 iframe」：
+ *   - **同一个 section 内跨页**：内容在 DOM 上是连续的（CSS 多列），
+ *     Range 可以跨列 ⇒ **一个 CFI 就够**，不需要分段；
+ *   - **跨 section**：不同 iframe / 不同 Document，Range 无法跨文档
+ *     ⇒ 只能按段存，每段一个 CFI，绘制时逐段画。
+ *
+ * 因此 `segments` 只在**跨 section** 时才非空；
+ * 同 section 跨页仍走单 `cfi`（保持旧数据与旧路径零改动）。
+ */
+export interface AnnotationSegment {
+  /** section 序号 */
+  index: number;
+  /** 该段在本 section 内的 CFI */
+  cfi: string;
+}
+
 /** 一条批注（结构与主插件 AnnotationItem 对齐） */
 export interface AnnotationItem {
   id: string;
@@ -80,6 +100,8 @@ export interface AnnotationItem {
   bookId?: string;
   /** foliate CFI 锚点（书籍场景精确定位） */
   cfi?: string;
+  /** 跨 section 选区的分段（每段一个 CFI）；单段/同 section 跨页时不写 */
+  segments?: AnnotationSegment[];
   type?: AnnotationType;
   sentence: string;
   selectedText: string;
@@ -126,6 +148,7 @@ export interface AnnotationInput {
   docId: string;
   bookId?: string;
   cfi?: string;
+  segments?: AnnotationSegment[];
   type?: AnnotationType;
   sentence: string;
   selectedText: string;
@@ -239,6 +262,35 @@ export function sanitizePdfRects(rects?: PdfRect[]): PdfRect[] | undefined {
     });
   }
   return out.length ? out : undefined;
+}
+
+/**
+ * 规整分段数组：剔除非有限 index / 空 cfi，并按 index 升序。
+ * 空数组 ⇒ undefined（表示"没有分段"，走单 cfi 路径）。
+ */
+export function sanitizeSegments(segments?: AnnotationSegment[]): AnnotationSegment[] | undefined {
+  if (!segments || !Array.isArray(segments)) return undefined;
+  const out: AnnotationSegment[] = [];
+  for (const s of segments) {
+    if (!s || typeof s !== "object") continue;
+    const index = Number(s.index);
+    const cfi = typeof s.cfi === "string" ? s.cfi.trim() : "";
+    if (!Number.isFinite(index) || !cfi) continue;
+    out.push({ index: Math.round(index), cfi });
+  }
+  if (!out.length) return undefined;
+  out.sort((a, b) => a.index - b.index);
+  return out;
+}
+
+/**
+ * 取一条批注的全部锚点 CFI：单段时返回 [cfi]，多段时返回每段的 cfi。
+ * 绘制 / 跳转统一走这个入口，避免各处自己判断"有没有 segments"。
+ */
+export function annotationCfis(a: Pick<AnnotationItem, "cfi" | "segments">): string[] {
+  const segs = sanitizeSegments(a.segments);
+  if (segs && segs.length) return segs.map((s) => s.cfi);
+  return a.cfi ? [a.cfi] : [];
 }
 
 /** 批注去重键（blockId + 句子 + 选中文本，跨会话稳定） */
@@ -368,6 +420,7 @@ export class AnnotationStore {
           lineColor: normalizeAnnotationColor(item.lineColor ?? item.color),
           noteFormat: item.noteFormat ?? "kramdown",
           version: item.version ?? 0,
+          segments: sanitizeSegments(item.segments),
         };
         this.items.set(normalized.id, normalized);
         this.byKey.set(annotationKey(normalized.blockId, normalized.sentence || "", normalized.selectedText || ""), normalized.id);
@@ -496,6 +549,7 @@ export class AnnotationStore {
         category: input.category ?? prev.category,
         ai: input.ai ? { ...prev.ai, ...input.ai } : prev.ai,
         pdfRects: sanitizePdfRects(input.pdfRects) ?? prev.pdfRects,
+        segments: sanitizeSegments(input.segments) ?? prev.segments,
         kind: input.kind ?? prev.kind,
         snapshotPath: input.snapshotPath ?? prev.snapshotPath,
         updatedAt: ts,
@@ -533,6 +587,7 @@ export class AnnotationStore {
         category: input.category ?? prev.category,
         ai: input.ai ? { ...prev.ai, ...input.ai } : prev.ai,
         pdfRects: sanitizePdfRects(input.pdfRects) ?? prev.pdfRects,
+        segments: sanitizeSegments(input.segments) ?? prev.segments,
         kind: input.kind ?? prev.kind,
         snapshotPath: input.snapshotPath ?? prev.snapshotPath,
         updatedAt: ts,
@@ -551,6 +606,7 @@ export class AnnotationStore {
       docId: input.docId as string,
       bookId: input.bookId,
       cfi: input.cfi,
+      segments: sanitizeSegments(input.segments),
       type: input.type,
       sentence: cleanSentence,
       selectedText: cleanSelected,

@@ -24,6 +24,10 @@ import {
   type ShortcutOverride,
   type HintLine,
 } from "./reader-shortcuts.ts";
+// 2026-10-24：翻页动作改走 page-turn.ts（统一翻页入口的单一真源）。
+// 语义在 page-turn.ts 里定义（逻辑方向 vs 物理方向），本文件只做动作→意图的映射，
+// 避免「同一个翻页动作在不同入口用不同方向」这种 RTL 书必炸的分叉。
+import { turnPage } from "./page-turn.ts";
 
 // 2026-10-10：re-export matchShortcut。
 // ReaderView / BookshelfView 等消费者从**本模块** import matchShortcut（把 keyboard-shared
@@ -79,11 +83,20 @@ export type PageTurnAction =
 
 /**
  * 默认翻页实现（视图层可复用或完全替换）：
- *  - prevPage/nextPage/PgUp/PgDn：整页翻（与←→ 等价）
+ *  - prevPage/nextPage/PgUp/PgDn：整页翻（与←→ 等价，物理方向）
  *  - prevSection/nextSection（↑↓）：滚动模式按视口高度滚一段，分页模式翻页
  *  - goStart（Home）：view.goToTextStart()
  *  - goEnd（End）：view.goTo(last section)
  *  - view 为 null：静默吞掉，不抛错
+ *
+ * 2026-10-24：翻页部分委托给 page-turn.ts 的 turnPage（单一真源）。
+ * 动作→意图的映射：
+ *   prevPage    → prevPhysical  （← 键 / PgUp：屏幕向左）
+ *   nextPage    → nextPhysical  （→ 键 / PgDn：屏幕向右）
+ *   prevSection → prevSection   （↑：滚动模式退一屏，分页模式翻页）
+ *   nextSection → nextSection   （↓：同上）
+ * ⚠️ 行为与改前**完全一致**（test/smoke-keyboard-shared.test.mjs 钉住），
+ *    差别只是实现搬了家 —— 以后加「滚轮翻页」不必再各写一份方向判断。
  */
 export function defaultPageTurn(action: PageTurnAction, view: any): void {
   if (!view) {
@@ -93,25 +106,15 @@ export function defaultPageTurn(action: PageTurnAction, view: any): void {
   try {
     switch (action) {
       case "prevPage":
-        void view.goLeft?.();
+        turnPage(view, "prevPhysical");
         return;
       case "nextPage":
-        void view.goRight?.();
+        turnPage(view, "nextPhysical");
         return;
       case "prevSection":
-      case "nextSection": {
-        const scrolled = (view as any)?.renderer?.scrolled;
-        const forward = action === "nextSection";
-        if (scrolled) {
-          // 滚动模式：按视口高度滚一段；foliate 的 next/prev 接受 distance
-          const size = Math.max(120, Number((view as any)?.renderer?.size) || 0);
-          void (forward ? view.next?.(size) : view.prev?.(size));
-        } else {
-          // 分页模式：与 ←→ 等价（RTL 由 goLeft/goRight 内部处理）
-          void (forward ? view.goRight?.() : view.goLeft?.());
-        }
+      case "nextSection":
+        turnPage(view, action === "nextSection" ? "nextSection" : "prevSection");
         return;
-      }
       case "goStart":
         void view.goToTextStart?.();
         return;
