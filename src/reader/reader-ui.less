@@ -61,6 +61,26 @@
   --reword-glass-fg-muted: rgba(255, 255, 255, 0.6);
   --reword-glass-fill: rgba(255, 255, 255, 0.1);
   --reword-glass-fill-hover: rgba(255, 255, 255, 0.18);
+
+  /* z-index 分层表（2026-10-24 移动端适配 Phase 1 统一）
+     ------------------------------------------------------------------
+     reader 内部浮层的层级口径，所有结构性 z-index 引用 token，禁止新写裸数值。
+     铁律：全部 ≤ 60 —— 阅读器内任何层都不得高于思源原生 UI（顶栏菜单等）。
+       stage(0) 正文 < backdrop(1) 点空白收起遮罩 < floating(2)/popover(2)
+       < sel-toolbar(3) 划词工具栏 < sel-handle(4) 选区手柄
+       < toolbar/handle(5/7) 顶栏·底栏及其圆点把手
+       < imgv(60) 图片灯箱（唯一全屏模态，对齐 .reword-pt-overlay 先例）
+     书架 portal 面板(.edit-mask z-50) / 右键菜单(z-10000) / index.less 遗留
+     AI 弹窗(z-100000) 属历史体系，统一收敛另列专项（见 docs/mobile-adaptation-plan.md）。 */
+  --rz-stage: 0;
+  --rz-backdrop: 1;
+  --rz-floating: 2;
+  --rz-popover: 2;
+  --rz-sel-toolbar: 3;
+  --rz-sel-handle: 4;
+  --rz-toolbar: 5;
+  --rz-handle: 7;
+  --rz-imgv: 60;
 }
 
 /* 毛玻璃基类：所有浮层共用，保证质感一致 */
@@ -228,20 +248,9 @@
 }
 .reader-ui-progress:hover .reader-ui-progress__thumb { opacity: 1; }
 
-/* 4 断点响应式（wide / normal / narrow / tiny） */
-/* 默认（tiny 起）隐藏 */
-.reader-ui-hide-narrow,
-.reader-ui-hide-tiny { display: none; }
-
-/* narrow (>= 480) */
-@media (min-width: 480px) {
-  .reader-ui-hide-tiny { display: initial; }
-}
-/* normal (>= 800) */
-@media (min-width: 800px) {
-  .reader-ui-hide-narrow { display: initial; }
-  .reader-ui-hide-tiny { display: initial; }
-}
+/* 4 断点响应式（wide / normal / narrow / tiny）
+   2026-10-24：.reader-ui-hide-tiny/narrow 整组删除 —— 全库无任何元素挂这两个类
+   （死样式，grep 证实）；响应式改走 viewport-store 的 re-phone/re-tablet 状态类。 */
 
 /* 暗色模式自动跟随（思源变量已自动处理，无需 media query） */
 

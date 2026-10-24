@@ -37,24 +37,12 @@ export default defineConfig({
       cssFileName: "index",
     },
     rollupOptions: {
-      // siyuan 与 node 内置模块（js-mdict 依赖 node:fs/node:zlib/node:assert）保持外部，
-      // 运行时由 SiYuan(Electron) 提供；js-mdict 自身逻辑则打包进 index.js。
+      // 仅 siyuan 保持 external —— 运行时由思源宿主提供（桌面与移动端都注入）。
+      // Node 内置模块（js-mdict 依赖 node:fs/node:zlib/node:assert）2026-10-24 起
+      // 不再 external：移动端无 Node 运行时，顶层 require 会崩掉整个插件加载，
+      // 已改为别名到 src/core/shims/ 惰性 shim（见上方 alias 注释）。
       external: [
         "siyuan",
-        "node:fs",
-        "node:path",
-        "node:zlib",
-        "node:assert",
-        "node:os",
-        "node:child_process",
-        "node:net",
-        "fs",
-        "path",
-        "zlib",
-        "assert",
-        "os",
-        "child_process",
-        "net",
       ],
       output: {
         // 禁用代码分割，将所有代码（含 Svelte 运行时）打包到单个 index.js，兼容 cjs 格式
@@ -63,9 +51,26 @@ export default defineConfig({
     },
   },
   resolve: {
-    alias: {
-      "@": resolve(__dirname, "src"),
-    },
+    alias: [
+      { find: "@", replacement: resolve(__dirname, "src") },
+      // 2026-10-24 移动端加载修复：Node 内置模块不再 external（产物顶层 require("fs")
+      // 在移动端 WebView 求值即崩，插件类注册不上 → 顶栏图标/页签全不出现），
+      // 改为别名到 src/core/shims/ 的惰性转发 shim：
+      //   模块求值零 require；桌面端首次调用经宿主 require 拿真实实现（行为不变），
+      //   移动端返回安全空值自然降级（词典 MISSING / 日志不落盘，插件正常加载）。
+      { find: /^node:fs$/, replacement: resolve(__dirname, "src/core/shims/fs.ts") },
+      { find: /^fs$/, replacement: resolve(__dirname, "src/core/shims/fs.ts") },
+      { find: /^node:path$/, replacement: resolve(__dirname, "src/core/shims/path.ts") },
+      { find: /^path$/, replacement: resolve(__dirname, "src/core/shims/path.ts") },
+      { find: /^node:zlib$/, replacement: resolve(__dirname, "src/core/shims/zlib.ts") },
+      { find: /^zlib$/, replacement: resolve(__dirname, "src/core/shims/zlib.ts") },
+      { find: /^node:assert$/, replacement: resolve(__dirname, "src/core/shims/assert.ts") },
+      { find: /^assert$/, replacement: resolve(__dirname, "src/core/shims/assert.ts") },
+      { find: /^node:os$/, replacement: resolve(__dirname, "src/core/shims/os.ts") },
+      { find: /^os$/, replacement: resolve(__dirname, "src/core/shims/os.ts") },
+      { find: /^node:(child_process|net)$/, replacement: resolve(__dirname, "src/core/shims/empty.ts") },
+      { find: /^(child_process|net)$/, replacement: resolve(__dirname, "src/core/shims/empty.ts") },
+    ],
   },
   publicDir: "public",
 });

@@ -16,6 +16,8 @@ import { getLogger } from "../core/logger.ts";
   import { isTouchDevice } from "../core/env.ts";
   // [REword patch 2026-08-29] 移动端 PDF 适配 Phase 1
   import { getDeviceClass, isSmallMobile, isLargeMobile } from "../core/env.ts";
+  // 2026-10-24 移动端适配 Phase 1：响应式视口状态（断点 / 软键盘），根节点状态类 + 紧凑顶栏开关
+  import { viewport, isPhoneBreakpoint, type ViewportBreakpoint } from "../core/viewport-store.ts";
   // [REword 2026-09-02] 界面分流：按书籍格式自动切换「图书界面 / PDF 界面」。
   // 此前 PDF 与 EPUB 共用同一套模板、靠散落的 isPdfBook() 拼装控件，两类格式互相干扰。
   // 现在 PDF 专属控件收进 PdfToolbar / PdfSettings / PdfOverlay，图书专属控件收进 BookToolbar，
@@ -2174,6 +2176,7 @@ function applyTopHandleHitHeight() {
         e.preventDefault();
         showSearch = true;
         showSettings = false;
+        showMoreMenu = false;
         showToc = false;
         setTimeout(() => {
           try {
@@ -2959,6 +2962,49 @@ function applyTopHandleHitHeight() {
     }
   }
 
+  /**
+   * [2026-10-24] 目录落点重定向。calibre 等书把 TOC 锚点钉在章节插图页 <body> 上，
+   * 正文标题在下一节，导致点目录落到章节「上方几页」。跳转前把落点改到该章节首个带 id 的标题。
+   * - 书本身锚点已精确指向标题（正常 EPUB）→ 原样返回，零回归；
+   * - 锚点指向 <body>/缺失（calibre 类）→ 从锚点所在节向前扫描，命中首个带 id 的 h1–h6 并跳转。
+   * 任何异常都退化回原 href，绝不阻断跳转。
+   */
+  async function refineTocLandingHref(v: any, href: string): Promise<string> {
+    if (!v || !v.book || typeof href !== "string" || !href.includes("#")) return href;
+    try {
+      const book = v.book;
+      const resolved = book.resolveHref?.(href);
+      if (!resolved || typeof resolved.index !== "number") return href;
+      const sections: any[] = book.sections || [];
+      const baseIndex = resolved.index;
+      const hash = href.split("#")[1] || "";
+      const MAX_SCAN = 12;
+      for (let i = baseIndex; i < Math.min(sections.length, baseIndex + MAX_SCAN); i++) {
+        const sec = sections[i];
+        if (!sec || typeof sec.loadText !== "function") continue;
+        const txt = await sec.loadText();
+        if (!txt) continue;
+        const doc = new DOMParser().parseFromString(txt, "text/html");
+        // 锚点本来就是具体元素（正常 EPUB，无论是否标题）→ 书本身精确，保持原行为，零回归
+        if (i === baseIndex && hash) {
+          const anchorEl = doc.getElementById(hash);
+          if (anchorEl && anchorEl !== doc.body) return href;
+        }
+        const heading = doc.querySelector("h1[id], h2[id], h3[id], h4[id], h5[id], h6[id]");
+        if (heading && heading.id) {
+          if (i === baseIndex && heading.id === hash) return href;
+          if (i !== baseIndex) {
+            console.log("[REword] TOC 落点重定向:", { from: href, to: `${sec.id}#${heading.id}` });
+          }
+          return `${sec.id}#${heading.id}`;
+        }
+      }
+      return href;
+    } catch (__e) {
+      return href;
+    }
+  }
+
   async function goToc(href: string) {
     if (!view) return;
     try {
@@ -2971,7 +3017,8 @@ function applyTopHandleHitHeight() {
           return;
         }
       }
-      await view.goTo(href);
+      const target = await refineTocLandingHref(view, href);
+      await view.goTo(target);
       showToc = false;
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · goToc", "debug"); }
   }
@@ -3480,6 +3527,7 @@ function applyTopHandleHitHeight() {
       case "openSearch":
         showSearch = true;
         showSettings = false;
+        showMoreMenu = false;
         showToc = false;
         setTimeout(() => {
           try { searchInput?.focus(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · onGlobalKey", "debug"); }
@@ -3836,6 +3884,31 @@ function applyTopHandleHitHeight() {
     ensureTopBarForPopover();
   }
 
+  /* ================= 2026-10-24 移动端适配 Phase 2.1：紧凑顶栏 ⋯ 溢出菜单 =================
+   * 旧实现：{#if !isIphoneMode} 把顶栏右组（双语/设置/搜索）整组隐藏 → 手机上无入口（功能断头）。
+   * 新实现：isCompactToolbar 时右组只留「进度 + ⋯」，以上功能收进溢出菜单。
+   * 菜单模板见 more-menu 块（复用 .reader-popover：点空白收起 + 统一质感免维护）。 */
+  function toggleMoreMenu() {
+    showMoreMenu = !showMoreMenu;
+    if (showMoreMenu) closeOtherPanels("more");
+  }
+  function onMoreToggleBilingual() {
+    showMoreMenu = false;
+    void toggleBilingual();
+  }
+  function onMoreBilingualSettings() {
+    showMoreMenu = false;
+    openBilingualSettingsPanel();
+  }
+  function onMoreSettings() {
+    showMoreMenu = false;
+    if (!showSettings) toggleSettings();
+  }
+  function onMoreSearch() {
+    showMoreMenu = false;
+    if (!showSearch) toggleSearch();
+  }
+
   function clearSearch() {
     try {
       view?.clearSearch?.();
@@ -3922,6 +3995,8 @@ function applyTopHandleHitHeight() {
     if (except !== "toc") showToc = false;
     if (except !== "search") showSearch = false;
     if (except !== "settings") showSettings = false;
+    // 2026-10-24 移动端适配 Phase 2.1：⋯ 溢出菜单纳入互斥体系
+    if (except !== "more") showMoreMenu = false;
   }
 
   /** 在当前页加/删书签（同位置再点一次即移除） */
@@ -4212,6 +4287,16 @@ function applyTopHandleHitHeight() {
   let deviceClass: ReturnType<typeof getDeviceClass> = "desktop";
   // iPhone / Android Phone 降级模式（强制 fit-width + 工具栏底部 sheet）
   let isIphoneMode = false;
+  // 2026-10-24 移动端适配 Phase 1/2.1：
+  //  - viewportBp —— $viewport.breakpoint 的本地镜像（模板 class: 指令用）
+  //  - isCompactToolbar —— 紧凑顶栏开关：手机（deviceClass 判定，含横屏）或窄视口（≤600px）。
+  //    开启时右组收纳为「进度 + ⋯ 溢出菜单」（双语/设置/搜索进菜单，见模板 more-menu 块）。
+  //    旧实现按 isIphoneMode 整组隐藏且无替代入口，手机上进不了设置/搜索 —— 已废弃。
+  let viewportBp: ViewportBreakpoint = "desktop";
+  $: viewportBp = $viewport.breakpoint;
+  $: isCompactToolbar = isIphoneMode || isPhoneBreakpoint(viewportBp);
+  // ⋯ 溢出菜单（紧凑顶栏专属）
+  let showMoreMenu = false;
 
   /**
    * 是否 PDF 书籍。
@@ -5052,9 +5137,10 @@ function applyTopHandleHitHeight() {
     // [REword patch 2026-08-29] Phase 2 触屏：单击空白处关闭所有浮层
     // 触屏场景：用户点中心区时如果有浮层（搜索/设置/目录）打开，
     // 应优先关闭浮层而不是 toggle 工具栏可见性（避免被遮挡的工具栏闪一下）
-    if (showSettings || showSearch) {
+    if (showSettings || showSearch || showMoreMenu) {
       showSettings = false;
       showSearch = false;
+      showMoreMenu = false;
       releaseTopBarForPopover();
       return;
     }
@@ -6176,6 +6262,8 @@ function applyTopHandleHitHeight() {
     activeDrawer = null;
     showSettings = false;
     showSearch = false;
+    // 2026-10-24 移动端适配 Phase 2.1：⋯ 溢出菜单随统一收起链路关闭
+    showMoreMenu = false;
     showFootnote = false;
     // 2026-10-10：快捷键面板一并收起（Esc / 点空白都走这里）。
     showShortcutHint = false;
@@ -6215,7 +6303,7 @@ function applyTopHandleHitHeight() {
     }
     // 2026-08-30 修复：守卫必须覆盖三个抽屉（此前只查 showToc，导致书签/摘录抽屉
     // 开着时点空白不会收起）；activeDrawer 也纳入，避免状态残留时漏关
-    if (!showToc && !showMarks && !showSettings && !showSearch && !showFootnote && !selToolbar.visible && !noteEditor.visible && !activeDrawer) return;
+    if (!showToc && !showMarks && !showSettings && !showSearch && !showMoreMenu && !showFootnote && !selToolbar.visible && !noteEditor.visible && !activeDrawer) return;
     const t = _e.target as Element | null;
     if (!t) return;
     dbg.event("onContainerMouseDown", "▶ 入口", { target: t.tagName + "." + (typeof t.className === "string" ? t.className : ""), selVisible: selToolbar.visible, mode: selToolbar.mode });
@@ -11049,6 +11137,9 @@ function applyTopHandleHitHeight() {
   on:mousemove={onReaderMouseMove}
   on:mouseleave={onReaderLeave}
   data-view-transition-root=""
+  class:re-phone={viewportBp === "phone"}
+  class:re-large-phone={viewportBp === "largePhone"}
+  class:re-tablet={viewportBp === "tablet"}
 >
   <!-- 2026-10-08 顶栏浮层化：脱离文档流、浮在正文上方。
        · class:reader-toolbar-floating —— 悬浮模式（topBarFloating，默认开）
@@ -11109,10 +11200,14 @@ function applyTopHandleHitHeight() {
         <span class="reader-chapter" title={chapterLabel} style="user-select:text;cursor:text">{chapterLabel}</span>
       {/if}
     </div>
-    <!-- 右：进度 + 双语 / 设置 / 搜索 / PDF 缩放 -->
+    <!-- 右：进度 + 双语 / 设置 / 搜索 / PDF 缩放。
+         2026-10-24 移动端适配 Phase 2.1：isCompactToolbar（手机 / ≤600px 窄视口）时
+         收敛为「进度 + ⋯」，双语/设置/搜索进溢出菜单（more-menu 块）。
+         旧实现按 isIphoneMode 整组隐藏且无替代入口 → 手机上进不了设置/搜索（已修）。
+         PDF 缩放/页码组两种模式都保留（缩放/翻页是刚需，见 PdfToolbar）。 -->
     <div class="reader-toolbar-right">
       <span class="reader-progress" title={t("阅读进度")}>{progressText}</span>
-      {#if !isIphoneMode}
+      {#if !isCompactToolbar}
         <!-- 2026-10-14 地基重构：双语对照依赖向可重排 DOM 注入译文，仅 reflow 内容适用。
              由能力表 caps.reflow 门控（PDF 位图=false、漫画图片=false 均隐藏；EPUB/TXT=true）。
              此前用 readerMode !== "pdf" 判定，会误对漫画(CBZ)也显示双语入口。 -->
@@ -11142,6 +11237,17 @@ function applyTopHandleHitHeight() {
           class:reader-btn-active={showSearch}
           on:click={toggleSearch}
         >🔍</button>
+      {:else}
+        <!-- 紧凑顶栏：双语/设置/搜索收进 ⋯（按钮 44×44 命中区由 .reader-toolbar-iphone /
+             (pointer:coarse) 规则放大） -->
+        <button
+          class="reader-btn reader-more-btn"
+          title={t("更多")}
+          aria-label={t("更多")}
+          aria-expanded={showMoreMenu}
+          class:reader-btn-active={showMoreMenu}
+          on:click={toggleMoreMenu}
+        >⋯</button>
       {/if}
       <!-- [REword 2026-09-02] PDF 界面专属：缩放 + 页码。iPhone 模式下也保留（缩放/翻页是刚需） -->
       {#if readerMode === "pdf"}
@@ -11326,6 +11432,33 @@ function applyTopHandleHitHeight() {
       {:else if searchQuery.trim()}
         <div class="reader-search-status">{t("未找到「{q}」", { q: searchQuery.trim() })}</div>
       {/if}
+    </div>
+  {/if}
+
+  {#if showMoreMenu}
+    <!-- 2026-10-24 移动端适配 Phase 2.1：紧凑顶栏 ⋯ 溢出菜单。
+         复用 .reader-popover（点空白收起走 onContainerMouseDown 的 .reader-popover 豁免 +
+         closeAllPopovers 链路，统一质感）。锚点在顶栏右组，故定位 top:44px; right:8px。 -->
+    <div class="reader-popover reader-more-menu" role="menu" aria-label={t("更多")} on:wheel|stopPropagation>
+      <div class="reader-popover-title">{t("更多")}</div>
+      {#if caps.reflow}
+        <button class="reader-more-item" role="menuitem" class:reader-more-item-active={bilingualOn}
+          on:click={onMoreToggleBilingual}>
+          <span>{t("双语对照")}</span>
+          <span class="reader-more-item-state">
+            {bilingualProgress.active ? `${bilingualProgress.done}/${bilingualProgress.total}` : bilingualOn ? t("开") : t("关")}
+          </span>
+        </button>
+        <button class="reader-more-item" role="menuitem" on:click={onMoreBilingualSettings}>
+          <span>{t("双语翻译设置")}</span>
+        </button>
+      {/if}
+      <button class="reader-more-item" role="menuitem" on:click={onMoreSettings}>
+        <span>⚙ {t("设置")}</span>
+      </button>
+      <button class="reader-more-item" role="menuitem" on:click={onMoreSearch}>
+        <span>🔍 {t("搜索全书（F3 / ⌘F）")}</span>
+      </button>
     </div>
   {/if}
 
@@ -12106,8 +12239,9 @@ function applyTopHandleHitHeight() {
     left: 6px;
     right: 6px;
     /* z-index 高于 stage(0) / backdrop(1) / floating-layer(2)，与底栏(5)同级；
-       圆点把手(7)在其之上。仍远低于思源原生 UI（同底栏的取值口径）。 */
-    z-index: 5;
+       圆点把手(7)在其之上。仍远低于思源原生 UI（同底栏的取值口径）。
+       2026-10-24 Phase 1：z 值 token 化（--rz-*，见 reader-ui.less 分层表），下同。 */
+    z-index: var(--rz-toolbar);
     /* 悬浮药丸条质感（与底栏对称）：思源 surface 底 + 圆角 + 半透明毛玻璃。
        不透明实色会「糊掉一块」，半透明能隐约看见底下的字，更像浮在上面。 */
     border-radius: var(--b3-border-radius, 8px);
@@ -12162,7 +12296,7 @@ function applyTopHandleHitHeight() {
     left: 50%;
     top: 4px;
     /* 高于顶栏浮层(5)，与底栏把手(7)同一层 */
-    z-index: 7;
+    z-index: var(--rz-handle);
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -12362,7 +12496,7 @@ function applyTopHandleHitHeight() {
     left: 0;
     right: 0;
     bottom: 0;
-    z-index: 1;
+    z-index: var(--rz-backdrop);
     background: transparent;
   }
 
@@ -12376,7 +12510,7 @@ function applyTopHandleHitHeight() {
     position: absolute;
     inset: 0;
     pointer-events: none;
-    z-index: 2;
+    z-index: var(--rz-floating);
   }
 
   .reader-floating-layer > * {
@@ -12398,7 +12532,7 @@ function applyTopHandleHitHeight() {
     pointer-events: auto;
     touch-action: none; /* 拖拽优先于滚动/系统选区 */
     cursor: ew-resize;
-    z-index: 4;
+    z-index: var(--rz-sel-handle);
   }
   .reader-sel-handle::before {
     content: "";
@@ -12454,7 +12588,7 @@ function applyTopHandleHitHeight() {
     left: 0;
     top: 0;
     transform: translate(-50%, -100%);
-    z-index: 3;
+    z-index: var(--rz-sel-toolbar);
     display: flex;
     flex-direction: column;
     align-items: stretch;
@@ -13707,7 +13841,7 @@ function applyTopHandleHitHeight() {
     position: absolute;
     /* 2026-08-24 修复：z-index 从 40 降到 2，保持高于 stage(0)/backdrop(1)，
        但远低于思源原生 UI，避免压住顶栏"管理"菜单 */
-    z-index: 2;
+    z-index: var(--rz-popover);
     background: var(--b3-theme-background, #fff);
     border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.15));
     border-radius: 10px;
@@ -13752,6 +13886,99 @@ function applyTopHandleHitHeight() {
     /* 入场动效（角标从锚点图标"长出来"） */
     transform-origin: top left;
     animation: reader-drawer-in 180ms ease-out;
+  }
+  /* 2026-10-24 移动端适配 Phase 2.1：紧凑顶栏 ⋯ 溢出菜单（isCompactToolbar 时右组收敛）。
+     锚定顶栏右组（top:44px 与各抽屉一致；right:8px 对齐 ⋯ 按钮列）。
+     触屏命中区 ≥44px（同 (pointer:coarse) 基线，菜单项无条件放大——菜单本就是手机入口）。 */
+  .reader-more-menu {
+    top: 44px;
+    right: 8px;
+    left: auto;
+    width: 216px;
+    padding: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    transform-origin: top right;
+    animation: reader-drawer-in 180ms ease-out;
+  }
+  .reader-more-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    box-sizing: border-box;
+    border: none;
+    background: none;
+    cursor: pointer;
+    text-align: left;
+    padding: 10px;
+    border-radius: 6px;
+    font-size: 14px;
+    min-height: 44px;
+    color: var(--b3-theme-on-background, #333);
+  }
+  .reader-more-item:hover {
+    background: var(--b3-theme-background-light, rgba(0, 0, 0, 0.06));
+  }
+  .reader-more-item-active {
+    color: var(--b3-theme-primary, #378add);
+  }
+  .reader-more-item-state {
+    font-size: 12px;
+    color: var(--b3-theme-on-surface-light, #888);
+  }
+
+  /* ================================================================
+   * 2026-10-24 移动端适配 Phase 2.2/2.4：手机（re-phone/re-large-phone）
+   * ================================================================
+   * ① 侧栏 popover（目录/书签摘录/搜索）→ 底部 sheet：
+   *    280px 窄 popover 在手机上又窄又矮还遮正文；改为贴底全宽 sheet，
+   *    底部让出 44px 给圆点把手/进度条区。角标小三角一并隐藏（锚点语义不再成立）。
+   * ② TTS 朗读条：横向一长条在窄屏溢出 → 允许横向滚动（改动最小的方案）。 */
+  .reader-view.re-phone .reader-toc,
+  .reader-view.re-phone .reader-bookmarks,
+  .reader-view.re-phone .reader-annots,
+  .reader-view.re-phone .reader-marks,
+  .reader-view.re-phone .reader-search {
+    top: auto;
+    bottom: 44px;
+    left: 0;
+    right: 0;
+    width: auto;
+    min-width: 0;
+    max-height: min(78vh, calc(100% - 104px));
+    border-radius: 16px 16px 0 0;
+    border-bottom: none;
+    transform-origin: bottom center;
+    animation: reader-sheet-in 180ms ease-out;
+  }
+  .reader-view.re-phone .reader-toc::before,
+  .reader-view.re-phone .reader-bookmarks::before,
+  .reader-view.re-phone .reader-annots::before,
+  .reader-view.re-phone .reader-marks::before {
+    display: none;
+  }
+  .reader-view.re-large-phone .reader-toc,
+  .reader-view.re-large-phone .reader-bookmarks,
+  .reader-view.re-large-phone .reader-annots,
+  .reader-view.re-large-phone .reader-marks {
+    /* 大手机（480-600px）保持锚定 popover 形态，但放宽到 320px 并提高高度上限 */
+    width: 320px;
+    max-height: 78vh;
+  }
+  @keyframes reader-sheet-in {
+    from { opacity: 0; transform: translateY(12px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+  .reader-view.re-phone .reader-tts-bar {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+  }
+  .reader-view.re-phone .reader-tts-bar::-webkit-scrollbar {
+    display: none;
   }
   @keyframes reader-drawer-in {
     from { opacity: 0; transform: translateY(-6px) scale(0.96); }
@@ -13865,7 +14092,7 @@ function applyTopHandleHitHeight() {
   .reader-imgv {
     position: fixed;
     inset: 0;
-    z-index: 60;
+    z-index: var(--rz-imgv);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -15200,7 +15427,7 @@ function applyTopHandleHitHeight() {
     left: 6px;
     right: 6px;
     bottom: 6px;
-    z-index: 5;
+    z-index: var(--rz-toolbar);
     opacity: 0;
     pointer-events: none;
     /* 2026-10-07：收起态带一点缩小，浮起时「浮上来」的层次感更强 */
@@ -15242,7 +15469,7 @@ function applyTopHandleHitHeight() {
     position: absolute;
     left: 50%;
     bottom: 8px;
-    z-index: 7; /* 高于进度条（z-index:5），展开时把手位于进度条上方仍可见可点 */
+    z-index: var(--rz-handle); /* 高于进度条（--rz-toolbar），展开时把手位于进度条上方仍可见可点 */
     display: inline-flex;
     align-items: center;
     justify-content: center;

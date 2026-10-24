@@ -544,4 +544,14 @@
     white-space: nowrap;
     box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
   }
+
+  /* 2026-10-24 移动端适配 Phase 4：手机（≤600px）转为底部 sheet（.edit-mask 是 flex 容器） */
+  @media (max-width: 600px) {
+    .graph-panel {
+      align-self: flex-end;
+      width: 100vw;
+      max-height: calc(100dvh - 24px);
+      border-radius: 16px 16px 0 0;
+    }
+  }
 </style>

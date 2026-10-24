@@ -788,6 +788,13 @@
   .rw-swatches { grid-template-columns: repeat(2, 1fr); }
   .rwd-tab { padding: 8px 10px 10px; }
   .rwd-tab-label { font-size: 11px; }
+  /* 2026-10-24 移动端适配 Phase 4：5+ 个 tab 在窄屏必然溢出 → 横向滚动 */
+  .rwd-tabs {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .rwd-tabs::-webkit-scrollbar { display: none; }
+  .rwd-tab { flex-shrink: 0; }
 }
 
 /* ===================== 词典管理（二级页内容） ===================== */

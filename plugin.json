@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-reader",
   "author": "LongDarkroom",
   "url": "https://github.com/LongDarkroom/siyuan-plugin-reader",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "minAppVersion": "3.7.0",
   "backends": ["all"],
   "frontends": ["desktop", "browser-desktop", "mobile", "browser-mobile"],

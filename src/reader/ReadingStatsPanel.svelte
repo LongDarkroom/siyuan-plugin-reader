@@ -473,4 +473,14 @@
     text-align: center;
     padding: 40px 0;
   }
+
+  /* 2026-10-24 移动端适配 Phase 4：手机（≤600px）转为底部 sheet（.edit-mask 是 flex 容器） */
+  @media (max-width: 600px) {
+    .stats-panel {
+      align-self: flex-end;
+      width: 100vw;
+      max-height: calc(100dvh - 24px);
+      border-radius: 16px 16px 0 0;
+    }
+  }
 </style>

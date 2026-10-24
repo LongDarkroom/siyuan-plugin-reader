@@ -102,11 +102,32 @@
     dispatch("close");
   }
 
-  function onItemClick(item: MenuItem) {
+  function onItemClick(item: MenuItem, idx?: number) {
     if (item.disabled) return;
-    if (item.children?.length) return; // 子菜单只能 hover 展开
+    if (item.children?.length) {
+      // 2026-10-24 移动端适配：触屏没有 hover，点按父项 = 展开/收起子菜单
+      // （桌面行为不变：hover 展开仍由 onItemEnter 处理，两者共存）。
+      if (idx != null) {
+        if (openSubmenuIdx === idx) {
+          openSubmenuIdx = -1;
+          return;
+        }
+        const btn = menuEl?.querySelectorAll(".shelf-menu-item")[idx] as HTMLElement | undefined;
+        if (btn) {
+          const tr = btn.getBoundingClientRect();
+          openSubmenuIdx = idx;
+          submenuPos = { x: clampSubmenuX(tr.right + 2), y: tr.top };
+        }
+      }
+      return;
+    }
     item.onClick?.();
     close();
+  }
+
+  /** 子菜单 x 定位：窄屏钳到视口内（右侧放不下就贴右缘，2026-10-24 移动端适配） */
+  function clampSubmenuX(x: number): number {
+    return Math.max(4, Math.min(x, window.innerWidth - 186));
   }
 
   function onItemEnter(idx: number, item: MenuItem, e: MouseEvent) {
@@ -118,7 +139,7 @@
     // 子菜单位置:菜单项右侧,垂直对齐
     const t = e.currentTarget as HTMLElement;
     const tr = t.getBoundingClientRect();
-    submenuPos = { x: tr.right + 2, y: tr.top };
+    submenuPos = { x: clampSubmenuX(tr.right + 2), y: tr.top };
   }
 
   function onItemLeave(e: MouseEvent) {
@@ -155,7 +176,7 @@
         class:has-submenu={!!item.children?.length}
         class:active={item.active}
         role="menuitem"
-        on:click={() => onItemClick(item)}
+        on:click={() => onItemClick(item, i)}
         on:mouseenter={(e) => onItemEnter(i, item, e)}
         on:mouseleave={onItemLeave}
       >
@@ -286,5 +307,23 @@
     border-radius: 6px;
     box-shadow: 0 6px 18px rgba(0, 0, 0, 0.2);
     padding: 4px 0;
+  }
+  /* 2026-10-24 移动端适配 Phase 4：手机上右键菜单（长按/⋯ 唤起）转为底部 action sheet。
+     !important 压过 inline left/top（组件按点击点定位，手机上贴边易溢出）。 */
+  @media (max-width: 600px) {
+    .shelf-context-menu {
+      left: 8px !important;
+      right: 8px !important;
+      top: auto !important;
+      bottom: calc(12px + env(safe-area-inset-bottom, 0px)) !important;
+      max-width: none;
+    }
+    .shelf-menu-item {
+      min-height: 44px;
+    }
+    /* 底部 sheet 下子菜单改为叠加在父菜单上方，不再向右飞出屏幕 */
+    .shelf-menu-submenu {
+      min-width: 180px;
+    }
   }
 </style>

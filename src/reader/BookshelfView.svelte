@@ -5,6 +5,8 @@
    * 续读、删除、编辑信息（书名/作者）。
    */
   import { onMount, onDestroy, tick } from "svelte";
+  // 2026-10-24 移动端适配 Phase 1/3：响应式视口状态（根节点状态类 + 手机端交互分支）
+  import { viewport, isPhoneBreakpoint } from "../core/viewport-store.ts";
   import type {
     BookshelfStore,
     BookMeta,
@@ -71,6 +73,53 @@
   }
   function closeCtxMenu() {
     ctxMenu = null;
+  }
+
+  /* ================================================================
+   * 2026-10-24 移动端适配 Phase 3：书卡触屏化
+   * ================================================================
+   * 桌面入口（hover 浮层 / 右键菜单）在手机上都不可达，补两个等价物：
+   *  ① ⋯ 常显小按钮（.book-more-btn，仅 re-phone 显示）→ 弹出与右键同一份菜单；
+   *  ② 长按 500ms = 右键（微信读书惯例），移动 >10px 视为滚动、取消。
+   * 菜单本体复用 BookshelfContextMenu（openCtxMenu），零新增 UI 组件。 */
+  $: isPhoneBp = isPhoneBreakpoint($viewport.breakpoint);
+  let lpTimer: ReturnType<typeof setTimeout> | null = null;
+  let lpStart = { x: 0, y: 0 };
+  let lpFired = false;
+  function onCardTouchStart(e: TouchEvent, items: MenuItem[]) {
+    if (!isPhoneBp) return;
+    const t0 = e.touches[0];
+    if (!t0) return;
+    lpStart = { x: t0.clientX, y: t0.clientY };
+    lpFired = false;
+    const x = t0.clientX;
+    const y = t0.clientY;
+    if (lpTimer) clearTimeout(lpTimer);
+    lpTimer = setTimeout(() => {
+      lpTimer = null;
+      lpFired = true;
+      ctxMenu = { x, y, items };
+    }, 500);
+  }
+  function onCardTouchMove(e: TouchEvent) {
+    if (!lpTimer) return;
+    const t0 = e.touches[0];
+    if (!t0) return;
+    if (Math.hypot(t0.clientX - lpStart.x, t0.clientY - lpStart.y) > 10) {
+      clearTimeout(lpTimer);
+      lpTimer = null;
+    }
+  }
+  function onCardTouchEnd(e: TouchEvent) {
+    if (lpTimer) {
+      clearTimeout(lpTimer);
+      lpTimer = null;
+    }
+    // 长按已弹出菜单：吞掉随后的合成 click，避免封面按钮把书打开
+    if (lpFired) {
+      e.preventDefault();
+      lpFired = false;
+    }
   }
 
   /* ================================================================
@@ -1252,6 +1301,8 @@
 
   onMount(() => {
     loadUiPrefs();
+    // 2026-10-24 移动端适配 Phase 3：手机端分组侧栏是 overlay 抽屉，默认收起（桌面保持记忆值）
+    if (isPhoneBreakpoint($viewport.breakpoint)) sidebarOpen = false;
     void refresh();
     unsubStore = store.subscribe((list) => {
       if (!Array.isArray(list)) return;
@@ -1375,6 +1426,9 @@
 <div
   class="bookshelf-view"
   class:dragging
+  class:re-phone={$viewport.breakpoint === "phone"}
+  class:re-large-phone={$viewport.breakpoint === "largePhone"}
+  class:re-tablet={$viewport.breakpoint === "tablet"}
   on:dragenter={onDragEnter}
   on:dragover={onDragOver}
   on:dragleave={onDragLeave}
@@ -1576,8 +1630,13 @@
   <div
     class="bookshelf-body"
     class:side-resizing={sideResizing}
+    class:sidebar-open={sidebarOpen}
     bind:this={shelfBodyEl}
   >
+    <!-- 2026-10-24 移动端适配 Phase 3：手机端分组侧栏是 overlay 抽屉，补一块可点击的遮罩 -->
+    {#if sidebarOpen && isPhoneBp}
+      <div class="shelf-sb-backdrop" on:click={() => (sidebarOpen = false)}></div>
+    {/if}
     {#if sidebarOpen}
       <!-- [2026-08-29] P1 分组侧栏：用户分组 + 智能分组（状态/标签/格式） -->
       <aside class="shelf-sidebar" style="width:{sideWidth}px">
@@ -1871,6 +1930,10 @@
               draggable={true}
               on:dragstart={(e) => onBookDragStart(e, book.id)}
               on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
+              on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
+              on:touchmove={onCardTouchMove}
+              on:touchend={onCardTouchEnd}
+              on:touchcancel={onCardTouchEnd}
             >
               <div class="book-cover-wrap">
                 <button
@@ -1906,6 +1969,13 @@
                   title={book.favorite ? t("取消收藏") : t("收藏")}
                   on:click|stopPropagation={() => toggleFav(book)}
                 ><span class="reword-shelf-ico reword-shelf-ico--sm{book.favorite ? ' reword-shelf-ico--fill' : ''}">{@html SEL_ICONS.fav}</span></button>
+                <!-- 2026-10-24 移动端适配 Phase 3：触屏操作入口（hover 浮层/右键在手机不可达）。
+                     仅 re-phone 显示（默认 display:none），弹出与右键同一份菜单。 -->
+                <button
+                  class="book-more-btn"
+                  title={t("更多操作")}
+                  on:click|stopPropagation={(e) => openCtxMenu(e, buildBookMenu(book))}
+                >⋯</button>
                 <!-- 2026-08-29 优化：操作按钮收纳到封面悬停层，卡片信息更简洁 -->
                 <div
                   class="book-cover-overlay"
@@ -1985,6 +2055,10 @@
               draggable={true}
               on:dragstart={(e) => onBookDragStart(e, book.id)}
               on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
+              on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
+              on:touchmove={onCardTouchMove}
+              on:touchend={onCardTouchEnd}
+              on:touchcancel={onCardTouchEnd}
             >
               <!-- 第 1 列：多选时是勾选框，否则是色点（同一格，列数不随模式变） -->
               <div class="row-lead">
@@ -2069,6 +2143,12 @@
                   <button class="row-icon-btn" title={t("编辑")} on:click={() => openEdit(book)}><span class="reword-shelf-ico">{@html SEL_ICONS.edit}</span></button>
                   <button class="row-icon-btn danger" title={t("删除")} on:click={() => openRemove(book)}><span class="reword-shelf-ico">{@html SEL_ICONS.trash}</span></button>
                 </div>
+                <!-- 2026-10-24 移动端适配 Phase 3：触屏菜单入口（row-actions-extra 是 hover 显示） -->
+                <button
+                  class="book-more-btn row-more-btn"
+                  title={t("更多操作")}
+                  on:click|stopPropagation={(e) => openCtxMenu(e, buildBookMenu(book))}
+                >⋯</button>
               </div>
             </div>
           {/each}
@@ -3384,6 +3464,83 @@
     display: flex;
     min-height: 0;
     overflow: hidden;
+  }
+
+  /* ================================================================
+   * 2026-10-24 移动端适配 Phase 3：书架手机端（re-phone）
+   * ================================================================
+   * ① 分组侧栏 → overlay 左抽屉（inline 宽度需 !important 压过）+ 遮罩；
+   * ② resizer / 拖拽是桌面交互，隐藏；
+   * ③ header 一行 9 组控件必然溢出 → 横向滚动（隐藏滚动条，视觉仍是单行）；
+   * ④ 卡片 ⋯ 菜单按钮：桌面隐藏、手机常显（触屏操作入口）。 */
+  .bookshelf-view.re-phone .bookshelf-body {
+    position: relative;
+  }
+  .bookshelf-view.re-phone .shelf-sidebar {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: min(78vw, 320px) !important;
+    max-width: 85%;
+    z-index: 30;
+    background: var(--b3-theme-background, #fff);
+    box-shadow: 0 0 24px rgba(0, 0, 0, 0.2);
+    animation: shelf-drawer-in 180ms ease-out;
+  }
+  .bookshelf-view.re-phone .shelf-side-resizer {
+    display: none;
+  }
+  .shelf-sb-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 29;
+    background: rgba(0, 0, 0, 0.35);
+  }
+  @keyframes shelf-drawer-in {
+    from { transform: translateX(-30%); opacity: 0; }
+    to   { transform: translateX(0);    opacity: 1; }
+  }
+  .bookshelf-view.re-phone .bookshelf-header {
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .bookshelf-view.re-phone .bookshelf-header::-webkit-scrollbar {
+    display: none;
+  }
+  .bookshelf-view.re-phone .bookshelf-header > * {
+    flex-shrink: 0;
+  }
+  .book-more-btn {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    min-width: 32px;
+    min-height: 32px;
+    border: none;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.45);
+    color: #fff;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .bookshelf-view.re-phone .book-more-btn {
+    display: inline-flex;
+  }
+  /* 网格卡：⋯ 钉在封面左上（右上被收藏星占了） */
+  .book-cover-wrap .book-more-btn {
+    position: absolute;
+    left: 6px;
+    top: 6px;
+    z-index: 3;
+  }
+  .bookshelf-view.re-phone .row-more-btn {
+    min-width: 36px;
+    min-height: 36px;
+    background: none;
+    color: var(--b3-theme-on-surface, #555);
+    font-size: 18px;
   }
   /* 拖动中：整块区域显示 col-resize，顺手禁掉选字 */
   .bookshelf-body.side-resizing {
