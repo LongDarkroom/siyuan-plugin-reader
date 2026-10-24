@@ -30,6 +30,7 @@ INCLUDE_FILES = [
     # （见 src/reader/bookshelf-store.ts:146-149）。漏掉它 → 从集市安装的插件
     # 在非弱设备（桌面）上解析 PDF 元数据/封面时 worker 加载失败。
     "pdf.worker.mjs",
+    "LICENSE",       # 许可证：集市校验要求仓库根目录与发布包均含许可证文件
     # "appreciate.jpg",  # 可选：赞赏码图片，自行放入仓库根目录后再取消注释以随包分发
 ]
 # 直接平铺到 zip 根的【白名单目录】
