@@ -1190,6 +1190,55 @@ function applyTopHandleHitHeight() {
     topBarRevealed = isTopBarFloating() && (topBarPinned || topBarBarHover);
   }
 
+  /* ================= 2026-10-25 移动端适配 B1：浮层栏自动收起 =================
+   * 用户真机反馈：顶/底栏弹出后一直挡着正文（移动端可视高度小，遮挡感强）。
+   * 只动 revealed/pinned 状态位（opacity/transform 过渡，零重排——
+   * 符合本文件"显隐不写几何"的铁律），触屏 3.5s 无交互自动收回。
+   * 触发：revealed 状态变化的响应式块 + 翻页（onRelocate，B2）。 */
+
+  const BAR_AUTO_HIDE_MS = 3500;
+  let barAutoHideTimer: any = null;
+
+  /** 完全收回顶/底浮层栏（含 pinned——自动收起本就是"替用户收"） */
+  function retractFloatingBars() {
+    if (!isTouchDevice()) return; // 桌面 hover/pinned 语义不动
+    let changed = false;
+    if (bottomBarRevealed || bottomBarPinned) {
+      bottomBarPinned = false;
+      bottomBarBarHover = false;
+      updateBottomBarReveal();
+      changed = true;
+    }
+    if (isTopBarFloating() && (topBarRevealed || topBarPinned)) {
+      // 顶栏收起联动收抽屉（与 toggleTopBarPin 收起分支同语义，防孤儿抽屉）
+      closeAllPopovers();
+      topBarPinned = false;
+      topBarBarHover = false;
+      updateTopBarReveal();
+      changed = true;
+    }
+    if (changed && barAutoHideTimer) {
+      clearTimeout(barAutoHideTimer);
+      barAutoHideTimer = null;
+    }
+  }
+
+  /** revealed 变化驱动：浮起 → 排 3.5s 收回；全收 → 清计时器 */
+  function pokeBarAutoHide(revealed: boolean) {
+    if (!isTouchDevice()) return;
+    if (revealed) {
+      if (barAutoHideTimer) clearTimeout(barAutoHideTimer);
+      barAutoHideTimer = setTimeout(() => {
+        barAutoHideTimer = null;
+        retractFloatingBars();
+      }, BAR_AUTO_HIDE_MS);
+    } else if (barAutoHideTimer) {
+      clearTimeout(barAutoHideTimer);
+      barAutoHideTimer = null;
+    }
+  }
+  $: pokeBarAutoHide(topBarRevealed || bottomBarRevealed);
+
   /** 点击顶部圆点：切换顶栏浮起 / 收回 */
   function toggleTopBarPin() {
     const willReveal = !topBarRevealed;
@@ -2387,6 +2436,17 @@ function applyTopHandleHitHeight() {
         pinchDist0 = 0;
         return;
       }
+      // 2026-10-25 移动端适配 A1：触屏选词接通划词工具栏。
+      // 桌面靠 iframe mouseup（onContentMouseUp）→ scheduleReadSelection；
+      // 触屏选词（长按选词/系统手柄）**不合成 mouseup**，桌面链路整条断死。
+      // 松手时选区非折叠 → 直接走同一条读取链（复用全部定位/避让/重试逻辑）。
+      try {
+        const sel = doc.getSelection?.();
+        if (sel && !sel.isCollapsed && typeof sel.toString === "function" && sel.toString().trim()) {
+          scheduleReadSelection();
+          return; // 有选区：不参与翻页/点按判定
+        }
+      } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · touchend selection", "debug"); }
       const c = e.changedTouches[0];
       if (!c) return;
       const dx = c.clientX - touchX;
@@ -6496,6 +6556,8 @@ function applyTopHandleHitHeight() {
   let wheelDetector: WheelGestureDetector | null = null;
   // 实时手柄刷新的 rAF 节流句柄（selectionchange 高频触发，一帧最多算一次）。
   let selHandleLiveRaf = 0;
+  // 2026-10-25 移动端适配 A2：selectionchange → 弹划词工具栏的防抖定时器（见 onContentSelectionChange）
+  let selTouchDebounceTimer: any = null;
   // 鼠标/触控正在按住拖选中（pointerdown→up 之间）。滚动收起手柄时据此避让：
   // 拖选到视口边缘会触发自动滚动，此时不能因 scroll 就把正在扩展的手柄/选区收起。
   let contentPointerHeld = false;
@@ -8160,6 +8222,18 @@ function applyTopHandleHitHeight() {
       selHandleLiveRaf = 0;
       updateSelHandlesLive();
     });
+    // 2026-10-25 移动端适配 A2：selectionchange 防抖兜底弹划词工具栏。
+    // A1 主路径（touchend）覆盖"长按选词"；本兜底覆盖"拖系统选区手柄改选区"——
+    // iOS/Android 的选区手柄是系统 UI，拖动/松手不产生页面 touchend，只能靠 selectionchange 感知。
+    // gate：仅触屏（桌面靠 mouseup 精确触发，这里直弹会拖选抖动）+ 非自绘手柄拖拽中
+    // （selHandleDragging 自管）+ 只有读到**有效选区**才弹（折叠时绝不收，避免拖动中误关）。
+    if (!isTouchDevice() || selHandleDragging) return;
+    if (selTouchDebounceTimer) clearTimeout(selTouchDebounceTimer);
+    selTouchDebounceTimer = setTimeout(() => {
+      selTouchDebounceTimer = null;
+      if (selHandleDragging) return;
+      if (readReaderSelection()) scheduleReadSelection();
+    }, 320);
   }
   function onContentMouseUp(_e: MouseEvent) {
     contentPointerHeld = false; // 松手：解除「拖选中」避让，此后滚动可正常收起
@@ -8592,6 +8666,9 @@ function applyTopHandleHitHeight() {
       return;
     }
     dbgHud.relocateCalls++;
+    // 2026-10-25 移动端适配 B2：翻页即收顶/底浮层栏（真机反馈遮挡正文；
+    // relocate 也会在初始加载/改字号时触发，栏未浮起时是 no-op）。触屏 only。
+    retractFloatingBars();
     // 2026-10-24 D2：跨页续接进行中 ⇒ **不收起**划词浮层，改为按新位置重锚。
     // （续接窗口内用户正在把选区往下一页接，收起会打断"选到一半"的连续动作。）
     if (isSelContinuationActive() && (selToolbar.visible || selHandles.visible)) {
@@ -13979,6 +14056,25 @@ function applyTopHandleHitHeight() {
   }
   .reader-view.re-phone .reader-tts-bar::-webkit-scrollbar {
     display: none;
+  }
+  /* 2026-10-25 移动端适配 B3：圆点把手命中区让位首/末行。
+     手机上把手是次要入口（中心点按 toggle + 翻页自动收起已是主路径）：
+     顶把手贴顶 22px、底把手贴底 24px、圆点缩小。桌面/平板不变。 */
+  .reader-view.re-phone .reader-top-handle {
+    top: 0;
+    height: 22px;
+  }
+  .reader-view.re-phone .reader-top-handle-dot {
+    width: 5px;
+    height: 5px;
+  }
+  .reader-view.re-phone .reader-bottom-handle:not(.reader-bottom-handle-revealed) {
+    bottom: 0;
+    height: 24px;
+  }
+  .reader-view.re-phone .reader-bottom-handle-dot {
+    width: 5px;
+    height: 5px;
   }
   @keyframes reader-drawer-in {
     from { opacity: 0; transform: translateY(-6px) scale(0.96); }

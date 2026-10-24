@@ -91,6 +91,18 @@ export class ReaderDockController {
     this.mountShelf(target);
   }
 
+  /**
+   * 销毁当前书架组件（2026-10-24 移动端适配）。
+   * 移动端书架由 Dialog 承载：弹窗 destroyCallback 里调用本方法 $destroy
+   * Svelte 组件，防 Dialog DOM 移除后组件残留监听器泄漏。
+   */
+  disposeShelf(): void {
+    try {
+      this.comp?.$destroy?.();
+    } catch (__swallowErr) { logSwallow(__swallowErr, "reader-dock.ts · disposeShelf", "debug"); }
+    this.comp = null;
+  }
+
   /** 书架视图（点书 → 打开独立阅读 Tab） */
   private mountShelf(target: HTMLElement): void {
     this.comp = new BookshelfView({

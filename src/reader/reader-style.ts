@@ -644,6 +644,23 @@ pre, code, kbd, samp, tt,
 }
 
 /**
+ * 触屏正文策略（2026-10-25 移动端适配 A3/C2）
+ * ------------------------------------------------------------------
+ * - `-webkit-touch-callout: none`：屏蔽 iOS 系统长按菜单（拷贝/分享/全选），
+ *   避免它叠在自绘划词工具栏上互相打架。桌面无此概念，零影响；
+ *   Android Chrome 部分版本不识别 —— 不阻塞主链路，真机实测兜底。
+ * - `overscroll-behavior: contain`：正文滚到头/底不把滚动链传给宿主
+ *   （移动端阅读页在 Dialog 里，不 contain 会拖动整个弹窗晃动）。
+ *   分页模式（横向 transform 翻页）不滚动，此规则无副作用。
+ */
+export function touchPolicyStyles(): string {
+  return `html, body {
+  -webkit-touch-callout: none;
+  overscroll-behavior: contain;
+}`.trim();
+}
+
+/**
  * 主样式生成器：把现有 buildStyles() 的内容 + EPUB 排版增强 CSS 拼成完整字符串。
  *
  * @param settings ReaderStyleInput
@@ -720,6 +737,8 @@ export function buildReaderStyles(
     // 2026-10-07：滚动条低调化（深色下亮灰滚动条 = 一条刺眼白线）。
     // 放在最前是保证它不被后续段覆盖；它只碰 html / 滚动条伪元素，互不冲突。
     scrollbarStyles(),
+    // 2026-10-25 移动端适配 A3/C2：触屏正文策略（紧跟滚动条段，同为 html/body 级）。
+    touchPolicyStyles(),
     cjkAliasFontFaces() + "\n" + digitFixFaceCss() + (fontCss ? "\n" + fontCss : ""),
     uniformBlockResetStyles(overrideLayout),
     paragraphStyles(o),

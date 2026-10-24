@@ -77,35 +77,30 @@
 
   /* ================================================================
    * 2026-10-24 移动端适配 Phase 3：书卡触屏化
-   * ================================================================
-   * 桌面入口（hover 浮层 / 右键菜单）在手机上都不可达，补两个等价物：
-   *  ① ⋯ 常显小按钮（.book-more-btn，仅 re-phone 显示）→ 弹出与右键同一份菜单；
-   *  ② 长按 500ms = 右键（微信读书惯例），移动 >10px 视为滚动、取消。
-   * 菜单本体复用 BookshelfContextMenu（openCtxMenu），零新增 UI 组件。 */
+   * 2026-10-25 防误触改造（C3，真机反馈"滑动不流畅且误触"）：
+   *  - **任何位移都取消长按**（旧实现 10px 内的慢速滑动起步会被累计成
+   *    "静止 500ms" 弹菜单——误触主源之一）；长按语义收敛为"按住不动"。
+   *  - 计时 500→550ms；弹出时轻震反馈（Android；iOS 无 API，静默降级）。
+   * ================================================================ */
   $: isPhoneBp = isPhoneBreakpoint($viewport.breakpoint);
   let lpTimer: ReturnType<typeof setTimeout> | null = null;
-  let lpStart = { x: 0, y: 0 };
   let lpFired = false;
   function onCardTouchStart(e: TouchEvent, items: MenuItem[]) {
     if (!isPhoneBp) return;
-    const t0 = e.touches[0];
-    if (!t0) return;
-    lpStart = { x: t0.clientX, y: t0.clientY };
-    lpFired = false;
-    const x = t0.clientX;
-    const y = t0.clientY;
     if (lpTimer) clearTimeout(lpTimer);
+    lpFired = false;
+    const x = e.touches[0]?.clientX ?? 0;
+    const y = e.touches[0]?.clientY ?? 0;
     lpTimer = setTimeout(() => {
       lpTimer = null;
       lpFired = true;
+      try { navigator.vibrate?.(10); } catch { /* iOS 无此 API */ }
       ctxMenu = { x, y, items };
-    }, 500);
+    }, 550);
   }
-  function onCardTouchMove(e: TouchEvent) {
-    if (!lpTimer) return;
-    const t0 = e.touches[0];
-    if (!t0) return;
-    if (Math.hypot(t0.clientX - lpStart.x, t0.clientY - lpStart.y) > 10) {
+  function onCardTouchMove() {
+    // 2026-10-25 C3：任何位移立即取消——不再有 10px 容差（慢滑不再误弹菜单）
+    if (lpTimer) {
       clearTimeout(lpTimer);
       lpTimer = null;
     }
@@ -3518,22 +3513,34 @@
     min-width: 32px;
     min-height: 32px;
     border: none;
-    border-radius: 6px;
-    background: rgba(0, 0, 0, 0.45);
-    color: #fff;
-    font-size: 16px;
+    border-radius: 50%;
+    background: none;
+    color: var(--b3-theme-on-background, #333);
+    font-size: 18px;
     line-height: 1;
     cursor: pointer;
   }
   .bookshelf-view.re-phone .book-more-btn {
     display: inline-flex;
   }
-  /* 网格卡：⋯ 钉在封面左上（右上被收藏星占了） */
+  /* 2026-10-25 移动端适配 C4：视觉降权——封面右下半透明毛玻璃小圆钮。
+     旧版是封面左上 45% 黑底方块（真机截图突兀、且 32px 命中区压在滑动路径上）。 */
   .book-cover-wrap .book-more-btn {
     position: absolute;
-    left: 6px;
-    top: 6px;
+    right: 6px;
+    bottom: 6px;
     z-index: 3;
+    background: color-mix(in srgb, var(--b3-theme-surface, #fff) 72%, transparent);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12));
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.18);
+    color: var(--b3-theme-on-surface, #555);
+  }
+  @supports not (color: color-mix(in srgb, red, blue)) {
+    .book-cover-wrap .book-more-btn {
+      background: var(--b3-theme-surface, #fff);
+    }
   }
   .bookshelf-view.re-phone .row-more-btn {
     min-width: 36px;
@@ -3598,6 +3605,11 @@
     flex: 1;
     min-width: 0;
     overflow-y: auto;
+    /* 2026-10-25 移动端适配 C2/C5：滚动收敛 + 滚动声明。
+       contain：滚到头/底不把滚动链传给宿主 Dialog（手机滑动"生涩/串动"体感来源之一）；
+       pan-y：纵向滚动明确交给浏览器合成器（更跟手），横向手势不被卡片拦截。 */
+    overscroll-behavior: contain;
+    touch-action: pan-y;
     container-type: inline-size;
     container-name: shelf-main;
   }
@@ -3784,6 +3796,9 @@
   .book-cover-wrap {
     position: relative;
     display: flex;
+    /* 2026-10-25 防御：封面 img 必须被裁在卡内（真机出现过封面图撑爆布局） */
+    overflow: hidden;
+    border-radius: 10px;
   }
   .book-cover-wrap .book-cover {
     width: 100%;

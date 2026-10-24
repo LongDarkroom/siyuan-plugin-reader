@@ -14,11 +14,17 @@ import { waitForLaunchIdle } from "./reader-launch.ts";
 
 // @ts-ignore - Svelte 组件
 import ReaderView from "./ReaderView.svelte";
-import { openTab, showMessage } from "siyuan";
+import { openTab, showMessage, Dialog } from "siyuan";
 import type { BookshelfStore } from "./bookshelf-store";
 import type { ReaderSettingsStore } from "./reader-settings";
 import type { FontStore } from "./reader-fonts";
 import { resolveReaderMode } from "./reader-mode.ts";
+// 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
+// `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签路径整条不可用；
+// 移动端改用 Dialog 承载同一 ReaderView（task-note-management 同款模式）。
+import { isMobile } from "../core/env.ts";
+import { responsiveDialogSize } from "../core/responsive.ts";
+import { hardenDialogBody, disposeDialogFit } from "../core/dialog-host.ts";
 
 export const READER_TAB_TYPE = "reader";
 
@@ -65,6 +71,8 @@ interface TabRecord {
 export class ReaderTabController {
   private openTabs = new Map<string, TabRecord>(); // bookId -> { tab, comp, title }
   private opening = new Set<string>(); // bookId -> 正在打开中（防重入竞态导致重复 openTab）
+  // 2026-10-24 移动端适配：移动端 openTab 不可用，ReaderView 改由 Dialog 承载（bookId -> 弹窗会话）
+  private openDialogs = new Map<string, { dialog: Dialog; comp: any; title: string }>();
   private registered = false;
   private sessionTimer: ReturnType<typeof setTimeout> | null = null; // 会话持久化防抖
 
@@ -77,6 +85,116 @@ export class ReaderTabController {
     },
     private getLabel?: (id: string) => { name: string; color: string } | null
   ) {}
+
+  /**
+   * ReaderView props 工厂（2026-10-24 移动端适配抽取）。
+   * 桌面 Tab init 与移动端 Dialog 共用同一份 props；差异只在两个回调：
+   *  - onCloseTab：桌面 = 关 Tab；移动端 = 销毁 Dialog（由调用方闭包决定）
+   *  - onTitleChange：桌面 = 更新 Tab 标题；移动端 = no-op（弹窗标题静态）
+   */
+  private buildReaderProps(
+    bookId: string,
+    onCloseTab: () => void,
+    onTitleChange: (t: string) => void
+  ) {
+    const self = this;
+    return {
+      bookId,
+      store: self.stores.store,
+      settingsStore: self.stores.settingsStore.scopeView(
+        resolveReaderMode(self.stores.store.get(bookId)?.format)
+      ),
+      fontStore: self.stores.fontStore,
+      // 2026-09-08 启动卡死修复：上次启动未完成初始化 → 组件内禁止自动开书（断自锁）
+      launchCrashed: !!self.plugin?.lastLaunchCrashed,
+      onCloseTab,
+      onTitleChange,
+      // 2026-08-28：连续朗读控制器设置透传（get 读 / save 写，结构 = reader-tts 的 RewordTtsSettings）
+      getTtsSettings: () => (self.plugin as any)?.getTtsSettings?.() ?? null,
+      saveTtsSettings: (s: any) => (self.plugin as any)?.saveTtsSettings?.(s) ?? Promise.resolve(),
+      // 2026-08-27：翻译按钮发送到 AI 精读面板（自动打开）；悬浮取词「加入词库」委托 vocabStore
+      onTranslateToAi: (t: string) => self.plugin?.translateToAi?.(t),
+      // 2026-08-27：双语段落批量翻译（按书缓存，引擎链兜底）
+      // 2026-08-30：透传 extra（model/overwrite/signal）以支持整书预翻译细化选项
+      // 2026-08-30 修复：ctxBefore（前文参考）+ meta（书籍元数据）必须透传，
+      //   否则 AI 翻译拿不到前文语境，专有名词一致性（v1.3.0）失效
+      //   meta 兜底用 plugin.getBookMeta(bookId) 现场取；ctxBefore 由调用方（bilingual.ts）传入
+      onTranslateBatch: (
+        texts: string[],
+        from: string,
+        to: string,
+        ctxBefore?: (string | null)[],
+        meta?: { title?: string; author?: string; language?: string; toc?: string } | null,
+        extra?: any
+      ) => {
+        const finalMeta = meta ?? (self.plugin as any)?.getBookMeta?.(bookId) ?? null;
+        return (
+          self.plugin?.translateBatch?.(texts, from, to, bookId, ctxBefore, finalMeta, extra) ??
+          Promise.resolve([])
+        );
+      },
+      // 2026-08-30 详细翻译（回传 provider / fromCache）供成本与引擎统计
+      // 2026-08-30 修复：同 onTranslateBatch，ctxBefore/meta 透传
+      onTranslateBatchDetailed: (
+        texts: string[],
+        from: string,
+        to: string,
+        ctxBefore?: (string | null)[],
+        meta?: { title?: string; author?: string; language?: string; toc?: string } | null,
+        extra?: any
+      ) => {
+        const finalMeta = meta ?? (self.plugin as any)?.getBookMeta?.(bookId) ?? null;
+        return (
+          self.plugin?.translateBatchDetailed?.(texts, from, to, bookId, ctxBefore, finalMeta, extra) ??
+          Promise.resolve({ texts: [], providers: [], fromCache: [] })
+        );
+      },
+      // 2026-08-30：整书预翻译弹窗「已缓存统计」——按书查询每段缓存命中，返回同序 boolean[]
+      onCheckCache: (texts: string[]) =>
+        self.plugin?.checkTranslationCacheHits?.(bookId, texts) ?? Promise.resolve(new Array(texts.length).fill(false)),
+      isTranslationConfigured: () => !!self.plugin?.isTranslationConfigured?.(),
+      getAiSettings: () => (self.plugin as any)?.getAiSettings?.() ?? null,
+      onSaveTencentLock: (chars: number) => (self.plugin as any)?.saveTencentCharsLock?.(chars) ?? Promise.resolve(),
+      onSaveAiSettings: (partial: any) => (self.plugin as any)?.updateAiSettings?.(partial) ?? Promise.resolve(),
+      onAddToVocab: (w: string) => self.plugin?.getVocabStore?.()?.addWord?.(w),
+      // 2026-10-12 接链：阅读器词典弹窗「侧边栏」按钮 → plugin.openWordInSidebar
+      // （内部跨插件调 REword 侧边栏查词面板，缺席时 toast 兜底；mode=小窗当前词典源）
+      onOpenInSidebar: (w: string, mode?: "offline" | "online") => (self.plugin as any)?.openWordInSidebar?.(w, mode),
+      onRemoveFromVocab: (w: string) => self.plugin?.getVocabStore?.()?.removeWord?.(w),
+      isInVocab: (w: string) => !!self.plugin?.getVocabStore?.()?.hasWord?.(w),
+      getLabel: self.getLabel,
+      // v1.3.0：本书前提上下文（用户手写背景/人物/译法，注入 AI 翻译 prompt）
+      primerStore: (self.plugin as any)?.bookPrimer,
+      // v1.3.0：本书累计 Token 统计（读/重置）
+      getTokenUsage: (bid: string) =>
+        (self.plugin as any)?.getBookTokenUsage?.(bid) ?? { total: 0, prompt: 0, completion: 0 },
+      resetTokenUsage: (bid: string) => (self.plugin as any)?.resetBookTokenUsage?.(bid),
+      // v1.3.0：最近一次翻译 token 用量（修复原裸 plugin 引用未定义）
+      getLastUsage: () => (self.plugin as any)?.lastTranslationUsage ?? null,
+      // 2026-08-28：翻译缓存统计 / 清空（按书；UI 展示已缓存条数 + 清空按钮）
+      getTranslationCacheStats: (bid: string) =>
+        (self.plugin as any)?.getTranslationCacheStats?.(bid) ?? Promise.resolve({ count: 0 }),
+      clearTranslationCache: (bid: string) =>
+        (self.plugin as any)?.clearTranslationCache?.(bid),
+      // 2026-08-28：列出所有有翻译缓存的书籍（bookId + 书名），供「选择书籍」下拉
+      listCachedBooks: () =>
+        (self.plugin as any)?.listCachedBooks?.() ?? Promise.resolve([]),
+      // 2026-08-30：清理「孤儿」翻译缓存（书架已删除书籍对应的缓存文件）
+      cleanOrphanCaches: () =>
+        (self.plugin as any)?.cleanOrphanTranslationCaches?.() ?? Promise.resolve(0),
+      // 2026-08-28：翻译成功入缓存后回传「节」序号（1-based），供 UI「第 X-Y 页缓存成功」
+      recordCachedSections: (bid: string, sections: number[]) =>
+        (self.plugin as any)?.recordCachedSections?.(bid, sections),
+      // 钉住阅读 Tab：官方 tab.pin() 防数量超限回收顶掉。
+      // 2026-10-08 起已无调用方（prop 保留未用），说明见原 init 注释 / git 历史。
+      onProtectTab: () => {
+        try {
+          const t = self.openTabs.get(bookId)?.tab;
+          t?.pin?.();
+        } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · onProtectTab", "debug"); }
+      },
+    };
+  }
 
   /** 注册自定义 Tab 类型（必须在 onload 同步阶段调用） */
   register(): void {
@@ -115,119 +233,22 @@ export class ReaderTabController {
           // 2026-09-09 P0 设置双分家：按书类型路由设置分片（book/pdf），
           // ReaderView 及其子组件零改动（scopeView 与 store 同签名）。
           // 此处 store 已在 dock init 时加载完毕（onload 先于任何 Tab 打开）。
-          const settingsForTab = self.stores.settingsStore.scopeView(
-            resolveReaderMode(self.stores.store.get(bookId)?.format)
-          );
+          // 2026-10-24 移动端适配：props 收敛到 buildReaderProps（桌面 Tab / 移动端 Dialog 共用）。
           comp = new ReaderView({
             target: holder,
-            props: {
+            props: self.buildReaderProps(
               bookId,
-              store: self.stores.store,
-              settingsStore: settingsForTab,
-              fontStore: self.stores.fontStore,
-              // 2026-09-08 启动卡死修复：上次启动未完成初始化 → 组件内禁止自动开书（断自锁）
-              launchCrashed: !!self.plugin?.lastLaunchCrashed,
-              onCloseTab: () => {
+              () => {
                 try {
                   custom.tab?.close?.();
                 } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · onCloseTab", "debug"); }
               },
-              onTitleChange: (t: string) => {
+              (t: string) => {
                 try {
                   custom.tab?.updateTitle?.(t);
                 } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · onTitleChange", "debug"); }
               },
-              // 2026-08-28：连续朗读控制器设置透传（get 读 / save 写，结构 = reader-tts 的 RewordTtsSettings）
-              getTtsSettings: () => (self.plugin as any)?.getTtsSettings?.() ?? null,
-              saveTtsSettings: (s: any) => (self.plugin as any)?.saveTtsSettings?.(s) ?? Promise.resolve(),
-              // 2026-08-27：翻译按钮发送到 AI 精读面板（自动打开）；悬浮取词「加入词库」委托 vocabStore
-              onTranslateToAi: (t: string) => self.plugin?.translateToAi?.(t),
-              // 2026-08-27：双语段落批量翻译（按书缓存，引擎链兜底）
-              // 2026-08-30：透传 extra（model/overwrite/signal）以支持整书预翻译细化选项
-              // 2026-08-30 修复：ctxBefore（前文参考）+ meta（书籍元数据）必须透传，
-              //   否则 AI 翻译拿不到前文语境，专有名词一致性（v1.3.0）失效
-              //   meta 兜底用 plugin.getBookMeta(bookId) 现场取；ctxBefore 由调用方（bilingual.ts）传入
-              onTranslateBatch: (
-                texts: string[],
-                from: string,
-                to: string,
-                ctxBefore?: (string | null)[],
-                meta?: { title?: string; author?: string; language?: string; toc?: string } | null,
-                extra?: any
-              ) => {
-                const finalMeta = meta ?? (self.plugin as any)?.getBookMeta?.(bookId) ?? null;
-                return (
-                  self.plugin?.translateBatch?.(texts, from, to, bookId, ctxBefore, finalMeta, extra) ??
-                  Promise.resolve([])
-                );
-              },
-              // 2026-08-30 详细翻译（回传 provider / fromCache）供成本与引擎统计
-              // 2026-08-30 修复：同 onTranslateBatch，ctxBefore/meta 透传
-              onTranslateBatchDetailed: (
-                texts: string[],
-                from: string,
-                to: string,
-                ctxBefore?: (string | null)[],
-                meta?: { title?: string; author?: string; language?: string; toc?: string } | null,
-                extra?: any
-              ) => {
-                const finalMeta = meta ?? (self.plugin as any)?.getBookMeta?.(bookId) ?? null;
-                return (
-                  self.plugin?.translateBatchDetailed?.(texts, from, to, bookId, ctxBefore, finalMeta, extra) ??
-                  Promise.resolve({ texts: [], providers: [], fromCache: [] })
-                );
-              },
-              // 2026-08-30：整书预翻译弹窗「已缓存统计」——按书查询每段缓存命中，返回同序 boolean[]
-              onCheckCache: (texts: string[]) =>
-                self.plugin?.checkTranslationCacheHits?.(bookId, texts) ?? Promise.resolve(new Array(texts.length).fill(false)),
-              isTranslationConfigured: () => !!self.plugin?.isTranslationConfigured?.(),
-              getAiSettings: () => (self.plugin as any)?.getAiSettings?.() ?? null,
-              onSaveTencentLock: (chars: number) => (self.plugin as any)?.saveTencentCharsLock?.(chars) ?? Promise.resolve(),
-              onSaveAiSettings: (partial: any) => (self.plugin as any)?.updateAiSettings?.(partial) ?? Promise.resolve(),
-              onAddToVocab: (w: string) => self.plugin?.getVocabStore?.()?.addWord?.(w),
-              // 2026-10-12 接链：阅读器词典弹窗「侧边栏」按钮 → plugin.openWordInSidebar
-              // （内部跨插件调 REword 侧边栏查词面板，缺席时 toast 兜底；mode=小窗当前词典源）
-              onOpenInSidebar: (w: string, mode?: "offline" | "online") => (self.plugin as any)?.openWordInSidebar?.(w, mode),
-              onRemoveFromVocab: (w: string) => self.plugin?.getVocabStore?.()?.removeWord?.(w),
-              isInVocab: (w: string) => !!self.plugin?.getVocabStore?.()?.hasWord?.(w),
-              getLabel: self.getLabel,
-              // v1.3.0：本书前提上下文（用户手写背景/人物/译法，注入 AI 翻译 prompt）
-              primerStore: (self.plugin as any)?.bookPrimer,
-              // v1.3.0：本书累计 Token 统计（读/重置）
-              getTokenUsage: (bid: string) =>
-                (self.plugin as any)?.getBookTokenUsage?.(bid) ?? { total: 0, prompt: 0, completion: 0 },
-              resetTokenUsage: (bid: string) => (self.plugin as any)?.resetBookTokenUsage?.(bid),
-              // v1.3.0：最近一次翻译 token 用量（修复原裸 plugin 引用未定义）
-              getLastUsage: () => (self.plugin as any)?.lastTranslationUsage ?? null,
-              // 2026-08-28：翻译缓存统计 / 清空（按书；UI 展示已缓存条数 + 清空按钮）
-              getTranslationCacheStats: (bid: string) =>
-                (self.plugin as any)?.getTranslationCacheStats?.(bid) ?? Promise.resolve({ count: 0 }),
-              clearTranslationCache: (bid: string) => (self.plugin as any)?.clearTranslationCache?.(bid),
-              // 2026-08-28：列出所有有翻译缓存的书籍（bookId + 书名），供「选择书籍」下拉
-              listCachedBooks: () =>
-                (self.plugin as any)?.listCachedBooks?.() ?? Promise.resolve([]),
-              // 2026-08-30：清理「孤儿」翻译缓存（书架已删除书籍对应的缓存文件）
-              cleanOrphanCaches: () =>
-                (self.plugin as any)?.cleanOrphanTranslationCaches?.() ?? Promise.resolve(0),
-              // 2026-08-28：翻译成功入缓存后回传「节」序号（1-based），用于 UI「第 X-Y 页缓存成功」
-              recordCachedSections: (bid: string, sections: number[]) =>
-                (self.plugin as any)?.recordCachedSections?.(bid, sections),
-              // 钉住阅读 Tab：官方 tab.pin() 防数量超限回收顶掉。
-              //
-              // ⚠️ 2026-10-08 起**已无调用方**（ReaderView 侧的 prop 保留未用）。
-              //   原因：`pin()` 会让思源把页签**缩成只显示图标、且不可关闭**
-              //   （`Tab.pin()` 的定义就是 "Pins the tab to prevent closing"；
-              //     思源用户指南也写明「钉住的页签只显示图标」）。
-              //   用户每保存一条批注就被钉一次，是不可接受的副作用。
-              //   「防回收」本来已由上面的 `updateTitle(书名)` 解决（见「问题3」注释）。
-              //   —— 将来若确有需要，重新接上这个回调即可，不必重查 API 语义。
-              onProtectTab: () => {
-                try {
-                  const t = self.openTabs.get(bookId)?.tab;
-                  t?.pin?.();
-                } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · onProtectTab", "debug"); }
-              },
-            },
+            ),
           });
         } catch (e) {
           console.warn("[REword] 阅读 Tab 挂载失败:", e);
@@ -263,6 +284,13 @@ export class ReaderTabController {
 
   /** 打开一本书的阅读 Tab；已打开则聚焦（不重复开），未打开则新建并激活 */
   async openBookTab(bookId: string, title?: string): Promise<void> {
+    // 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
+    // `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签路径整条不可用；
+    // ReaderView 改由全屏 Dialog 承载（task-note-management 同款模式）。
+    if (isMobile()) {
+      this.openBookDialog(bookId, title);
+      return;
+    }
     const existing = this.openTabs.get(bookId);
     if (existing?.tab) {
       try {
@@ -333,6 +361,59 @@ export class ReaderTabController {
   }
 
   /**
+   * 移动端阅读弹窗（2026-10-24）：ReaderView 由全屏 Dialog 承载。
+   * 与桌面 Tab 完全同源：同一 buildReaderProps、同一 store、同一生命周期语义
+   * （弹窗关闭 = $destroy，进度/时长照常落盘）。comp 同步镜像进 openTabs
+   * （tab 为 null），让 focusAnnotation / focusAnnotationRecord 的轮询照常命中。
+   */
+  private openBookDialog(bookId: string, title?: string): void {
+    const existing = this.openDialogs.get(bookId);
+    if (existing) return; // 已开：幂等（Dialog 无聚焦 API，无需重复开）
+    if (this.opening.has(bookId)) return;
+    this.opening.add(bookId);
+    try {
+      const meta = this.stores.store.get?.(bookId);
+      let dialogHost: HTMLElement | null = null;
+      const dialog = new Dialog({
+        title: title || meta?.title || "阅读",
+        content:
+          '<div class="re-reader-dialog-host" style="position:relative;height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden;"></div>',
+        // 手机端铺满视口（留边距给圆角/手势区），平板/桌面弹窗给足阅读空间
+        width: responsiveDialogSize(860, "width"),
+        height: responsiveDialogSize(640, "height"),
+        destroyCallback: () => {
+          disposeDialogFit(dialogHost);
+          const rec = this.openDialogs.get(bookId);
+          try {
+            rec?.comp?.$destroy?.();
+          } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · openBookDialog destroy", "debug"); }
+          this.openDialogs.delete(bookId);
+          // 同 Tab destroy：从 openTabs 镜像中摘除
+          this.openTabs.delete(bookId);
+        },
+      });
+      const host = hardenDialogBody(dialog, ".re-reader-dialog-host");
+      if (!host) return;
+      dialogHost = host;
+      const comp = new ReaderView({
+        target: host,
+        props: this.buildReaderProps(
+          bookId,
+          () => dialog.destroy(),
+          () => { /* 弹窗标题静态，无需更新 */ },
+        ),
+      });
+      this.openDialogs.set(bookId, { dialog, comp, title: title || meta?.title || "阅读" });
+      // 镜像进 openTabs（tab=null）：focusAnnotation 等轮询路径照常工作
+      this.openTabs.set(bookId, { tab: null, comp, title: title || meta?.title || "阅读" });
+    } catch (e) {
+      console.warn("[REword] 移动端打开阅读弹窗失败:", e);
+    } finally {
+      this.opening.delete(bookId);
+    }
+  }
+
+  /**
    * 持久化当前打开的阅读 Tab 列表（bookId + 书名）。
    * 思源不会自动恢复自定义插件 Tab，关机/重启后这些 Tab 会丢失；
    * 这里把「关机前还开着的书」记到插件数据，等 restart 后由 restoreSession 重开。
@@ -344,10 +425,14 @@ export class ReaderTabController {
     this.sessionTimer = setTimeout(() => {
       this.sessionTimer = null;
       try {
-        const open = Array.from(this.openTabs.entries()).map(([bookId, rec]) => ({
-          bookId,
-          title: rec.title || "",
-        }));
+        const open = Array.from(this.openTabs.entries())
+          // 2026-10-24 移动端适配：Dialog 会话的镜像记录（tab=null）不参与会话持久化，
+          // 避免桌面端 restoreSession 把它们当页签恢复
+          .filter(([, rec]) => !!rec.tab)
+          .map(([bookId, rec]) => ({
+            bookId,
+            title: rec.title || "",
+          }));
         this.plugin.saveData(READER_SESSION_KEY, { openTabs: open }).catch(() => {});
       } catch (__e) { logSwallow(__e, "reader-tab.ts · persistSession", "debug"); }
     }, 200);
@@ -403,6 +488,12 @@ export class ReaderTabController {
       return finish("窗口后台");
     }
 
+    // 2026-10-24 移动端适配：移动端启动不自动弹阅读 Dialog（桌面的 Tab 恢复语义
+    // 在手机上是"一启动就糊脸一本书"，改为用户点图标 → 书架 → 自己选书）。
+    if (isMobile()) {
+      return finish("移动端不自动恢复");
+    }
+
     // 让出主线程：等思源启动的密集布局期过去再恢复
     getLogger().info(`[REword] 阅读会话恢复：等待空闲窗口（待恢复 ${open.length} 本）`);
     await waitForLaunchIdle();
@@ -443,6 +534,16 @@ export class ReaderTabController {
       } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · dispose", "debug"); }
     }
     this.openTabs.clear();
+    // 2026-10-24 移动端适配：Dialog 会话一并销毁（$destroy 触发 ReaderView 的落盘收尾）
+    for (const rec of this.openDialogs.values()) {
+      try {
+        rec.comp?.$destroy?.();
+      } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · dispose dialog comp", "debug"); }
+      try {
+        rec.dialog?.destroy?.();
+      } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · dispose dialog", "debug"); }
+    }
+    this.openDialogs.clear();
   }
 
   /**

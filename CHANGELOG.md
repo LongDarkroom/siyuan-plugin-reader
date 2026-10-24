@@ -1,5 +1,25 @@
 # 更新日志
 
+## v0.2.0 (2026-10-25)
+
+### 手机端完整可用：Dialog 承载书架与阅读
+- 思源移动端 `openTab` 是官方空实现（`app/src/plugin/API.ts` `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），桌面页签路径在手机上整条不可用。本版起：
+  - **书架**改由 Dialog 承载（复用 `mountShelf`，与桌面 Tab 完全同源）；关窗 / 卸载链式 `$destroy` Svelte 组件，防 Dialog DOM 移除后监听器泄漏。
+  - **阅读**同样改由 Dialog 承载 ReaderView；props 收敛到 `buildReaderProps`，桌面 Tab 与移动端 Dialog 共用同一份配置，只差 `onCloseTab` / `onTitleChange` 两个回调。
+  - 新增 `src/core/dialog-host.ts`：高度链硬化——三层 flex 主策略 + 按 container 实测高减 header 写死 body 高 + ResizeObserver 跟随旋转 / 窗口变化，修复 Dialog 内容塌缩 / 溢出。
+  - 弹窗尺寸走 `responsiveDialogSize`：手机铺满视口（留边距），平板 / 桌面给足空间。
+
+### 触屏交互（真机反馈驱动）
+- **触屏选词接通划词工具栏**：桌面靠 iframe mouseup 触发，而触屏长按选词不合成 mouseup、拖系统选区手柄也不产生页面事件——主路径接 `touchend`，兜底接 `selectionchange` 防抖（320ms），两条都汇入原有读取链，定位 / 避让 / 重试逻辑全复用。
+- **屏蔽 iOS 长按系统菜单**（`-webkit-touch-callout: none`），不再叠在自绘划词工具栏上互相打架；Android 不识别该属性，自然降级。
+- **顶 / 底浮层栏 3.5s 无交互自动收起**：只动 revealed/pinned 状态位（opacity/transform 过渡，零重排）；收起时联动收抽屉，防孤儿面板。
+- **翻页即收浮层栏**：relocate 触发，栏未浮起时 no-op，初始加载 / 改字号不受影响。
+- **圆点把手命中区让位首 / 末行**：顶把手贴顶 22px、底把手贴底 24px、圆点缩至 5px——手机上把手是次要入口（中心点按 + 翻页自动收起已是主路径）。
+- **书卡长按防误触**：任何位移立即取消长按（旧 10px 容差会把慢速滑动累计成「静止 500ms」误弹菜单），计时 500→550ms，弹出时轻震反馈（Android；iOS 无 API，静默降级）。
+- **书卡 ⋯ 按钮视觉降权**：从封面左上 45% 黑底方块改为封面右下半透明毛玻璃小圆钮，不再压在滑动路径上。
+
+---
+
 ## v0.1.2 (2026-10-24)
 
 ### 手机端可用（本版重点）

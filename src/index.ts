@@ -17,7 +17,7 @@
  *  · 页签 init 闭包捕获 plugin 引用；
  *  · window/document 级监听器保留引用，onunload 摘除。
  */
-import { Plugin, openTab, showMessage } from "siyuan";
+import { Plugin, openTab, showMessage, Dialog } from "siyuan";
 import { t, initI18n, saveLang } from "./i18n/index.ts";
 import { ReaderDockController } from "./reader/reader-dock.ts";
 import { getAnnotationStore, initAnnotationStore, flushAnnotationStore } from "./annotation/store-singleton.ts";
@@ -27,6 +27,12 @@ import { getLogger } from "./core/logger.ts";
 import { DictManager } from "./dict/dict-manager.ts";
 import { TranslateHost } from "./translate/host.ts";
 import { DEFAULT_REWORD_TTS, type RewordTtsSettings } from "./reader/reader-tts.ts";
+// 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
+// `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签入口整条不可用；
+// 移动端改用 Dialog 承载同一书架视图（task-note-management 同款模式）。
+import { isMobile } from "./core/env.ts";
+import { responsiveDialogSize } from "./core/responsive.ts";
+import { hardenDialogBody, disposeDialogFit } from "./core/dialog-host.ts";
 import "./index.less";
 
 /** 书架入口页签类型（本插件的入口壳） */
@@ -280,6 +286,11 @@ export class ReaderPlugin extends Plugin {
    */
   openShelfTab(): void {
     try {
+      // 2026-10-24 移动端适配：openTab 在移动端无实现 → Dialog 承载书架（幂等：已开即返回）
+      if (isMobile()) {
+        this.openShelfDialog();
+        return;
+      }
       void openTab({
         app: this.app,
         custom: {
@@ -292,6 +303,44 @@ export class ReaderPlugin extends Plugin {
     } catch (e) {
       getLogger().warn("[RE 阅读器] 打开书架页签失败", { error: e });
     }
+  }
+
+  /**
+   * 移动端书架弹窗（2026-10-24）：思源移动端 openTab 是官方空实现（TODO: Mobile），
+   * 自定义页签整条路径不可用。改用 Dialog 承载同一 BookshelfView
+   * （复用 mountShelf，与桌面 Tab 完全同源）；点书 → openBookTab 的移动端分支
+   * 会再叠一层阅读 Dialog。destroyCallback 里销毁 Svelte 组件防泄漏。
+   */
+  private shelfDialog: Dialog | null = null;
+  private shelfDialogHost: HTMLElement | null = null;
+  private openShelfDialog(): void {
+    if (this.shelfDialog) return; // 已开：幂等
+    let dialog: Dialog | null = null;
+    dialog = new Dialog({
+      title: t("RE 阅读器"),
+      content:
+        '<div class="re-shelf-dialog-host" style="position:relative;height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden;"></div>',
+      // 手机端铺满视口（留边距），平板/桌面弹窗给足空间
+      width: responsiveDialogSize(860, "width"),
+      height: responsiveDialogSize(620, "height"),
+      destroyCallback: () => {
+        this.shelfDialog = null;
+        disposeDialogFit(this.shelfDialogHost);
+        this.shelfDialogHost = null;
+        try {
+          this.readerDock?.disposeShelf();
+        } catch (e) {
+          getLogger().warn("[RE 阅读器] 销毁书架弹窗组件失败", { error: e });
+        }
+      },
+    });
+    this.shelfDialog = dialog;
+    // 2026-10-25 C1 v2：高度链硬化（实测 container−header 写死 body 高 + 三层 flex），
+    // 保证 .shelf-main 成为唯一滚动容器（否则手机滑动生涩且误触书卡）
+    const host = hardenDialogBody(dialog, ".re-shelf-dialog-host");
+    if (!host) return;
+    this.shelfDialogHost = host;
+    this.mountShelf(host);
   }
 
   /** 打开指定书籍（供深链 / 命令面板 / 外部调用） */
@@ -613,6 +662,13 @@ export class ReaderPlugin extends Plugin {
       this.readerDock?.dispose();
     } catch (e) {
       getLogger().warn("[RE 阅读器] 卸载时清理阅读器失败", { error: e });
+    }
+    // 2026-10-24 移动端适配：卸载时销毁书架弹窗（内部 Svelte 组件经 destroyCallback 链式销毁）
+    try {
+      this.shelfDialog?.destroy?.();
+      this.shelfDialog = null;
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 卸载时销毁书架弹窗失败", { error: e });
     }
     // 2026-10-13：批注落盘（防抖窗口内可能挂起的批注变更）
     void flushAnnotationStore();
