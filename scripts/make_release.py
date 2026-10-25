@@ -13,9 +13,14 @@
 """
 import json
 import os
+import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# [2026-10-25 集市检查修复] 思源集市自动索引对清单字段 icon 声明的 icon.png 有
+# 64.0KB 硬上限（GitHub Actions 开 issue 且索引不更新）。KB 口径与集市一致 = 1024 字节。
+ICON_LIMIT_KB = 64.0
 
 # 直接平铺到 zip 根的【白名单文件】
 INCLUDE_FILES = [
@@ -112,7 +117,34 @@ def collect_paths():
     return paths
 
 
+def check_icon_size() -> None:
+    """打包前自检：icon.png 必须 ≤ 集市 64KB 上限，否则直接失败（不产出 zip）。
+
+    [2026-10-25] v0.2.0 的 icon.png 为 140.5KB，超出上限导致集市自动索引检查
+    未通过、索引不更新，只能事后压缩重传 Release 附件。把这道检查前移到打包前，
+    超限时连 package.zip 都不生成，避免"发一版才发现"。
+
+    压缩配方（已验证视觉无损，扁平图标适用）：
+        python3 -c "
+        from PIL import Image
+        im = Image.open('icon.png').convert('RGBA')
+        im.quantize(colors=256, method=Image.FASTOCTREE,
+                    dither=Image.FLOYDSTEINBERG).save('icon.png', optimize=True)"
+    """
+    icon_path = os.path.join(ROOT, "icon.png")
+    if not os.path.isfile(icon_path):
+        print(f"[错误] 缺少 icon.png（集市必需，且清单字段 icon 指向它）: {icon_path}")
+        sys.exit(1)
+    kb = os.path.getsize(icon_path) / 1024
+    if kb > ICON_LIMIT_KB:
+        print(f"[错误] icon.png 超限：{kb:.1f}KB > {ICON_LIMIT_KB:.1f}KB（集市自动索引检查会拒绝）")
+        print("       修复：256 色量化压缩（保持 512×512 分辨率不变），配方见本函数文档字符串。")
+        sys.exit(1)
+    print(f"[自检] icon.png {kb:.1f}KB ≤ {ICON_LIMIT_KB:.1f}KB 上限，通过")
+
+
 def main():
+    check_icon_size()
     paths = collect_paths()
     if not paths:
         print("没有可打包的文件，请先 npm run build")
