@@ -31,6 +31,11 @@ INCLUDE_FILES = [
     "preview.png",
     "preview.webp",   # plugin.json 的 preview 字段指向此文件（全分辨率 WebP，208KB）
     "README.md",
+    # [2026-10-26] 版本更新弹窗：升级后弹一次「本次更新了什么」，日志正文来自包内
+    # 插件根的 CHANGELOG.md（src/core/changelog.ts 走 POST /api/file/getFile 读
+    # /data/plugins/<name>/CHANGELOG.md）。**漏了这个文件，弹窗会永远读不到内容**
+    # （静默失败，用户看不到任何更新说明）。
+    "CHANGELOG.md",
     # [2026-08-29 修复] PDF 支持：PDF.js 的 worker 由 copy-dist.mjs 复制到插件根目录，
     # 运行时按 /plugins/siyuan-plugin-reader/pdf.worker.mjs 加载
     # （见 src/reader/bookshelf-store.ts:146-149）。漏掉它 → 从集市安装的插件

@@ -1419,3 +1419,61 @@
   background: var(--b3-theme-background-light, #fafafa);
 }
 .hiword-bs-sum { font-size: 12px; color: var(--b3-theme-on-surface, #555); }
+
+/* ================= 2026-10-26：版本更新弹窗 ================= */
+/* scope 挂 .re-changelog-dialog，容器/标题/内容边距沿用命名对话框口径
+   （.b3-dialog__content 的内边距会随主题浮动，必须显式定死）。
+   日志正文自己滚动：整段 CHANGELOG 塞进去会把窗口撑到屏幕外。 */
+.re-changelog-dialog .b3-dialog__container {
+  overflow: hidden;
+  border-radius: 12px;
+  box-shadow: 0 0 0 1px var(--b3-border-color, rgba(0, 0, 0, 0.1)), 0 2px 8px rgba(0, 0, 0, 0.08),
+    0 12px 40px rgba(0, 0, 0, 0.2);
+}
+.re-changelog-dialog .b3-dialog__header {
+  padding: 16px 24px 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+.re-changelog-dialog .b3-dialog__content {
+  padding: 14px 24px 20px;
+}
+.re-changelog-dialog .re-changelog {
+  max-height: min(58vh, 540px);
+  overflow: auto;
+  padding-right: 6px;
+  font-size: 14px;
+  line-height: 1.7;
+}
+/* Lute 出来的是文档尺度标题，压到对话框尺度；段首那行「## v0.3.0（…）」就是本段的第一行 */
+.re-changelog-dialog .re-changelog h2 {
+  margin: 0 0 10px;
+  font-size: 15px;
+  line-height: 1.45;
+}
+.re-changelog-dialog .re-changelog h3 {
+  margin: 18px 0 6px;
+  font-size: 13px;
+  opacity: 0.72;
+}
+.re-changelog-dialog .re-changelog p {
+  margin: 0 0 8px;
+}
+.re-changelog-dialog .re-changelog ul,
+.re-changelog-dialog .re-changelog ol {
+  margin: 0 0 8px;
+  padding-left: 20px;
+}
+.re-changelog-dialog .re-changelog li {
+  margin: 2px 0;
+}
+.re-changelog-dialog .re-changelog table {
+  font-size: 13px;
+}
+/* 没有 Lute 时的纯文本回落：不折成 HTML，保住换行即可 */
+.re-changelog-dialog .re-changelog__plain {
+  margin: 0;
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.65;
+}

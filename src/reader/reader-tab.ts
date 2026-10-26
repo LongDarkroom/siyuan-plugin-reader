@@ -14,17 +14,20 @@ import { waitForLaunchIdle } from "./reader-launch.ts";
 
 // @ts-ignore - Svelte 组件
 import ReaderView from "./ReaderView.svelte";
-import { openTab, showMessage, Dialog } from "siyuan";
+import { openTab, showMessage } from "siyuan";
 import type { BookshelfStore } from "./bookshelf-store";
 import type { ReaderSettingsStore } from "./reader-settings";
 import type { FontStore } from "./reader-fonts";
 import { resolveReaderMode } from "./reader-mode.ts";
 // 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
-// `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签路径整条不可用；
-// 移动端改用 Dialog 承载同一 ReaderView（task-note-management 同款模式）。
+// `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签路径整条不可用。
+// 2026-10-26 路线 A：移动端承载从思源 Dialog 换成**全屏浮层**（对标「思阅」SiReader
+// v2.5.7 的 #sireader-mobile-container 模式）—— 不进思源 Dialog 的
+// `.b3-dialog__body` 高度链（v0.2.0 曾用 core/dialog-host.ts 硬修），
+// 且阅读层与书架层共用同一浮层容器：关书回书架、返回键逐层退出。
+// 调研与证据：docs/手机端适配对标思阅-调研与方案-2026-10-26.md
 import { isMobile } from "../core/env.ts";
-import { responsiveDialogSize } from "../core/responsive.ts";
-import { hardenDialogBody, disposeDialogFit } from "../core/dialog-host.ts";
+import { mobileOverlay } from "../core/mobile-overlay-host.ts";
 
 export const READER_TAB_TYPE = "reader";
 
@@ -71,8 +74,6 @@ interface TabRecord {
 export class ReaderTabController {
   private openTabs = new Map<string, TabRecord>(); // bookId -> { tab, comp, title }
   private opening = new Set<string>(); // bookId -> 正在打开中（防重入竞态导致重复 openTab）
-  // 2026-10-24 移动端适配：移动端 openTab 不可用，ReaderView 改由 Dialog 承载（bookId -> 弹窗会话）
-  private openDialogs = new Map<string, { dialog: Dialog; comp: any; title: string }>();
   private registered = false;
   private sessionTimer: ReturnType<typeof setTimeout> | null = null; // 会话持久化防抖
 
@@ -88,14 +89,17 @@ export class ReaderTabController {
 
   /**
    * ReaderView props 工厂（2026-10-24 移动端适配抽取）。
-   * 桌面 Tab init 与移动端 Dialog 共用同一份 props；差异只在两个回调：
-   *  - onCloseTab：桌面 = 关 Tab；移动端 = 销毁 Dialog（由调用方闭包决定）
-   *  - onTitleChange：桌面 = 更新 Tab 标题；移动端 = no-op（弹窗标题静态）
+   * 桌面 Tab init 与移动端浮层共用同一份 props；差异只在几个回调：
+   *  - onCloseTab：桌面 = 关 Tab；移动端 = 不传（‹ 按钮走 onBack = 返回书架）
+   *  - onTitleChange：桌面 = 更新 Tab 标题；移动端 = no-op（浮层无标题栏）
+   *  - opts.mobileOverlay：移动端浮层模式（ReaderView 据此把 ‹ 的文案改成「返回书架」）
+   *  - opts.onBack：移动端 ‹ 的落点（关掉阅读层，露出下层书架）
    */
   private buildReaderProps(
     bookId: string,
-    onCloseTab: () => void,
-    onTitleChange: (t: string) => void
+    onCloseTab: (() => void) | undefined,
+    onTitleChange: (t: string) => void,
+    opts?: { mobileOverlay?: boolean; onBack?: () => void }
   ) {
     const self = this;
     return {
@@ -108,6 +112,9 @@ export class ReaderTabController {
       // 2026-09-08 启动卡死修复：上次启动未完成初始化 → 组件内禁止自动开书（断自锁）
       launchCrashed: !!self.plugin?.lastLaunchCrashed,
       onCloseTab,
+      // 2026-10-26 路线 A：移动端浮层的 ‹ = 返回书架（书架层在下方，关阅读层即露出）
+      onBack: opts?.onBack,
+      mobileOverlay: !!opts?.mobileOverlay,
       onTitleChange,
       // 2026-08-28：连续朗读控制器设置透传（get 读 / save 写，结构 = reader-tts 的 RewordTtsSettings）
       getTtsSettings: () => (self.plugin as any)?.getTtsSettings?.() ?? null,
@@ -284,11 +291,10 @@ export class ReaderTabController {
 
   /** 打开一本书的阅读 Tab；已打开则聚焦（不重复开），未打开则新建并激活 */
   async openBookTab(bookId: string, title?: string): Promise<void> {
-    // 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
-    // `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签路径整条不可用；
-    // ReaderView 改由全屏 Dialog 承载（task-note-management 同款模式）。
+    // 2026-10-26 路线 A：思源移动端 openTab 无实现 → ReaderView 改由**全屏浮层**承载
+    // （对标「思阅」SiReader：同一浮层容器内换层，一次一本，关书回书架）。
     if (isMobile()) {
-      this.openBookDialog(bookId, title);
+      this.openBookOverlay(bookId, title);
       return;
     }
     const existing = this.openTabs.get(bookId);
@@ -361,53 +367,56 @@ export class ReaderTabController {
   }
 
   /**
-   * 移动端阅读弹窗（2026-10-24）：ReaderView 由全屏 Dialog 承载。
+   * 移动端阅读浮层（2026-10-26 路线 A）。
    * 与桌面 Tab 完全同源：同一 buildReaderProps、同一 store、同一生命周期语义
-   * （弹窗关闭 = $destroy，进度/时长照常落盘）。comp 同步镜像进 openTabs
+   * （关层 = $destroy，进度/时长照常落盘）。comp 同步镜像进 openTabs
    * （tab 为 null），让 focusAnnotation / focusAnnotationRecord 的轮询照常命中。
+   *
+   * 层级：浮层宿主里最多两层 —— 底层书架 + 顶层阅读。
+   *  · ‹ 按钮（ReaderView 的 onBack）→ 关掉阅读层，露出下层书架；
+   *  · 返回键 → 同样逐层退出（宿主统一处理 popstate）；
+   *  · 换书 → 同 role 不同 key，宿主替换旧层（思阅同款：移动端一次一本）。
    */
-  private openBookDialog(bookId: string, title?: string): void {
-    const existing = this.openDialogs.get(bookId);
-    if (existing) return; // 已开：幂等（Dialog 无聚焦 API，无需重复开）
+  private openBookOverlay(bookId: string, title?: string): void {
     if (this.opening.has(bookId)) return;
     this.opening.add(bookId);
     try {
+      const self = this;
       const meta = this.stores.store.get?.(bookId);
-      let dialogHost: HTMLElement | null = null;
-      const dialog = new Dialog({
-        title: title || meta?.title || "阅读",
-        content:
-          '<div class="re-reader-dialog-host" style="position:relative;height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden;"></div>',
-        // 手机端铺满视口（留边距给圆角/手势区），平板/桌面弹窗给足阅读空间
-        width: responsiveDialogSize(860, "width"),
-        height: responsiveDialogSize(640, "height"),
-        destroyCallback: () => {
-          disposeDialogFit(dialogHost);
-          const rec = this.openDialogs.get(bookId);
-          try {
-            rec?.comp?.$destroy?.();
-          } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · openBookDialog destroy", "debug"); }
-          this.openDialogs.delete(bookId);
-          // 同 Tab destroy：从 openTabs 镜像中摘除
-          this.openTabs.delete(bookId);
+      const displayTitle = title || meta?.title || "阅读";
+      mobileOverlay.open("reader", {
+        key: bookId,
+        mount: (el) => {
+          const comp = new ReaderView({
+            target: el,
+            props: self.buildReaderProps(
+              bookId,
+              undefined,
+              () => {
+                /* 浮层无标题栏：标题变更无需回传 */
+              },
+              {
+                mobileOverlay: true,
+                onBack: () => mobileOverlay.close("reader"),
+              },
+            ),
+          });
+          // 镜像进 openTabs（tab=null）：focusAnnotation 等轮询路径照常工作
+          self.openTabs.set(bookId, { tab: null, comp, title: displayTitle });
+          return {
+            destroy: () => {
+              try {
+                comp?.$destroy?.();
+              } catch (__swallowErr) {
+                logSwallow(__swallowErr, "reader-tab.ts · openBookOverlay destroy", "debug");
+              }
+              self.openTabs.delete(bookId);
+            },
+          };
         },
       });
-      const host = hardenDialogBody(dialog, ".re-reader-dialog-host");
-      if (!host) return;
-      dialogHost = host;
-      const comp = new ReaderView({
-        target: host,
-        props: this.buildReaderProps(
-          bookId,
-          () => dialog.destroy(),
-          () => { /* 弹窗标题静态，无需更新 */ },
-        ),
-      });
-      this.openDialogs.set(bookId, { dialog, comp, title: title || meta?.title || "阅读" });
-      // 镜像进 openTabs（tab=null）：focusAnnotation 等轮询路径照常工作
-      this.openTabs.set(bookId, { tab: null, comp, title: title || meta?.title || "阅读" });
     } catch (e) {
-      console.warn("[REword] 移动端打开阅读弹窗失败:", e);
+      console.warn("[REword] 移动端打开阅读浮层失败:", e);
     } finally {
       this.opening.delete(bookId);
     }
@@ -426,7 +435,7 @@ export class ReaderTabController {
       this.sessionTimer = null;
       try {
         const open = Array.from(this.openTabs.entries())
-          // 2026-10-24 移动端适配：Dialog 会话的镜像记录（tab=null）不参与会话持久化，
+          // 2026-10-26 路线 A：移动端浮层会话的镜像记录（tab=null）不参与会话持久化，
           // 避免桌面端 restoreSession 把它们当页签恢复
           .filter(([, rec]) => !!rec.tab)
           .map(([bookId, rec]) => ({
@@ -534,16 +543,10 @@ export class ReaderTabController {
       } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · dispose", "debug"); }
     }
     this.openTabs.clear();
-    // 2026-10-24 移动端适配：Dialog 会话一并销毁（$destroy 触发 ReaderView 的落盘收尾）
-    for (const rec of this.openDialogs.values()) {
-      try {
-        rec.comp?.$destroy?.();
-      } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · dispose dialog comp", "debug"); }
-      try {
-        rec.dialog?.destroy?.();
-      } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · dispose dialog", "debug"); }
-    }
-    this.openDialogs.clear();
+    // 2026-10-26 路线 A：移动端浮层会话一并销毁（$destroy 触发 ReaderView 的落盘收尾）
+    try {
+      mobileOverlay.close("reader");
+    } catch (__swallowErr) { logSwallow(__swallowErr, "reader-tab.ts · dispose overlay", "debug"); }
   }
 
   /**

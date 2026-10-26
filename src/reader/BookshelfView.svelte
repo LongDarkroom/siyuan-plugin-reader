@@ -4198,6 +4198,19 @@
       display: none;
     }
   }
+  /* 2026-10-26 路线 A · 极小屏档（对标「思阅」SiReader 的 380 断点）：
+     折叠机半屏 / iPhone SE 竖屏下再收一档内边距与封面宽度。 */
+  @container shelf-main (max-width: 400px) {
+    .shelf-list {
+      padding: 4px 6px;
+    }
+    .shelf-row {
+      padding: 6px 6px;
+    }
+    .row-cover {
+      width: 22px;
+    }
+  }
 
   /* ---- 分组管理弹窗 ---- */
   .group-new {

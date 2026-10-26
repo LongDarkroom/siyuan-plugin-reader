@@ -27,12 +27,26 @@ import { getLogger } from "./core/logger.ts";
 import { DictManager } from "./dict/dict-manager.ts";
 import { TranslateHost } from "./translate/host.ts";
 import { DEFAULT_REWORD_TTS, type RewordTtsSettings } from "./reader/reader-tts.ts";
+// 2026-10-26 版本更新弹窗（对标 Excali Studio）：升级后弹一次「本次更新了什么」。
+// 纯逻辑在 core/changelog.ts（不 import 思源 SDK，node 侧可直接跑单测），
+// 这里只负责取版本号 / 存版本号 / 开弹窗三件事。
+import {
+  PLUGIN_VERSION,
+  VERSION_SLOT,
+  changelogDecision,
+  changelogPath,
+  fetchPluginFile,
+  renderChangelogHtml,
+  sliceVersionSection,
+} from "./core/changelog.ts";
 // 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
-// `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签入口整条不可用；
-// 移动端改用 Dialog 承载同一书架视图（task-note-management 同款模式）。
+// `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签入口整条不可用。
+// 2026-10-26 路线 A：移动端承载从思源 Dialog 换成**全屏浮层**（对标「思阅」SiReader
+// v2.5.7）—— 思源 Dialog 的 height 只写在 container、body 无确定高度，我们得靠
+// hardenDialogBody 硬修；且 Dialog 自带标题栏 chrome、书架/阅读两层叠加。
+// 调研与证据：docs/手机端适配对标思阅-调研与方案-2026-10-26.md
 import { isMobile } from "./core/env.ts";
-import { responsiveDialogSize } from "./core/responsive.ts";
-import { hardenDialogBody, disposeDialogFit } from "./core/dialog-host.ts";
+import { mobileOverlay } from "./core/mobile-overlay-host.ts";
 import "./index.less";
 
 /** 书架入口页签类型（本插件的入口壳） */
@@ -213,6 +227,38 @@ export class ReaderPlugin extends Plugin {
     // 2026-10-07：翻译宿主同样挂到 window，供 ReaderView 里的
     //「翻译引擎配置」二级页读写设置。与词典同一套路（两棵组件树间无 props 通道）。
     (window as any).__rewordTranslateHost = this.getTranslate();
+
+    /* 2026-10-26：升级后的一次性更新日志。
+     * 不 await：弹窗不该挡启动，失败也不该挡任何人进阅读器。 */
+    void this.maybeShowChangelog();
+  }
+
+  /**
+   * 版本更新弹窗。四条口径（对标 Excali Studio，用户拍板）：
+   *   ① 首装不弹，只静默记版本号（用户装插件时不需要被弹窗迎接）；
+   *   ② 只弹当前版本那一段（CHANGELOG.md 里 `## v<当前版本>`）；
+   *   ③ 不设「不再提示」——版本号已经先记进独立槽，× 掉就不会重启再弹；
+   *   ④ 读不到日志 / 该版本没写日志 / 渲染器缺失，一律静默。
+   */
+  private async maybeShowChangelog(): Promise<void> {
+    try {
+      const action = changelogDecision(await this.loadData(VERSION_SLOT), PLUGIN_VERSION);
+      if (action === "unknown-version" || action === "up-to-date") return;
+      // 先回写再弹：弹窗被用户划掉、或者这一段的日志其实是空的，
+      // 都不该下次重启再来一遍
+      await this.saveData(VERSION_SLOT, PLUGIN_VERSION);
+      if (action !== "show") return;
+      const section = sliceVersionSection(await fetchPluginFile(changelogPath(this.name)), PLUGIN_VERSION);
+      if (!section) return;
+      const dialog = new Dialog({
+        title: `${t("更新日志")} v${PLUGIN_VERSION}`,
+        width: "min(640px, 92vw)",
+        content: `<div class="re-changelog b3-typography">${renderChangelogHtml(section)}</div>`,
+      });
+      dialog.element.classList.add("re-changelog-dialog");
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 更新日志读取失败", { error: e });
+    }
   }
 
   /**
@@ -286,9 +332,9 @@ export class ReaderPlugin extends Plugin {
    */
   openShelfTab(): void {
     try {
-      // 2026-10-24 移动端适配：openTab 在移动端无实现 → Dialog 承载书架（幂等：已开即返回）
+      // 2026-10-26 路线 A：移动端 openTab 无实现 → 全屏浮层承载书架（幂等：已开即聚焦）
       if (isMobile()) {
-        this.openShelfDialog();
+        this.openShelfOverlay();
         return;
       }
       void openTab({
@@ -306,46 +352,47 @@ export class ReaderPlugin extends Plugin {
   }
 
   /**
-   * 移动端书架弹窗（2026-10-24）：思源移动端 openTab 是官方空实现（TODO: Mobile），
-   * 自定义页签整条路径不可用。改用 Dialog 承载同一 BookshelfView
-   * （复用 mountShelf，与桌面 Tab 完全同源）；点书 → openBookTab 的移动端分支
-   * 会再叠一层阅读 Dialog。destroyCallback 里销毁 Svelte 组件防泄漏。
+   * 移动端书架浮层（2026-10-26 路线 A）。
+   *
+   * 承载方式：全屏浮层（core/mobile-overlay-host.ts）—— 不进思源 Dialog 的
+   * `.b3-dialog__body` 高度链，也就没有 v0.2.0 那套「三层 flex + 实测 px 写死 +
+   * ResizeObserver」的补丁债；且无标题栏 chrome，正文/书卡可铺满整屏。
+   * 组件与桌面页签完全同源（同一 mountShelf → readerDock.render）。
+   * 点书 → reader-tab.ts 的移动端分支在**同一浮层**上叠一层阅读层（思阅同款：
+   * 一次一本，关书回书架）。
    */
-  private shelfDialog: Dialog | null = null;
-  private shelfDialogHost: HTMLElement | null = null;
-  private openShelfDialog(): void {
-    if (this.shelfDialog) return; // 已开：幂等
-    let dialog: Dialog | null = null;
-    dialog = new Dialog({
-      title: t("RE 阅读器"),
-      content:
-        '<div class="re-shelf-dialog-host" style="position:relative;height:100%;min-height:0;display:flex;flex-direction:column;overflow:hidden;"></div>',
-      // 手机端铺满视口（留边距），平板/桌面弹窗给足空间
-      width: responsiveDialogSize(860, "width"),
-      height: responsiveDialogSize(620, "height"),
-      destroyCallback: () => {
-        this.shelfDialog = null;
-        disposeDialogFit(this.shelfDialogHost);
-        this.shelfDialogHost = null;
-        try {
-          this.readerDock?.disposeShelf();
-        } catch (e) {
-          getLogger().warn("[RE 阅读器] 销毁书架弹窗组件失败", { error: e });
-        }
-      },
-    });
-    this.shelfDialog = dialog;
-    // 2026-10-25 C1 v2：高度链硬化（实测 container−header 写死 body 高 + 三层 flex），
-    // 保证 .shelf-main 成为唯一滚动容器（否则手机滑动生涩且误触书卡）
-    const host = hardenDialogBody(dialog, ".re-shelf-dialog-host");
-    if (!host) return;
-    this.shelfDialogHost = host;
-    this.mountShelf(host);
+  private openShelfOverlay(): void {
+    const plugin = this;
+    try {
+      mobileOverlay.open("shelf", {
+        key: "shelf",
+        mount: (el) => {
+          plugin.mountShelf(el);
+          return {
+            destroy: () => {
+              try {
+                plugin.readerDock?.disposeShelf();
+              } catch (e) {
+                getLogger().warn("[RE 阅读器] 销毁书架浮层组件失败", { error: e });
+              }
+            },
+          };
+        },
+      });
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 打开书架浮层失败", { error: e });
+    }
   }
 
   /** 打开指定书籍（供深链 / 命令面板 / 外部调用） */
   openBook(bookId: string, title?: string): void {
     try {
+      // 2026-10-26 路线 A：移动端 openTab 是空实现 → 走浮层（与书架点书同一条路，
+      // 否则深链/外部调用在手机上会静默无反应）
+      if (isMobile()) {
+        void this.readerDock?.tabController?.openBookTab(bookId, title);
+        return;
+      }
       void openTab({
         app: this.app,
         custom: {
@@ -663,12 +710,12 @@ export class ReaderPlugin extends Plugin {
     } catch (e) {
       getLogger().warn("[RE 阅读器] 卸载时清理阅读器失败", { error: e });
     }
-    // 2026-10-24 移动端适配：卸载时销毁书架弹窗（内部 Svelte 组件经 destroyCallback 链式销毁）
+    // 2026-10-26 路线 A：卸载时关闭移动端浮层（容器保留在 body 上无碍，
+    // 但层里的 Svelte 组件必须销毁，否则监听器泄漏）
     try {
-      this.shelfDialog?.destroy?.();
-      this.shelfDialog = null;
+      mobileOverlay.closeAll();
     } catch (e) {
-      getLogger().warn("[RE 阅读器] 卸载时销毁书架弹窗失败", { error: e });
+      getLogger().warn("[RE 阅读器] 卸载时关闭移动浮层失败", { error: e });
     }
     // 2026-10-13：批注落盘（防抖窗口内可能挂起的批注变更）
     void flushAnnotationStore();

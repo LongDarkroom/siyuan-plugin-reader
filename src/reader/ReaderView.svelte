@@ -14,8 +14,10 @@ import { getLogger } from "../core/logger.ts";
   import { onMount, onDestroy, tick } from "svelte";
   // 移动端适配 Phase 0/1：统一环境判定入口（禁止再手写 getFrontend().endsWith("mobile")）
   import { isTouchDevice } from "../core/env.ts";
+  // 2026-10-26：移动端压制浏览器原生选词菜单（长按浮条压在自绘划词工具栏上）
+  import { shouldSuppressNativeMenu, nativeMenuGuardHandler, applyTouchCalloutNone } from "../core/native-menu.ts";
   // [REword patch 2026-08-29] 移动端 PDF 适配 Phase 1
-  import { getDeviceClass, isSmallMobile, isLargeMobile } from "../core/env.ts";
+  import { getDeviceClass, isSmallMobile, isLargeMobile, isMobile } from "../core/env.ts";
   // 2026-10-24 移动端适配 Phase 1：响应式视口状态（断点 / 软键盘），根节点状态类 + 紧凑顶栏开关
   import { viewport, isPhoneBreakpoint, type ViewportBreakpoint } from "../core/viewport-store.ts";
   // [REword 2026-09-02] 界面分流：按书籍格式自动切换「图书界面 / PDF 界面」。
@@ -354,9 +356,14 @@ import { getLogger } from "../core/logger.ts";
   export let fontStore: FontStore;
   /** 2026-09-08 启动卡死修复：上次启动未完成初始化时为 true，禁止 onMount 自动开书（断自锁，改手动打开） */
   export let launchCrashed: boolean = false;
-  export let onBack: () => void;
+  /** 返回书架（未提供时 ‹ 不可用） */
+  export let onBack: (() => void) | undefined = undefined;
   /** 独立 Tab 模式：关闭当前 Tab（未提供时 ‹ 退化为 onBack） */
   export let onCloseTab: (() => void) | undefined = undefined;
+  /** 2026-10-26 路线 A：移动端全屏浮层模式。
+   *  true 时 ‹ 按钮的语义是「返回书架」（关掉阅读层、露出下层书架层），
+   *  文案也不再是桌面 Tab 的「关闭阅读（书架在侧边栏）」。 */
+  export let mobileOverlay: boolean = false;
   /** 独立 Tab 模式：标题联动（书名 · 章节） */
   export let onTitleChange: ((title: string) => void) | undefined = undefined;
   /** 翻译选中文本并直接发送到 AI 精读面板（委托 plugin.translateToAi） */
@@ -7225,6 +7232,19 @@ function applyTopHandleHitHeight() {
     trackDocListener(doc, "pointerdown", onFootnoteOutsidePointerDown as EventListener, true);
     // 2026-08-27 晚（P2.2）：专注模式滚动高亮（capture 捕获内部滚动容器）
     trackDocListener(doc, "scroll", ((_e: Event) => onFocusScroll(doc)) as EventListener, true);
+    // 2026-10-26：移动端压制浏览器原生选词菜单。
+    // 真机截图实证：长按选词后 Chrome 的原生浮选菜单（询问Copilot/大声朗读/复制/全选）
+    // 压在插件自己的划词工具栏上，两层混在一起。原生菜单属浏览器 UI 层，CSS/z-index
+    // 盖不住，唯一办法是不让它弹出（对标思阅 SiReader 的 contextmenu → preventDefault）。
+    // · 只在移动端前端生效：桌面右键菜单有实际用途（复制粘贴 / PDF 标注 / 链接右键）。
+    // · 只 preventDefault、**不** stopPropagation ⇒ 同文档上 PDF 矩形标注的右键菜单
+    //   （PdfTextHlLayer 自绘的 JS 菜单）照常可用。
+    // · iOS 的长按「复制/查找/共享」是系统 callout 菜单，不派发 DOM contextmenu，
+    //   只能靠 CSS 属性关 ⇒ 同时给内容文档 html 加 -webkit-touch-callout:none。
+    if (shouldSuppressNativeMenu({ mobile: isMobile() })) {
+      trackDocListener(doc, "contextmenu", nativeMenuGuardHandler as EventListener, true);
+      applyTouchCalloutNone(doc);
+    }
     // [REword patch 2026-08-29] PDF ⌘/Ctrl+滚轮缩放：
     // wheel 事件不跨 iframe 边界，必须挂到内容文档里才能收到页面上的滚轮。
     // 仅 PDF 挂载——EPUB 滚动模式下挂 passive:false 的 wheel 监听会让
@@ -11449,6 +11469,13 @@ function applyTopHandleHitHeight() {
     document.addEventListener("dblclick", onDblClickToggleZoom, true);
       // 2026-08-29：点击脚注气泡外部（reader UI 空白区）关闭
       document.addEventListener("pointerdown", onFootnoteOutsidePointerDown as EventListener, true);
+      // 2026-10-26：主文档也压制浏览器原生 contextmenu 菜单。
+      // 场景：长按**插件自己的**划词工具栏按钮时，Android Chrome 同样会弹出
+      // 原生「复制/粘贴」浮条，压在工具栏上。内容文档（iframe）那条见 attachContentDoc。
+      // 只在移动端前端生效；桌面右键菜单保留。
+      if (shouldSuppressNativeMenu({ mobile: isMobile() })) {
+        document.addEventListener("contextmenu", nativeMenuGuardHandler as EventListener, true);
+      }
     }
     // 2026-10-07 修「深色模式重载后不跟随」（用户实测：重载后不跟随，
     //   需手动 深色→浅色→再切深色 才生效）。
@@ -11555,6 +11582,8 @@ function applyTopHandleHitHeight() {
       document.removeEventListener("dblclick", onDblClickToggleZoom, true);
       // 注销脚注气泡外部点击关闭
       document.removeEventListener("pointerdown", onFootnoteOutsidePointerDown as EventListener, true);
+      // 2026-10-26：注销主文档原生菜单压制（与 onMount 的注册对称）
+      document.removeEventListener("contextmenu", nativeMenuGuardHandler as EventListener, true);
     }
     // [REword patch 2026-08-29] 注销 PDF 滚轮缩放（页面四周留白）+ 清掉落盘防抖定时器
     if (stageWheelBound && readerViewEl) {
@@ -11664,8 +11693,8 @@ function applyTopHandleHitHeight() {
     <div class="reader-toolbar-left">
       <button
         class="reader-btn"
-        title={onCloseTab ? t("关闭阅读（书架在侧边栏）") : t("返回书架")}
-        on:click={() => (onCloseTab ? onCloseTab() : onBack())}
+        title={mobileOverlay ? t("返回书架") : (onCloseTab ? t("关闭阅读（书架在侧边栏）") : t("返回书架"))}
+        on:click={() => (mobileOverlay ? onBack?.() : (onCloseTab ? onCloseTab() : onBack?.()))}
       >‹</button>
       <button
         class="reader-btn reader-drawer-anchor"
@@ -13243,6 +13272,14 @@ function applyTopHandleHitHeight() {
     align-items: stretch;
     gap: 8px;
     pointer-events: none; /* 容器不拦截，子元素自动开启 */
+    /* 2026-10-26：工具栏自身不可被选中。
+       否则长按工具栏上的按钮会选中按钮文字，iOS 弹「复制/查找」callout、
+       Android 弹原生菜单 —— 都会压在工具栏上（用户反馈的「两层混在一起」）。 */
+    -webkit-user-select: none;
+    -moz-user-select: none;
+    -ms-user-select: none;
+    user-select: none;
+    -webkit-touch-callout: none;
     /* 恒深色令牌：主栏 / 药丸 / 三角共用（改动只改这一处） */
     --rwd-sel-bg: rgba(28, 29, 31, 0.94);
     --rwd-sel-fg: #ffffff;
@@ -14647,6 +14684,43 @@ function applyTopHandleHitHeight() {
   .reader-view.re-phone .reader-bottom-handle-dot {
     width: 5px;
     height: 5px;
+  }
+  /* ================================================================
+   * 2026-10-26 路线 A · 极小屏档（对标「思阅」SiReader 的 420/380 断点）
+   * ----------------------------------------------------------------
+   * re-phone 已覆盖 ≤480px；这里补两档更窄的（折叠机半屏 / iPhone SE 竖屏）：
+   * 顶栏控件更紧凑、底部 sheet 让出更多正文高度。
+   * 注意 .reader-toolbar-iphone .reader-btn 的 44×44 命中区**不缩**
+   * （只调 padding/字号，min-width 仍兜底触摸命中）。 */
+  @media (max-width: 420px) {
+    .reader-view.re-phone .reader-toolbar {
+      padding-left: calc(4px + env(safe-area-inset-left, 0px));
+      padding-right: calc(4px + env(safe-area-inset-right, 0px));
+      gap: 2px;
+    }
+    .reader-view.re-phone .reader-btn {
+      padding: 4px 5px;
+    }
+    .reader-view.re-phone .reader-toc,
+    .reader-view.re-phone .reader-bookmarks,
+    .reader-view.re-phone .reader-annots,
+    .reader-view.re-phone .reader-marks,
+    .reader-view.re-phone .reader-search {
+      bottom: 36px;
+      max-height: min(84vh, calc(100% - 84px));
+    }
+  }
+  @media (max-width: 380px) {
+    .reader-view.re-phone .reader-toolbar {
+      padding-top: calc(4px + env(safe-area-inset-top, 0px));
+    }
+    .reader-view.re-phone .reader-btn {
+      padding: 3px 4px;
+      font-size: 12px;
+    }
+    .reader-view.re-phone .reader-title {
+      font-size: 12px;
+    }
   }
   /* ================================================================
    * 2026-10-25 P0-1：常驻侧边栏（停靠模式，根节点 .sidebar-docked）

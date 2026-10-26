@@ -4,7 +4,22 @@
 // 2026-09-04 P0：全脚本不执行任何删除。此前对 cmaps/ standard_fonts/ 先 rmSync 再 cpSync，
 // 单次删除 170+ 文件，会触发批量删除保护使构建中断；改为 cpSync(force:true) 覆盖写，
 // 效果等价（同名文件被覆盖）且不产生删除动作。
-import { copyFileSync, cpSync, existsSync } from "node:fs";
+//
+// 2026-10-26 修复：PDF 三件套（pdf.worker.mjs / cmaps/ / standard_fonts/）原是
+// 「从 src/reader/vendor/foliate-js/vendor/pdfjs/ 拷到插件根」。但那三个源路径
+// **从未进过 git**（仓库里只有 pdf.worker.mjs.map），真实来源是 foliate-js 的
+// rollup 从 node_modules/pdfjs-dist 拷的——而 node_modules/ 被 .gitignore 排除，
+// 不在本仓库安装 ⇒ 拷贝步骤永远拿不到源，`npm run build` 一直以退出码 1 结束。
+// 后果：发版命令 `npm run make`（check && build && make_release.py）在 build 这一步断链。
+//
+// 现在的口径：**这三个文件直接以插件根的形态入库**（git 跟踪 pdf.worker.mjs、
+// cmaps/ 169 个 .bcmap、standard_fonts/ 16 个 .pfb），运行时由思源 webview 经
+// `/plugins/siyuan-plugin-reader/` 读取，无需构建期搬运。
+// 因此这里从「拷贝」改为「校验就位」——缺了就报错（不是可选项：
+//   · 缺 pdf.worker.mjs ⇒ 桌面端解析 PDF 元数据/封面失败；
+//   · 缺 cmaps/ ⇒ CJK PDF 中文显示为方块，PDF.js 抛 "cMapUrl/cMapPacked required"；
+//   · 缺 standard_fonts/ ⇒ PDF 1.7 之前引用的 Type1 字体拿不到）。
+import { copyFileSync, existsSync, readdirSync, statSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -15,13 +30,6 @@ const files = [
   // 主 bundle + 样式
   ["dist/index.js", "index.js"],
   ["dist/style.css", "index.css"],
-  // [REword patch 2026-08-29] PDF 适配 Phase 1.5：PDF.js worker 独立文件
-  // vite 单 CJS bundle 模式（inlineDynamicImports）下无法自动 emit worker，
-  // 手动复制到插件根目录，让思源 webview 通过 /plugins/siyuan-plugin-reword/pdf.worker.mjs 访问
-  [
-    "src/reader/vendor/foliate-js/vendor/pdfjs/pdf.worker.mjs",
-    "pdf.worker.mjs",
-  ],
 ];
 
 let ok = true;
@@ -37,31 +45,27 @@ for (const [src, dest] of files) {
   console.log(`[copy-dist] ${src} -> ${dest}`);
 }
 
-// 2026-09-04 P1 修复：复制 PDF.js cMap + standard_fonts 目录到插件根
-// cMap 缺失会导致 CJK PDF 中文显示为方块，PDF.js 抛 "cMapUrl/cMapPacked required" 警告
-// （思源 webview 走相对路径 ./cmaps/ / ./standard_fonts/ 加载，与 worker 同一策略）
-const dirs = [
-  [
-    "src/reader/vendor/foliate-js/vendor/pdfjs/cmaps",
-    "cmaps",
-  ],
-  [
-    "src/reader/vendor/foliate-js/vendor/pdfjs/standard_fonts",
-    "standard_fonts",
-  ],
+// PDF 三件套：已以插件根形态入库，这里只校验就位（见文件头注释）。
+const pdfAssets = [
+  ["pdf.worker.mjs", "file", "桌面端解析 PDF 元数据/封面"],
+  ["cmaps", "dir", "CJK PDF 中文（缺了显示为方块）"],
+  ["standard_fonts", "dir", "PDF 1.7 之前引用的 Type1 字体"],
 ];
-for (const [src, dest] of dirs) {
-  const srcPath = resolve(ROOT, src);
-  const destPath = resolve(ROOT, dest);
-  if (!existsSync(srcPath)) {
-    console.error(`[copy-dist] 未找到 ${src}`);
+for (const [name, kind, why] of pdfAssets) {
+  const p = resolve(ROOT, name);
+  const exists = existsSync(p);
+  // 目录要求非空（空目录等于没有资源）
+  const nonEmpty = !exists
+    ? false
+    : kind === "file"
+      ? statSync(p).isFile()
+      : statSync(p).isDirectory() && readdirSync(p).length > 0;
+  if (!nonEmpty) {
+    console.error(`[copy-dist] 缺少 ${name}（${kind}）—— 影响：${why}`);
     ok = false;
     continue;
   }
-  // force:true 覆盖写，避免旧版本残留导致 cMap 错位。
-  // 不使用 rmSync —— 删除 170+ 文件会被批量删除保护拦截。
-  cpSync(srcPath, destPath, { recursive: true, force: true });
-  console.log(`[copy-dist] ${src}/ -> ${dest}/`);
+  console.log(`[copy-dist] ${name} 已就位（${why}）`);
 }
 
 if (!ok) process.exit(1);

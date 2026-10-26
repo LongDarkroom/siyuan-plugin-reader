@@ -125,14 +125,9 @@ export function responsiveHeight(designHeight: number, min = 280, max?: number):
  *  - 移动端：包成 "calc(100vw - Npx)" / "calc(100vh - Npx)"，
  *    让思源 Dialog 直接铺满视口（更适合触屏交互）
  *
- * 用法：
- * ```ts
- * new Dialog({
- *   title: "设置",
- *   width: responsiveDialogSize(720, "width"),
- *   ...
- * });
- * ```
+ * ⚠️ 2026-10-26 路线 A 后**当前无调用方**：移动端一级承载（书架 / 阅读）已从
+ * 思源 Dialog 迁到全屏浮层（core/mobile-overlay-host.ts），本函数随之成为死代码。
+ * 若将来二级弹窗（设置 / 词典管理）需要「按视口缩放」，可重新启用。
  */
 export function responsiveDialogSize(designPx: number, axis: "width" | "height"): string {
   if (typeof window === "undefined") return `${designPx}px`;
