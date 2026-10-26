@@ -19,6 +19,8 @@ export type ShortcutAction =
   | "nextSection"
   | "goStart"
   | "goEnd"
+  | "prevChapter"
+  | "nextChapter"
   | "fontIncrease"
   | "fontDecrease"
   | "openSearch"
@@ -85,6 +87,11 @@ export const READER_SHORTCUTS: ShortcutSpec[] = [
   // 2026-10-10：Space 语义由「下一段」改为「下一页」（用户拍板，与 Readest 一致）。
   // 此前它与 ↑↓ 撞在同一个 action 上，导致注册表里出现两条 key 指向同一动作。
   { action: "nextPage",       label: "下一页（Space）",        key: " ", group: "nav" },
+  // 2026-10-25 P0-2：上/下一章跳转（长章节翻页痛点，对标微信读书/Readest）。
+  // Alt+←/→：不与 ←/→（翻页）和思源全局键冲突；实现走 foliate renderer.prevSection/nextSection
+  //（分页 paginator 与 PDF fixed-layout 都有）。注意与 prevSection/nextSection（↑↓ 滚一段）区分。
+  { action: "prevChapter",    label: "上一章（Alt+←）",       alt: true, key: "ArrowLeft", group: "nav" },
+  { action: "nextChapter",    label: "下一章（Alt+→）",       alt: true, key: "ArrowRight", group: "nav" },
   // PgUp / PgDn：与 ←→ 同义（部分用户习惯用这两个键翻页）
   { action: "prevPage",       label: "上一页（PgUp）",         key: "PageUp", group: "nav" },
   { action: "nextPage",       label: "下一页（PgDn）",         key: "PageDown", group: "nav" },

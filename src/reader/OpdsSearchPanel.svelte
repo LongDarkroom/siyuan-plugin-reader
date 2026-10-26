@@ -1173,9 +1173,12 @@
     cursor: pointer;
   }
   .opds-fmt-chip.active {
+    /* 2026-10-25 对比度修复（审计 R3）：主色文字压 primary-light 淡底对比度 2.97~3.65
+       不达 WCAG AA → 文字改 on-background，选中指示交给主色描边 + 字重 */
     background: var(--b3-theme-primary-lightest, rgba(53, 117, 240, 0.1));
-    color: var(--b3-theme-primary, #3575f0);
-    border-color: var(--b3-theme-primary-light, #85b7eb);
+    color: var(--b3-theme-on-background, #333);
+    font-weight: 600;
+    border-color: var(--b3-theme-primary, #3575f0);
   }
   .opds-detail-actions {
     display: flex;

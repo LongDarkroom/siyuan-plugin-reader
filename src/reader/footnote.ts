@@ -206,6 +206,17 @@ export interface FootnoteResult {
    *   自己拼容易拿到错误的 index。
    */
   target?: { index: number; anchor?: any }
+  /**
+   * 2026-10-26：抽取成功时使用的**完整解析 href**（含章节路径，形如
+   * `EPUB/xhtml/chapter5.xhtml#footnote-6-177`）。
+   *
+   * 「↗ 跳转」改走 `view.goTo(resolvedHref)`——与目录跳转同一条正路
+   * （resolveNavigation → renderer.goTo），history 里存的是字符串（安全；
+   * 此前传 `{index, anchor}` 对象才有人参进历史栈的问题）。
+   * 调用方拿到裸 `#hash` 时必须先对所在 section 解析（见 ReaderView
+   * 的 resolveFootnoteHref），本字段保证存进来时已是全径。
+   */
+  resolvedHref?: string
 }
 
 function parseXhtml(xhtml: string): Document {
@@ -364,16 +375,16 @@ export async function extractFootnote(book: any, href: string): Promise<Footnote
       const xmlDoc = new DOMParser().parseFromString(xhtml, 'application/xhtml+xml')
       el = findFootnoteElement(xmlDoc, hash)
     }
-    if (!el) return { html: null, type: '脚注', target }
+    if (!el) return { html: null, type: '脚注', target, resolvedHref: href }
     const type = classifyType(el)
     const html = prepareFootnoteHtml(el)
-    if (!html) return { html: null, type, target }
+    if (!html) return { html: null, type, target, resolvedHref: href }
     // 相对图片解析为 blob URL（best-effort）：在临时容器上操作，避免污染缓存的原始 DOM
     const tmp = doc.createElement('div')
     tmp.innerHTML = html
     await resolveImages(tmp, book, target.index)
     // 🔴 target 一并进缓存：否则「已缓存」的那次拿不到导航目标，跳转按钮会灰掉
-    const result: FootnoteResult = { html: tmp.innerHTML, type, target }
+    const result: FootnoteResult = { html: tmp.innerHTML, type, target, resolvedHref: href }
     footnoteCache.set(cacheKey, result)
     return result
   } catch {

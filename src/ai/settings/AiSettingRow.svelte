@@ -312,7 +312,7 @@
     flex-shrink: 0;
   }
   .ais-badge[data-wired="partial"] {
-    color: var(--b3-theme-warning);
+    color: var(--b3-theme-warning, #d25f04);
     background: var(--b3-theme-surface-lighter);
   }
   .ais-badge[data-wired="planned"] {
@@ -327,7 +327,7 @@
     opacity: 0.85;
   }
   .ais-note[data-wired="partial"] {
-    color: var(--b3-theme-warning);
+    color: var(--b3-theme-warning, #d25f04);
   }
   .ais-note[data-wired="planned"] {
     color: var(--b3-theme-primary);
