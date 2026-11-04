@@ -8,7 +8,7 @@
 
 import { forwardProxyRaw } from "../siyuan/api";
 // @ts-ignore - foliate vendor 为纯 JS，无类型声明（仅运行时 import）
-import { getFeed, getOpenSearch, REL, SYMBOL } from "./vendor/foliate-js/opds.js";
+import { getFeed, getOpenSearch, getPublication, REL, SYMBOL } from "./vendor/foliate-js/opds.js";
 
 const UA = "REword/1.4 (+SiYuan plugin)";
 
@@ -437,6 +437,26 @@ export async function downloadAsFileWithProgress(
   return new File([blob], `${name}.${ext}`, { type: type || "application/epub+zip" });
 }
 
+/** OPDS / Atom 命名空间（与 vendor/foliate-js/opds.js 的 NS.ATOM 一致） */
+const ATOM_NS = "http://www.w3.org/2005/Atom";
+
+/**
+ * 从 feed 文档里取第一个 Atom `<entry>` 元素。
+ *
+ * 2026-11-03 新增：fetchOpdsDetail 的 XML 分支原先把 **feed 根节点**当 entry 用，
+ * 而 foliate 的 getPublication 期望的是 `<entry>`（其内部读 entry.children /
+ * entry.ownerDocument）。这里按 foliate getFeed 的同一口径取 feed 的 entry 子元素；
+ * 同时兼容「详情 URL 直接返回单个 <entry> 文档」与「无命名空间裸 entry」两种情况。
+ */
+function findFirstAtomEntry(root: Element | null): Element | null {
+  if (!root) return null;
+  if (root.localName === "entry") return root;
+  const byNs = root.getElementsByTagNameNS(ATOM_NS, "entry");
+  if (byNs.length) return byNs[0];
+  const plain = root.getElementsByTagName("entry");
+  return plain.length ? plain[0] : null;
+}
+
 /**
  * 拉取书籍详情文档（rel="self"，参照 readest #4749）：feed 列表只带摘要，
  * 完整元数据（出版方/语言/年份/简介全文）与全部格式链接在详情文档里。
@@ -444,7 +464,7 @@ export async function downloadAsFileWithProgress(
  */
 export async function fetchOpdsDetail(url: string, auth?: string, extraHeaders?: Record<string, string>): Promise<OpdsDetail> {
   const { body, contentType } = await fetchText(url, auth, extraHeaders);
-  const abs = (h?: string) => resolveOpdsUrl(h, url);
+  const abs = (h?: string) => (h ? resolveOpdsUrl(h, url) : h);
   if (/json/i.test(contentType) || body.trim().startsWith("{")) {
     try {
       const j = JSON.parse(body);
@@ -467,7 +487,11 @@ export async function fetchOpdsDetail(url: string, auth?: string, extraHeaders?:
   }
   const doc = parseXmlDoc(body);
   const root = doc.documentElement;
-  const pub = getPublication(root) as any;
+  // 2026-11-03 修复：此前这里调用了**未导入**的 getPublication ⇒ 走到 XML(Atom) 分支
+  // 直接抛 ReferenceError（OPDS 详情抓取整条路径是断的）；而且传的是 feed 根节点，
+  // 而 getPublication 期望的是 <entry> 元素（foliate 的 getFeed 也是对 entry 调用）。
+  const entry = findFirstAtomEntry(root);
+  const pub = entry ? (getPublication(entry) as any) : null;
   const meta = pub?.metadata || {};
   return {
     title: meta.title,

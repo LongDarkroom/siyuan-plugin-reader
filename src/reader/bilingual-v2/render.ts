@@ -143,6 +143,9 @@ export function buildFailedEl(doc: Document): HTMLElement {
 
 /** doc 级委托去重标记：foliate 翻页会重建 Document，重绑时靠它避免重复 addEventListener */
 const AI_REDO_BOUND_FLAG = "__rewordAiRedoBound";
+/** doc 级持有的当前回调（2026-11-03 泄漏清理）：
+ *  组件重建后重新 bind 时，替换回调而不是继续用旧闭包 —— 旧闭包持有已销毁组件的状态。 */
+const AI_REDO_HANDLER_KEY = "__rewordAiRedoHandler";
 
 /**
  * 绑定「用 AI 重译」的 doc 级事件委托（幂等）。
@@ -158,8 +161,10 @@ export function bindAiRedoDelegation(
 ): void {
   if (!doc) return;
   const d = doc as any;
-  if (d[AI_REDO_BOUND_FLAG]) return;
+  // 已绑过：只替换回调（组件重建后旧闭包持有已销毁组件的状态，会写到已卸载的 store）
+  if (d[AI_REDO_BOUND_FLAG]) { d[AI_REDO_HANDLER_KEY] = handler; return; }
   d[AI_REDO_BOUND_FLAG] = true;
+  d[AI_REDO_HANDLER_KEY] = handler;
   doc.addEventListener("click", (e) => {
     const t = e.target as Element | null;
     const btn = t?.closest?.("." + REWORD_BILINGUAL_AI_REDO);
@@ -172,7 +177,9 @@ export function bindAiRedoDelegation(
     const src = wrap.previousElementSibling;
     const text = src ? (src.textContent || "").trim() : "";
     if (!text) return;
-    handler(wrap, text);
+    const cb = d[AI_REDO_HANDLER_KEY];
+    if (!cb) return;
+    cb(wrap, text);
   });
 }
 
@@ -268,6 +275,8 @@ export function segHash(text: string): string {
 }
 
 const HIDE_BOUND_FLAG = "__rewordHideBound";
+/** doc 级持有的当前回调（2026-11-03 泄漏清理）：组件重建后重新 bind 时替换旧闭包 */
+const HIDE_HANDLER_KEY = "__rewordHideHandler";
 
 /**
  * 绑定「删除此段译文」的 doc 级事件委托（幂等，与 bindAiRedoDelegation 同构）。
@@ -279,8 +288,10 @@ export function bindHideDelegation(
 ): void {
   if (!doc) return;
   const d = doc as any;
-  if (d[HIDE_BOUND_FLAG]) return;
+  // 已绑过：只替换回调（组件重建后旧闭包持有已销毁组件的状态）
+  if (d[HIDE_BOUND_FLAG]) { d[HIDE_HANDLER_KEY] = handler; return; }
   d[HIDE_BOUND_FLAG] = true;
+  d[HIDE_HANDLER_KEY] = handler;
   doc.addEventListener("click", (e) => {
     const t = e.target as Element | null;
     const btn = t?.closest?.("." + REWORD_BILINGUAL_HIDE);
@@ -293,6 +304,8 @@ export function bindHideDelegation(
     const src = wrap.previousElementSibling;
     const text = src ? (src.textContent || "").trim() : "";
     if (!text) return;
-    handler(wrap, text);
+    const cb = d[HIDE_HANDLER_KEY];
+    if (!cb) return;
+    cb(wrap, text);
   });
 }

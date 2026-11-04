@@ -1,20 +1,12 @@
-<script lang="ts">
+<script context="module" lang="ts">
   /**
-   * 书架右键菜单 - 通用轻量组件
-   * ----------------------------------------------------------------
-   * - 单例:全文档只一个 menu 元素(切换数据时只更新内容)
-   * - 子菜单:hover 展开,不需点击
-   * - 自动关闭:点击外部 / Esc / 滚轮 / 窗口 resize
-   * - 视口边缘 flip:避免超出右/下边界
+   * 书架右键菜单项。
    *
-   * [2026-08-29] P2 书架 I1 改造
+   * 2026-11-03：从实例 script 移到 module script —— Svelte 4 不允许在实例 script 里
+   * `export type`（报 "Modifiers cannot appear here"）。这一处塌陷会让 MenuItem 类型
+   * 整体失效，连带把子菜单项全推成 unknown（连锁 9 处错误）。
+   * 移到 module script 后，BookshelfView 的 `import { type MenuItem }` 照常可用。
    */
-  import { onMount, onDestroy, tick } from "svelte";
-  // 2026-10-11 美化 P1：菜单项图标换成与工具栏同一张生成表里的 Tabler 线性 SVG。
-  // 此前 icon 字段是 emoji —— 菜单和刚换完的顶栏/工具栏并排看会「一半线性、一半彩色」，
-  // 而彩色 emoji 在深色模式下还自带背景，是这次统一要消灭的那一类。
-  import { SEL_ICONS } from "./sel-icons.generated.ts";
-
   export type MenuItem = {
     /** 按钮文字 */
     label?: string;
@@ -39,6 +31,25 @@
     /** 当前选中标记(右侧打勾) */
     active?: boolean;
   };
+</script>
+
+<script lang="ts">
+  /**
+   * 书架右键菜单 - 通用轻量组件
+   * ----------------------------------------------------------------
+   * - 单例:全文档只一个 menu 元素(切换数据时只更新内容)
+   * - 子菜单:hover 展开,不需点击
+   * - 自动关闭:点击外部 / Esc / 滚轮 / 窗口 resize
+   * - 视口边缘 flip:避免超出右/下边界
+   *
+   * [2026-08-29] P2 书架 I1 改造
+   */
+  import { onMount, onDestroy, tick } from "svelte";
+  // 2026-10-11 美化 P1：菜单项图标换成与工具栏同一张生成表里的 Tabler 线性 SVG。
+  // 此前 icon 字段是 emoji —— 菜单和刚换完的顶栏/工具栏并排看会「一半线性、一半彩色」，
+  // 而彩色 emoji 在深色模式下还自带背景，是这次统一要消灭的那一类。
+  import { SEL_ICONS } from "./sel-icons.generated.ts";
+
 
   export let items: MenuItem[] = [];
   export let x: number;
@@ -49,6 +60,10 @@
 
   let menuEl: HTMLDivElement;
   let openSubmenuIdx = -1;
+  /** 当前展开的子菜单项（派生：{#if} 里的 ?. 收窄不会传递到 {#each}，
+   *  直接写 items[openSubmenuIdx].children 会是 MenuItem[] | undefined）。 */
+  let openSubmenuItems: MenuItem[] = [];
+  $: openSubmenuItems = openSubmenuIdx >= 0 ? (items[openSubmenuIdx]?.children ?? []) : [];
   let submenuPos = { x: 0, y: 0 };
   let adjusted = { x: 0, y: 0 };
 
@@ -197,7 +212,7 @@
       style="left:{submenuPos.x}px; top:{submenuPos.y}px"
       role="menu"
     >
-      {#each items[openSubmenuIdx].children as sub, j (j)}
+      {#each openSubmenuItems as sub, j (j)}
         {#if sub.divider}
           <div class="shelf-menu-divider"></div>
         {:else}

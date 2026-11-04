@@ -23,9 +23,14 @@
  */
 
 import {
-  SERIF_FONT_PRESETS,
-  SANS_SERIF_FONT_PRESETS,
   MONOSPACE_FONT_PRESETS,
+  // 2026-11-01 拉丁/中文分离：字体链构建需要**分开的**西文池与中文池
+  // （合并池 SERIF_FONT_PRESETS / SANS_SERIF_FONT_PRESETS 只用于设置面板下拉展示，
+  //  链内部必须按「西文优先」排序，故此处不再引入）。
+  SERIF_LATIN_PRESETS,
+  CJK_SERIF_PRESETS,
+  SANS_SERIF_LATIN_PRESETS,
+  CJK_SANS_SERIF_PRESETS,
   // 2026-10-07：选区色的深浅判定改为「按预设 bg 实际亮度算」，
   // 需要读THEME_PRESETS（原先按名字硬编码 ['night','dark']，会漏判 gold 等深色配色）。
   THEME_PRESETS,
@@ -414,6 +419,18 @@ export interface SiyuanThemeVars {
 }
 
 /**
+ * 宿主主题给出的「链接色」是否真能区分链接与正文。
+ *
+ * Neo 等主题把 `--b3-protyle-inline-link-color` 定义为 `currentColor`，
+ * 拿到的是**继承正文色**，等价于「没有链接提示」；这类 token 不能当真色用。
+ */
+export function isUsableLinkColor(raw: string | null | undefined): boolean {
+  const t = (raw ?? "").trim();
+  if (!t) return false;
+  return !/^(currentcolor|inherit|unset|initial|revert|revert-layer|transparent|none|auto)$/i.test(t);
+}
+
+/**
  * 在「父文档」（思源主窗口）抓取思源调色板。
  *
  * 关键约束：阅读器运行在 foliate 的 <iframe> 内，CSS 自定义属性**不会跨 iframe 继承**，
@@ -425,9 +442,24 @@ export interface SiyuanThemeVars {
  * 由调用方（ReaderView.svelte 的 getSiyuanVar）注入父文档上下文，保持本模块纯函数、可单测。
  */
 export function captureSiyuanThemeVars(
-  get: (name: string, fallback: string) => string
+  get: (name: string, fallback: string) => string,
+  /**
+   * 可选：把颜色 token 在宿主文档里解析成具体色值。
+   *
+   * 为什么不直接用原始 token：自定义属性的 computed value **不会展开内部的 var()**
+   * （Neo 的 `--b3-theme-primary: oklch(from var(--b3-theme-accent) …)`），
+   * 原样桥接进 iframe 后缺少 `--b3-theme-accent`，整条颜色声明失效。
+   * 链接色是唯一必须解析后再用的（否则回落到主色时同样失效）。
+   */
+  resolveColor?: (raw: string, fallback: string) => string
 ): SiyuanThemeVars {
   const primary = get("--b3-theme-primary", "#0f6bff");
+  const rawLink = get("--b3-protyle-inline-link-color", "#185FA5");
+  const rc = resolveColor ?? ((raw: string) => raw);
+  // 2026-11-04：Neo 等主题把 --b3-protyle-inline-link-color 设成 currentColor，
+  // 链接与正文同色 ⇒ 游戏书里的「Go to 12.」完全看不出可点。此时回落到主色，
+  // 与 Readest「覆盖配色时链接用 primary」同策略。
+  const link = isUsableLinkColor(rawLink) ? rc(rawLink, "#185FA5") : rc(primary, "#185FA5");
   return {
     bg: get("--b3-theme-background", "#ffffff"),
     onBackground: get("--b3-theme-on-background", "#222222"),
@@ -436,7 +468,7 @@ export function captureSiyuanThemeVars(
     primary,
     surface: get("--b3-theme-surface", "#f7f8fa"),
     border: get("--b3-border-color", "#e0e0e0"),
-    link: get("--b3-protyle-inline-link-color", "#185FA5"),
+    link,
     codeBg: get("--b3-protyle-code-background", "rgba(128,128,128,0.08)"),
     bqBg: get("--b3-bq-background", "rgba(128,128,128,0.06)"),
     markBg: get("--b3-protyle-inline-mark-background", "#ffe9a8"),
@@ -536,8 +568,16 @@ function q(name: string): string {
  * 参考 Readest `buildFontFamilyLists()`：用户只选首选字体名，系统自动补全
  * 同类候选池 + CJK 兜底 + 通用族，保证任何字符都有字形（不会方块/乱码）。
  *
- * 链结构（以衬线为例）：
- *   [首选衬线] → [CJK 指定字体] → [衬线候选池其余] → [跨平台 CJK 兜底栈] → serif
+ * ## 2026-11-01 链序改为「西文优先」（对标 Readest）
+ * 旧链序：`[首选] → [CJK 指定] → [候选池(混排)] → [CJK 兜底栈] → 通用族`
+ * 新链序：`[首选] → [西文候选池] → [CJK 指定] → [中文候选池] → [CJK 兜底栈] → 通用族`
+ *
+ * 为什么把「CJK 指定字体」挪到西文池**之后**（Readest 放在首选之后）：
+ *   浏览器按**字符**逐个回退。若西文首选字体本机没装，而中文槽排在西文池前面，
+ *   英文会被中文字体的**拉丁字形**接走 —— 正是本次要消灭的病根。
+ *   放到西文池之后，英文字符必然先命中某个西文候选
+ *   （Georgia / Times New Roman / Helvetica / Arial 四大装机必备，命中率≈100%），
+ *   汉字则跳过整条西文段（西文字体无汉字字形）落到中文槽。
  *
  * 为什么每条链都要带 CJK 兜底：英文衬线字体（Georgia/Literata）**没有汉字字形**，
  * 若链尾只有 `serif`，浏览器会用系统默认衬线渲染中文（macOS 上是 Songti SC，
@@ -547,7 +587,7 @@ function q(name: string): string {
  * @param serif 衬线链首选字体（空=不指定，走候选池）
  * @param sansSerif 无衬线链首选字体
  * @param monospace 等宽链首选字体
- * @param defaultCJKFont 中文字体（插入每条链次位；空=不插入）
+ * @param defaultCJKFont 中文字体（插入西文段之后；空=不插入）
  */
 export function buildFontFamilyLists(
   serif: string,
@@ -561,8 +601,9 @@ export function buildFontFamilyLists(
   // 衬线链
   const serifChain = [
     ...(serif ? [q(serif)] : []),
+    ...SERIF_LATIN_PRESETS.filter((f) => f !== serif && f !== cjk).map(q),
     ...(cjk && cjk !== serif ? [q(cjk)] : []),
-    ...SERIF_FONT_PRESETS.filter((f) => f !== serif && f !== cjk).map(q),
+    ...CJK_SERIF_PRESETS.filter((f) => f !== serif && f !== cjk).map(q),
     cjkFallback,
     "serif",
   ].join(", ");
@@ -570,8 +611,9 @@ export function buildFontFamilyLists(
   // 无衬线链
   const sansSerifChain = [
     ...(sansSerif ? [q(sansSerif)] : []),
+    ...SANS_SERIF_LATIN_PRESETS.filter((f) => f !== sansSerif && f !== cjk).map(q),
     ...(cjk && cjk !== sansSerif ? [q(cjk)] : []),
-    ...SANS_SERIF_FONT_PRESETS.filter((f) => f !== sansSerif && f !== cjk).map(q),
+    ...CJK_SANS_SERIF_PRESETS.filter((f) => f !== sansSerif && f !== cjk).map(q),
     cjkFallback,
     "sans-serif",
   ].join(", ");
@@ -599,6 +641,33 @@ export function fontVariableStyles(lists: FontFamilyLists): string {
   --reword-serif: ${lists.serif};
   --reword-sans-serif: ${lists.sansSerif};
   --reword-monospace: ${lists.monospace};
+}`;
+}
+
+/**
+ * 字重变量（2026-11-01，对标 Readest 的 `--font-weight`）。
+ *
+ * ## 为什么需要
+ * 书籍 CSS 里大量写 `font-weight: normal`（作者的「常规字重」声明）。
+ * 我们的字重设置此前只作用在 `body` 上，而 **CSS 继承规则决定了元素自身的声明
+ * 永远赢过继承值** ⇒ 书籍写了 `font-weight: normal` 的段落完全不受用户字重设置影响，
+ * 字重滑块对这些段落形同虚设。
+ *
+ * ## 怎么做
+ * 把书籍样式表里的 `font-weight: normal` **重写**成 `var(--reword-font-weight)`
+ * （见 reader-font-classify.ts 的 rewriteFontWeightInDocument），
+ * 于是「作者的 normal」变成「用户的字重」，滑块真正贯穿全书。
+ * 书籍写死的 `bold / 700` 等**不重写** —— 那是标题层级的语义，不该被字重滑块抹平。
+ *
+ * 默认值 400 ≡ normal ⇒ 用户没动过滑块时，重写前后观感完全一致。
+ */
+export function fontWeightVariableStyles(weight = 400): string {
+  const w =
+    typeof weight === "number" && Number.isFinite(weight) && weight >= 100 && weight <= 900
+      ? Math.round(weight)
+      : 400;
+  return `:root {
+  --reword-font-weight: ${w};
 }`;
 }
 
@@ -684,6 +753,8 @@ export function buildReaderStyles(
   sysDark = false
 ): string {
   const o = deriveStyleOutput(settings, preset, lineWidthPreset, sysDark);
+  // 与 bodyStyles 内 darkOverride 同源：用户开启覆盖，或背景本身是深色（深底深字必须救）
+  const overrideBooks = settings.overrideBookColor === true || isColorDark(o.bg);
 
   // 字体链构建：2026-10-07 起 `custom` 是它们的唯一开关
   // （原先是 `classified`，随「分类」档并入「自定义」而更名，见 ReaderFontMode 注释）
@@ -740,7 +811,7 @@ export function buildReaderStyles(
     // 2026-10-25 移动端适配 A3/C2：触屏正文策略（紧跟滚动条段，同为 html/body 级）。
     touchPolicyStyles(),
     cjkAliasFontFaces() + "\n" + digitFixFaceCss() + (fontCss ? "\n" + fontCss : ""),
-    uniformBlockResetStyles(overrideLayout),
+    uniformBlockResetStyles(),
     paragraphStyles(o),
     colorSchemeStyles(o),
     fontSizeOverrideStyles(settings.fontSize, settings.overrideBookFontSize !== false),
@@ -774,6 +845,10 @@ export function buildReaderStyles(
       ? invertImagesInDarkStyles(true)
       : "",
     textStyles(settings.text, overrideLayout),
+    // 2026-11-01：字重变量（--reword-font-weight）。
+    // 必须**所有字体模式**都注入：书籍 CSS 里的 `font-weight: normal` 会被重写成
+    // var(--reword-font-weight)，变量缺失时整条声明失效 ⇒ 标题的粗体会被抹平。
+    fontWeightVariableStyles(settings.text?.fontWeight ?? 400),
     // 2026-10-07 接通两个此前完全失效的开关：
     //   textAlign（原先硬编码 justify，用户关不掉）
     //   hyphenate（原先无条件 auto，且总开关也管不住）
@@ -799,7 +874,7 @@ export function buildReaderStyles(
         settings.layout?.followSiyuanMargin === true ? settings.sideMarginPx ?? null : null,
     } as Parameters<typeof layoutMarginStyles>[0]),
     ...fontSegments,
-    linkStyles(),
+    linkStyles(o, { overrideBooks, linkColor: siyuanVars?.link }),
     codeStyles(),
     colorSchemeStyles(o),
     wordWrapStyles(overrideLayout, settings.hyphenate === true),
@@ -1064,6 +1139,12 @@ export function selectionStyles(theme: string = "auto", isEink = false): string 
 export function bodyStyles(o: ReaderStyleOutput, settings: ReaderStyleInput): string {
   const rawImg = settings.theme === "custom" ? (settings.customBgImage || "").trim() : "";
   const img = rawImg ? rawImg.replace(/"/g, "%22").replace(/\)/g, "%29") : "";
+  // 2026-10-27 深色强制提亮：按**解析后的实际背景亮度**判深（isColorDark(o.bg)，
+  // 不按主题名硬编码——custom/新增配色都能正确判定）。深色主题下书籍 CSS 写死
+  // 的黑字（如 Calibre 转换书在段落 class 上 color:rgb(0,0,0)）会「深底深字」，
+  // 此时无论开关如何都自动启用书籍颜色覆盖（黑字→主题浅色）；
+  // 浅色背景该值为 false，行为与旧版完全一致（尊重书籍配色）。
+  const darkOverride = settings.overrideBookColor === true || isColorDark(o.bg);
   if (img) {
     // 2026-08-27 晚（P2.3 自定义背景图）：拆简写 background，避免 image 被覆盖
     return `
@@ -1076,7 +1157,7 @@ body {
   background-attachment: fixed !important;
   color: ${o.fg} !important;
   line-height: ${settings.lineHeight} !important;
-}`.trim();
+}${bookColorOverrideStyles(darkOverride, o)}`.trim();
   }
   return `
 /* === 搜索高亮：主色 70% 透明（更深更显眼，与 40% 选区色错开） === */
@@ -1091,7 +1172,7 @@ body {
   background: ${o.bg} !important;
   color: ${o.fg} !important;
   line-height: ${settings.lineHeight} !important;
-}${bookColorOverrideStyles(settings.overrideBookColor === true, o)}`.trim();
+}${bookColorOverrideStyles(darkOverride, o)}`.trim();
 }
 
 /**
@@ -1121,17 +1202,24 @@ export function bookColorOverrideStyles(enable: boolean, o: { fg: string; fg2: s
    书籍常在段落 class / 标题 / 引用块上写死颜色，那些是子元素直接声明、
    body 的继承管不到 ⇒ 深色主题下会出现「深底深字」。
    这里用 :is() 提高特异性，压过书籍的 (0,1,0) 段落级声明。 */
-html body :is(p, li, dd, dt, blockquote, h1, h2, h3, h4, h5, h6, figcaption, td, th) {
+html body :is(p, li, dd, dt, blockquote, h1, h2, h3, h4, h5, h6, figcaption, td, th,
+aside, span, b, strong, em, i, u, s,
+[role="doc-footnote"], [role="doc-endnote"], [role="doc-note"], [role="definition"]) {
   color: ${o.fg} !important;
 }
-/* 次级文本（图注/脚注/版权页）用弱一档的颜色，保留层级差*/
+/* 次级文本（图注/版权页）用弱一档的颜色，保留层级差
+   （aside/脚注内容放上面主色档：脚注是要读的正文，用弱色会重演「太暗看不清」）
+   🔴 2026-10-27 补 span/b/em 等行内元素：Calibre 转换书的「标题」常是
+   span.calibre25 + 逐字 <b class=calibreN> 拼的（如《打造第二大脑》「信息抓取标准」），
+   黑色挂在 span 类上 —— 只列块级元素时 span 链继承的黑色原样漏过来，
+   表现为「正文亮了、标题照样黑」。span 放主色档而非弱色档：标题是要读的。 */
 html body :is(figcaption, small, .footnote, .footnote p) {
   color: ${o.fg2} !important;
 }
-/* 书籍把链接写死成深蓝时，深色主题下几乎不可见 → 拉回主题前景色 */
-html body a {
-  color: ${o.fg} !important;
-}`.trim();
+/* 链接**不**在这里拉回前景色（2026-11-04 对标 Readest）：
+   Readest 的 overrideColor 只作用于 p/div/span 等文本容器，a 元素单独保留主色调，
+   否则链接与正文同色，"Go to 12." 这类游戏书跳转就看不出可点。
+   链接配色统一由 linkStyles() 负责（它在 bodyStyles 之后输出，可覆盖本书规则）。 */`.trim();
 }
 
 /**
@@ -1325,7 +1413,7 @@ p {
  * - 先统一归零，再为 blockquote/ul/ol/li/figure 恢复必要语义缩进；
  * - 不碰上下边距和纵向排版，只清横向偏移。
  */
-export function uniformBlockResetStyles(overrideLayout = true): string {
+export function uniformBlockResetStyles(): string {
   return `
 html body,
 html body > div,
@@ -1368,21 +1456,17 @@ html body li {
   margin-left: 0 !important;
   padding-left: 0.35em !important;
 }
-/* 统一文本对齐：覆盖书籍用高特异性类把段落设为 text-align:center。
-   2026-10-06：受 overrideBookLayout 门控 —— 关闭时（使用书籍原版排版）
-   不再强制 justify，把对齐权交还书籍。段落级的 justify 由
-   paragraphLayoutStyles() 施加，此处只兜住 div/section/article/li 这些
-   不在段落选择器里的容器。 */
-${overrideLayout
-      ? `html body p,
-html body div,
-html body section,
-html body article,
-html body li,
-html body blockquote {
-  text-align: justify !important;
-}`
-      : ""}
+/* 🔴 2026-11-01：此处原有的「统一文本对齐：text-align: justify !important」
+   （作用在 p/div/section/article/li/blockquote）**已整段删除**。
+
+   为什么删：段落级 !important 会把书籍**自己声明**的对齐方式一并压平 ——
+   诗、题词、版权页这些刻意居中的块会被拉成两端对齐（这正是 Readest 观感更好的
+   原因之一：Readest 只在 body 层给默认值，元素自身的声明照旧生效）。
+   新的对齐默认值改由 paragraphLayoutStyles() 施加在 **body 层**
+   （html body { text-align: justify|start }）—— 继承给所有后代，
+   元素自身的声明天然优先；再由 reader-align.ts 的 keepTextAlignment 快照
+   给「刻意居中/右对齐」的块打标记，确保它们在两端对齐下依然保留原样。
+   ⇒ uniformBlockResetStyles 不再需要 overrideLayout 门控（对齐已不在本段）。 */
 /* 图片/题注保持居中，不被清零拉偏 */
 html body figure,
 html body figcaption {
@@ -1636,9 +1720,48 @@ img[style*="float"] {
 }`.trim();
 }
 
-/** 链接 a（2026-08-30 思源化：跟随思源行内链接色 --b3-protyle-inline-link-color） */
-export function linkStyles(): string {
-  return `a { color: var(--b3-protyle-inline-link-color, #185FA5) !important; }`;
+/**
+ * 正文链接着色（2026-11-04 对标 Readest 的 `a:any-link` 规则）。
+ *
+ * ## 旧行为的问题
+ * 无条件输出 `a { color: var(--b3-protyle-inline-link-color) !important }`：
+ * Neo 等主题把该变量定义为 `currentColor` ⇒ 链接被刷成正文色，
+ * 游戏书里「Go to 12.」这种跳转完全看不出可点；同时 `!important`
+ * 也压掉了书籍自带的链接配色（Readest 截图里是青绿色数字）。
+ *
+ * ## 现在的三段语义（与 Readest 一致）
+ * - 覆盖书籍颜色（含深色背景自动启用）→ 链接统一用思源强调色 + `!important`
+ *   （Readest 对块级元素拉回前景色，但**把 `a` 排除在外**单独用 primary）
+ * - 深色、未覆盖 → 只把链接提亮（书籍常写死深蓝，深底上不可见）
+ * - 浅色、未覆盖 → 零特异性兜底：书籍自己的链接色优先，没写色时才用强调色
+ *   （不能像旧实现那样用 `!important` 把书籍配色抹平）
+ */
+export interface LinkStyleOptions {
+  /** 与 bodyStyles 的 darkOverride 同源（用户开关 || 深色背景） */
+  overrideBooks?: boolean;
+  /** 已解析的链接强调色（captureSiyuanThemeVars().link） */
+  linkColor?: string;
+}
+
+export function linkStyles(o: ReaderStyleOutput, opts: LinkStyleOptions = {}): string {
+  const accent = (opts.linkColor ?? "").trim() || "var(--b3-protyle-inline-link-color, #185FA5)";
+  // 深底上深蓝链接几乎不可见：向白色混一档（等价 Readest 深色下的 lightblue 策略）
+  const themed = o.isDark ? `color-mix(in srgb, ${accent} 55%, #ffffff)` : accent;
+  if (opts.overrideBooks) {
+    return `html body a:any-link {
+  color: ${themed} !important;
+}`;
+  }
+  if (o.isDark) {
+    return `html body a:any-link {
+  color: ${themed};
+}`;
+  }
+  // 浅色未覆盖：用 :where() 把特异性压到 0 —— 书籍自己写的链接色优先（书虫的青绿数字），
+  // 书籍没写色时才落到强调色，保证任何书都有可点提示。
+  return `:where(html body a:any-link) {
+  color: ${accent};
+}`;
 }
 
 /** 代码块 pre / code（2026-08-30 思源化：跟随思源行内代码底色 --b3-protyle-code-background） */
@@ -1717,7 +1840,8 @@ p code, li code, td code, th code, h1 code, h2 code, h3 code, h4 code {
  * 现在按 Readest 的做法补齐精细排版属性，并按 `overrideBookLayout` 门控 `!important`：
  * - `hyphens: auto` + `hyphenate-limit-*`：只对超过限长的词断词（Readest 同值 3/2/2）
  * - `hanging-punctuation: allow-end last`：行尾标点悬挂，**中文观感提升最大的单项**
- * - `widows: 2`：分页时不留孤行
+ * - `widows: 2` / `orphans: 2`：分页时不留孤行/寡行（2026-11-01 补齐 orphans，
+ *   Readest 同为 2 —— 只写 widows 会让段末**寡行**（只剩 1 行）单独留在页尾）
  * - `overflow-wrap: break-word`（**不是 anywhere**）：anywhere 会污染 min-content
  *   导致 flex/grid 子项塌陷（Readest 注释明确点名此坑）
  */
@@ -1746,9 +1870,20 @@ body, p, li, blockquote {
   -webkit-hyphenate-limit-after: 2;
   -webkit-hyphenate-limit-lines: 2;
   hanging-punctuation: allow-end last;
-  widows: 2;
+  widows: 2${imp};
+  orphans: 2${imp};
   overflow-wrap: break-word${imp};
   word-wrap: break-word${imp};
+}
+/* CJK 放宽孤行/寡行控制（2026-11-01，Readest 同款）
+   中文不断词、每行字数接近固定，2 行孤行控制在中英混排里常把段落推得过散；
+   Readest 对 zh/ja/ko 放宽到 1。特异性 (0,1,2) 高于上面的元素选择器，
+   且与施加层的 widows 同为 !important 时按「后写者赢」判定。 */
+html body :lang(zh),
+html body :lang(ja),
+html body :lang(ko) {
+  widows: 1${imp};
+  orphans: 1${imp};
 }`.trim();
 }
 
@@ -1801,11 +1936,16 @@ export function textStyles(
    * 与 letterSpacing 分开的原因：letter-spacing 作用在**所有字符之间**
    * （含词内），给负值会让英文单词粘连；word-spacing 只作用在**词之间**，
    * 是调节西文/中英混排疏密的正确旋钮。 */
-  const wsSeg = ws === 0 ? "" : `word-spacing: ${ws}px${imp};`;
+  const wsSeg = ws === 0 ? "" : `word-spacing: ${ws}em${imp};`;
 
+  /* ⚠️ 2026-11-04 单位由 px 改 em、选择器补 div。
+   * · px → em：字距/词距本就是**相对字号**的比例参数，px 下换字号会破坏用户调好的疏密。
+   * · 补 div：不少 EPUB 把正文段落写成 <div>（没有 p），旧选择器漏掉它们，
+   *   用户拖动字距/词距时这些书「一点反应都没有」。div 是容器也无妨 ——
+   *   letter-spacing/word-spacing 只影响文字，图片/分隔线 div 不受影响。 */
   return `${fwSeg}
-body, p, li, blockquote, dd, dt {
-  letter-spacing: ${ls}px${imp};
+html body p, html body li, html body blockquote, html body dd, html body dt, html body div {
+  letter-spacing: ${ls}em${imp};
   ${wsSeg}
 }`.trim();
 }
@@ -1952,15 +2092,87 @@ ${PARA_SEL} {
 ${PARA_SEL} {
   line-height: ${lineHeight}${imp};
   text-indent: ${ti}em${imp};
-  /* 2026-10-07 接通 textAlign：此前恒为 justify（死设置）。 */
-  text-align: ${justify ? "justify" : "start"}${imp};
   /* 🔴 2026-10-09 由 em 改 px（见上方「段距为何改 px」注释）。 */
   margin-bottom: ${psPx}px${imp};
   widows: 2${imp};
+  orphans: 2${imp};
 }
-/* 图片/题注段落不该缩进：图居中段、图文混排段加首行缩进会歪（Readest 同款例外清单） */
+/* ⚠️ 2026-11-04 li 单列一条：只给行距。
+   PARA_SEL 的段距/首行缩进是**段落**语义，套到 li 上会给每个列表项
+   加出多余的段间空白和缩进，观感是坏的；但 li 的正文同样需要跟随行距设置
+   （旧选择器漏了 li，列表多的书行距「调不动」）。 */
+html body li {
+  line-height: ${lineHeight}${imp};
+}
+/* ── ③ 对齐默认值：作用在 **body 层**（2026-11-01，Readest 架构）──
+ *
+ * 旧实现把「text-align: justify !important」写在段落选择器上。那等于**替作者做主**：
+ * 诗、题词、版权页这些刻意居中的块会被拉成两端对齐 —— 英文书的观感因此明显不如
+ * Readest（Readest 只在 html/body 上给默认值，元素自身的声明照旧生效）。
+ *
+ * CSS 继承规则正好支持这个改法：
+ *   · 元素**自身声明**的 text-align，永远赢过从 body 继承来的值
+ *     ⇒ 书籍写的「p { text-align: center }」原样保留；
+ *   · 而 body 自身的声明赢过书籍的「body { text-align: ... }」
+ *     （html body 特异性 (0,0,2) > body (0,0,1)）⇒ 全局默认值仍由我们说了算。
+ *
+ * 剩下的两处例外交给 keepTextAlignment 快照类（见下方 ④）：
+ *   · 书籍写死 text-align: left 的块 —— 两端对齐开启时按正文统一两端对齐；
+ *   · 书籍写死 text-align: justify 的块 —— 用户关掉两端对齐时回到顶格。 */
+html body {
+  text-align: ${justify ? "justify" : "start"}${imp};
+}
+/* ── ④ keepTextAlignment 快照类（Readest 同款）──
+ * 类名由 reader-align.ts 的 keepTextAlignment(doc) 在文档加载时打上：
+ * 它读取每个块级元素**当时**的计算对齐值并打标，因此拿到的是**作者声明**的意图
+ * （我们的 body 级默认值只是继承值，不会盖掉元素自身的声明）。
+ * 选择器带类名 → 特异性 (0,1,3) 高于上面的段落选择器 (0,0,3)，稳定赢过段落级规则。 */
+html body p.reword-align-center,
+html body blockquote.reword-align-center,
+html body dd.reword-align-center,
+html body div.reword-align-center {
+  text-align: center${imp};
+}
+html body p.reword-align-right,
+html body blockquote.reword-align-right,
+html body dd.reword-align-right,
+html body div.reword-align-right {
+  text-align: right${imp};
+}
+${justify
+      ? `html body p.reword-align-left,
+html body blockquote.reword-align-left,
+html body dd.reword-align-left,
+html body div.reword-align-left {
+  text-align: justify${imp};
+}`
+      : `html body p.reword-align-justify,
+html body blockquote.reword-align-justify,
+html body dd.reword-align-justify,
+html body div.reword-align-justify {
+  text-align: initial${imp};
+}`}
+/* ── ⑤ text-wrap-style 复位（2026-11-01，Readest #5582 同款）──
+ * 书籍（尤其 Standard Ebooks 的 core.css）会写 text-wrap: pretty。
+ * 在两端对齐下，Chromium/Safari 的 pretty 算法会把词间距拉得忽大忽小，
+ * 且会盖掉用户的「词间距」设置。只复位 style 长属性（保留 nowrap 模式），
+ * 且只作用于正文块级元素 —— 标题的 balance/pretty 排版不受影响。 */
+${justify
+      ? `html body p,
+html body li,
+html body blockquote,
+html body dd {
+  text-wrap-style: auto !important;
+}`
+      : ""}
+/* 图片/题注段落不该缩进：图居中段、图文混排段加首行缩进会歪（Readest 同款例外清单）
+   居中的块同理：带首行缩进的「居中」看着像没居中（Readest 同样把居中块缩进清零） */
 html body p:has(> img:only-child),
 html body p:has(> span:only-child > img:only-child),
+html body p.reword-align-center,
+html body blockquote.reword-align-center,
+html body dd.reword-align-center,
+html body div.reword-align-center,
 html body figure,
 html body figcaption {
   text-indent: 0 !important;

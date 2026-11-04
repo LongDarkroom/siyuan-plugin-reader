@@ -621,7 +621,7 @@
                 {#if detail.meta?.language}<div class="opds-meta-row">{t("语言：")}{detail.meta.language}</div>{/if}
                 {#if detail.meta?.issued}<div class="opds-meta-row">{t("年份：")}{detail.meta.issued}</div>{/if}
                 {#if detail.meta?.summary || detail.entry.summary}
-                  <div class="opds-detail-sum">{truncate(detail.meta?.summary || detail.entry.summary, 260)}</div>
+                  <div class="opds-detail-sum">{truncate(detail.meta?.summary || detail.entry.summary || "", 260)}</div>
                 {/if}
               </div>
             </div>
@@ -632,7 +632,7 @@
                   <button
                     class="opds-fmt-chip"
                     class:active={i === detail.selIdx}
-                    on:click={() => (detail = { ...detail, selIdx: i })}
+                    on:click={() => { if (!detail) return; detail = { ...detail, selIdx: i }; }}
                   >{d.label}</button>
                 {/each}
               </div>
@@ -645,7 +645,7 @@
                     : t("下载所选格式")}
                 </button>
                 {#if isOwned(detail.entry)}
-                  <button class="opds-btn" on:click={() => openOwnedBook(detail.entry.title)}>
+                  <button class="opds-btn" on:click={() => { if (!detail) return; openOwnedBook(detail.entry.title); }}>
                     {t("打开书架中的书")}
                   </button>
                 {/if}

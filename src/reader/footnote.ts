@@ -316,6 +316,52 @@ function sanitizeFootnoteElement(root: Element): void {
   walker(root)
 }
 
+/** 2026-10-27：裸 URL 自动链接化。
+ * 《打造第二大脑》等书的脚注是纯文本（URL 没包 <a>），气泡里点不了——
+ * 在 DOM 层把文本节点里的 http(s) URL 包成 <a href>（跳过已在链接内的文本，
+ * 只动文本节点，不会碰属性/已有标签）。链接的点击行为由 ReaderView 的
+ * 气泡点击接管统一处理（外链→浏览器，内链→goTo）。 */
+const BARE_URL_RE = /https?:\/\/[^\s<>"]+/gi
+/** 预筛用（不带 /g，规避 lastIndex 状态） */
+const BARE_URL_HAS = /https?:\/\//
+
+function linkifyBareUrls(root: Element): void {
+  if (!root.ownerDocument) return
+  const doc = root.ownerDocument
+  // 先收集待处理的文本节点（改树前遍历，避免 live NodeList 踩坑）
+  const pending: Text[] = []
+  const walker = doc.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node: Text) {
+      // 已在链接内的文本不动（链接文本里的 URL 保持原样）
+      if (node.parentElement?.closest('a')) return NodeFilter.FILTER_REJECT
+      return BARE_URL_HAS.test(node.data) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT
+    },
+  })
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) pending.push(n as Text)
+  for (const node of pending) {
+    const text = node.data
+    const frag = doc.createDocumentFragment()
+    const re = new RegExp(BARE_URL_RE.source, 'gi') // 每节点新建，避开 /g 正则 lastIndex 状态
+    let m: RegExpExecArray | null
+    let last = 0
+    while ((m = re.exec(text))) {
+      // 去尾部排版标点（中文句号/引号/括号等），URL 本体不该带这些
+      const url = m[0].replace(/[.,;:!?)\]}》」』。，；：！？…]+$/, '')
+      const start = m.index
+      if (start > last) frag.appendChild(doc.createTextNode(text.slice(last, start)))
+      const a = doc.createElement('a')
+      a.setAttribute('href', url)
+      a.textContent = url
+      frag.appendChild(a)
+      last = start + url.length
+      re.lastIndex = last // url 截短后显式推进，保证循环进度
+    }
+    if (last === 0) continue // 没匹配到（理论上到不了：acceptNode 已预筛）
+    if (last < text.length) frag.appendChild(doc.createTextNode(text.slice(last)))
+    node.parentNode?.replaceChild(frag, node)
+  }
+}
+
 function prepareFootnoteHtml(el: Element): string {
   const container = pickFootnoteContainer(el)
   if (!container) return ''
@@ -383,6 +429,8 @@ export async function extractFootnote(book: any, href: string): Promise<Footnote
     const tmp = doc.createElement('div')
     tmp.innerHTML = html
     await resolveImages(tmp, book, target.index)
+    // 2026-10-27：裸 URL 链接化（外链在气泡里可直接点开）
+    try { linkifyBareUrls(tmp) } catch (__swallowErr) { logSwallow(__swallowErr, "footnote.ts · linkifyBareUrls", "debug") }
     // 🔴 target 一并进缓存：否则「已缓存」的那次拿不到导航目标，跳转按钮会灰掉
     const result: FootnoteResult = { html: tmp.innerHTML, type, target, resolvedHref: href }
     footnoteCache.set(cacheKey, result)

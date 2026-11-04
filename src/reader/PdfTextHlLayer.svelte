@@ -309,12 +309,31 @@
 
   /** 已挂监听的 iframe 文档集合（WeakSet：文档销毁自动随 iframe 回收） */
   const ctxDocSeen = new WeakSet<Document>();
+  /** 具名 handler 引用表（2026-11-03 泄漏清理）：组件销毁时成对解绑，
+   *  否则 doc 被 foliate 复用时 contextmenu / click 监听会叠加。 */
+  const ctxDocHandlers = new Map<Document, { contextmenu: (e: MouseEvent) => void; click: (e: MouseEvent) => void }>();
   function ensureIframeContextmenu(doc: Document) {
     if (!doc || ctxDocSeen.has(doc)) return;
     ctxDocSeen.add(doc);
-    doc.addEventListener("contextmenu", (e) => onIframeContextmenu(doc, e));
+    const onCtx = (e: MouseEvent) => onIframeContextmenu(doc, e);
+    const onClick = (e: MouseEvent) => onIframeClick(doc, e);
+    ctxDocHandlers.set(doc, { contextmenu: onCtx, click: onClick });
+    doc.addEventListener("contextmenu", onCtx);
     // 2026-09-09：点击命中文本标注（编辑态入口，PDF 补齐 EPUB 原生 overlayer 的能力）
-    doc.addEventListener("click", (e) => onIframeClick(doc, e));
+    doc.addEventListener("click", onClick);
+  }
+
+  /** 解除所有 iframe 文档上的监听（组件销毁时调用） */
+  function detachIframeDocListeners() {
+    for (const [doc, h] of ctxDocHandlers) {
+      try {
+        doc.removeEventListener("contextmenu", h.contextmenu);
+        doc.removeEventListener("click", h.click);
+      } catch (__swallowErr) {
+        // doc 可能已被 foliate 销毁，解绑失败可忽略
+      }
+    }
+    ctxDocHandlers.clear();
   }
 
   function copyMenuLink() {
@@ -382,6 +401,8 @@
     if (ro) ro.disconnect();
     for (const t of settleTimers) clearTimeout(t);
     settleTimers = [];
+    // 2026-11-03 泄漏清理：解绑 iframe 文档上的 contextmenu / click
+    detachIframeDocListeners();
     window.removeEventListener("resize", scheduleRecompute);
     window.removeEventListener("scroll", scheduleRecompute, true);
     document.removeEventListener("mousedown", onDocMouseDown, true);

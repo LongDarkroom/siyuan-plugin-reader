@@ -21,6 +21,8 @@ import { Plugin, openTab, showMessage, Dialog } from "siyuan";
 import { t, initI18n, saveLang } from "./i18n/index.ts";
 import { ReaderDockController } from "./reader/reader-dock.ts";
 import { getAnnotationStore, initAnnotationStore, flushAnnotationStore } from "./annotation/store-singleton.ts";
+// 2026-11-04 AI 桥（方案 B）：内核 MCP 工具 → 前端活动 ReaderView。
+import { initReaderBridge, disposeReaderBridge } from "./ai/reader-bridge.ts";
 import { installConsoleFilter } from "./core/console-filter.ts";
 import { logSwallow } from "./core/safe.ts";
 import { getLogger } from "./core/logger.ts";
@@ -186,6 +188,13 @@ export class ReaderPlugin extends Plugin {
       await this.readerDock.init();
     } catch (e) {
       getLogger().error("[RE 阅读器] 阅读器初始化失败（阅读面板将不可用）", { error: e });
+    }
+    /* AI 桥（2026-11-04）：绑定内核广播，把 Copilot 的 MCP 工具调用转发到
+     * 当前活动 ReaderView。kernel.js 缺席时只打一条 warn，不影响阅读。*/
+    try {
+      if (this.readerDock?.tabController) initReaderBridge(this, this.readerDock.tabController);
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] AI 桥初始化失败", { error: e });
     }
     /* 翻译宿主（引擎链 + AI 末端 + 按书缓存）。
      * 2026-10-07 接通：此前 src/translate/ 下引擎链与全部 provider 都已迁移，
@@ -705,6 +714,12 @@ export class ReaderPlugin extends Plugin {
   }
 
   onunload(): void {
+    // 2026-11-04：先摘 AI 桥，避免卸载过程中内核广播打到已销毁的组件
+    try {
+      disposeReaderBridge();
+    } catch {
+      /* 桥未绑定时忽略 */
+    }
     try {
       this.readerDock?.dispose();
     } catch (e) {

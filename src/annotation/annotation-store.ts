@@ -122,12 +122,15 @@ export interface AnnotationItem {
   /** 分类标签 id 数组 */
   labels?: string[];
   category?: AnnotationCategory;
+  /** 分组（书架分组名；2026-11-03 补 —— 代码一直在读 stored.group，但类型里没声明，
+   *  TS 只能报「Property group does not exist」）。 */
+  group?: string;
   /** 创建时间（ISO 字符串） */
   createdAt: string;
   /** 更新时间（ISO 字符串） */
   updatedAt: string;
   /** 仅 origin==="ai" 或曾用 AI 时存在 */
-  ai?: unknown;
+  ai?: Record<string, unknown>;
   /** 软删时间戳（ISO）；未删为 undefined。读取路径一律过滤 */
   deletedAt?: string;
   /** 媒体类型双保险（pdf/epub/other），渲染「我的标记」时按当前书籍过滤 */
@@ -158,6 +161,23 @@ export interface AnnotationInput {
   color?: string;
   style?: AnnotationStyle;
   rects?: PdfRect[];
+  // ↓↓ 2026-11-03：以下字段在 upsert 中实际被读写，但此前未在本接口声明，
+  //    只靠末尾的索引签名 `[k: string]: unknown` 兜住 ⇒ TS 把它们全部退化成
+  //    unknown / {}，导致 upsert 三处共 32 个类型错误。显式声明后类型恢复，
+  //    运行时行为不变（索引签名保留，额外字段仍可透传）。
+  origin?: AnnotationOrigin;
+  scope?: AnnotationScope;
+  lineColor?: string;
+  tags?: string[];
+  labels?: string[];
+  category?: AnnotationCategory;
+  group?: string;
+  ai?: Record<string, unknown>;
+  bookType?: BookType;
+  page?: number;
+  pdfRects?: PdfRect[];
+  kind?: "rect";
+  snapshotPath?: string;
   [k: string]: unknown;
 }
 
@@ -337,7 +357,15 @@ export class AnnotationStore {
   private items = new Map<string, AnnotationItem>();
   private byKey = new Map<string, string>(); // annotationKey -> id
   private byBlock = new Map<string, Set<string>>(); // blockId -> ids
-  private subs = new Set<(v: AnnotationItem[]) => void>();
+  /**
+   * 订阅者集合。
+   * 2026-11-03：原声明为 `Set<(v: AnnotationItem[]) => void>`，但
+   *   · `subscribe(listener: () => void)` 收的是无参 listener；
+   *   · `emit()` 传数组、`notify()` 不传，两处调用方式不一致；
+   *   · 实际所有订阅方（ReaderView / PdfTextHlLayer）都是无参 lambda。
+   * 改为可选参数后，emit/notify 两种调用都合法，且**运行时行为完全不变**。
+   */
+  private subs = new Set<(v?: AnnotationItem[]) => void>();
   private persist!: PersistentStore;
 
   /** 初始化持久化层（由 index.ts 在 onload 中调用） */

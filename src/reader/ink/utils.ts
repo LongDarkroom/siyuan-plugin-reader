@@ -91,7 +91,24 @@ export function getCoalescedPoints(e: PointerEvent): InkPoint[] {
 }
 
 /** 笔刷 → SVG 属性映射 */
-export function brushToSvgProps(brush: string, color: string, baseWidth: number, opacity: number, pressure: number) {
+
+/**
+ * brushToSvgProps 的返回值类型。
+ *
+ * 2026-11-03：此前无显式返回类型 ⇒ TS 把 "stroke-linecap": "round" 这类
+ * 字面量拓宽成 string ⇒ Svelte 的 SVG 属性类型（"round" | "butt" | ...）不接受。
+ * 这里把字面量联合显式写出来，渲染结果不变。
+ */
+export interface BrushSvgProps {
+  stroke: string;
+  "stroke-width": number;
+  "stroke-linecap": "round" | "butt";
+  "stroke-linejoin": "round" | "miter";
+  opacity?: number;
+  style?: string;
+}
+
+export function brushToSvgProps(brush: string, color: string, baseWidth: number, opacity: number, pressure: number): BrushSvgProps {
   const width = baseWidth * pressureToWidthScale(pressure);
   switch (brush) {
     case "ballpoint":

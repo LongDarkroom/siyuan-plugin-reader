@@ -54,6 +54,12 @@ export interface LogOpts {
   error?: unknown;
   durationMs?: number;
   data?: unknown;
+  /**
+   * 2026-11-03：允许附加任意诊断字段（如 { fontSize } / { detail }）。
+   * 此前这些调用点各自写 `as any` 压类型错误 ⇒ 类型上等于不设防；
+   * 改为显式索引签名后，日志负载字段不再需要逃逸类型。
+   */
+  [k: string]: unknown;
 }
 
 export interface LogFilter {

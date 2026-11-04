@@ -27,6 +27,9 @@ INCLUDE_FILES = [
     "plugin.json",
     "index.js",
     "index.css",
+    # [2026-11-04] AI 桥内核侧：Copilot 的 MCP 工具注册在这里。
+    # plugin.json 已声明 kernels: ["all"]，漏掉本文件 → Copilot 看不到 reader 工具。
+    "kernel.js",
     "icon.png",
     "preview.png",
     "preview.webp",   # plugin.json 的 preview 字段指向此文件（全分辨率 WebP，208KB）
@@ -47,6 +50,10 @@ INCLUDE_FILES = [
 # 直接平铺到 zip 根的【白名单目录】
 INCLUDE_DIRS = [
     "i18n",
+    # [2026-11-04] Copilot 插件技能：skills/<工具名>/SKILL.md。
+    # Copilot 按 plugin__<插件目录>__reader 查 /data/plugins/<目录>/skills/reader/SKILL.md，
+    # 缺失时工具仍可用，但 AI 不知道调用口径（逐字 quote / 先 dryRun）。
+    "skills",
     # [2026-09-04 修复] PDF CJK 渲染：pdf.js 的 CMap 与标准字体资源。
     # 运行时按 `${origin}/plugins/siyuan-plugin-reader/cmaps/` 与
     # `/standard_fonts/` 加载（见 src/reader/vendor/foliate-js/pdf.js:516-522），

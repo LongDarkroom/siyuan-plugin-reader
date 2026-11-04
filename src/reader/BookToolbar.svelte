@@ -20,7 +20,6 @@
   export let completionTokens: number | null = null;
   export let totalTokens: number | null = null;
   export let onToggleBilingual: () => void = () => {};
-  export let onOpenBilingualSettings: (() => void) | null = null;
 </script>
 
 <button
@@ -32,19 +31,3 @@
     : t("双语对照：在每段正文后注入译文（AI 翻译）")}
   on:click={onToggleBilingual}
 >{t("双语")}{bilingualActive ? ` ${bilingualDone}/${bilingualTotal}` : ""}{totalTokens != null && !bilingualActive ? ` · ${totalTokens}T` : ""}</button>
-
-{#if onOpenBilingualSettings}
-  <button
-    class="reader-btn reader-bilingual-settings-btn"
-    title={t("双语翻译设置")}
-    aria-label={t("双语翻译设置")}
-    on:click={() => onOpenBilingualSettings?.()}
-  >
-    <!-- 2026-09-05：🌐 emoji → SVG 线性图标（与顶栏其他按钮风格一致，随主题色） -->
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-      <circle cx="12" cy="12" r="9"/>
-      <path d="M3 12h18"/>
-      <path d="M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3z"/>
-    </svg>
-  </button>
-{/if}

@@ -289,6 +289,35 @@ export class ReaderTabController {
     });
   }
 
+  /**
+   * AI 桥（2026-11-04）：返回当前应响应的阅读器实例。
+   *
+   * 判定顺序：
+   *  1) 位于「激活布局窗口」且可见的页签（多窗口并排时用户正在看的那本）；
+   *  2) 任意可见页签（同窗口多开，退化为第一本）；
+   *  3) 移动端浮层（tab=null，同样镜像在 openTabs 里）/ 最后打开的一本。
+   * 桥只读当前书，避免 AI 操作到后台页签里的另一本书。
+   */
+  getActiveReader(): { bookId: string; comp: any; tab: any } | null {
+    const records = Array.from(this.openTabs.entries());
+    if (!records.length) return null;
+    const visible = (rec: TabRecord) => {
+      const el = rec.tab?.element as HTMLElement | undefined;
+      return !!(el && el.isConnected && el.offsetParent !== null);
+    };
+    for (const [bookId, rec] of records) {
+      const el = rec.tab?.element as HTMLElement | undefined;
+      if (el && el.isConnected && el.offsetParent !== null && el.closest(".layout__wnd--active")) {
+        return { bookId, comp: rec.comp, tab: rec.tab };
+      }
+    }
+    for (const [bookId, rec] of records) {
+      if (visible(rec)) return { bookId, comp: rec.comp, tab: rec.tab };
+    }
+    const last = records[records.length - 1];
+    return { bookId: last[0], comp: last[1].comp, tab: last[1].tab };
+  }
+
   /** 打开一本书的阅读 Tab；已打开则聚焦（不重复开），未打开则新建并激活 */
   async openBookTab(bookId: string, title?: string): Promise<void> {
     // 2026-10-26 路线 A：思源移动端 openTab 无实现 → ReaderView 改由**全屏浮层**承载

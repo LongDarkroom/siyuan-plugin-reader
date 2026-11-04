@@ -22,17 +22,18 @@ import { getLogger } from "../core/logger.ts";
   import { viewport, isPhoneBreakpoint, type ViewportBreakpoint } from "../core/viewport-store.ts";
   // [REword 2026-09-02] 界面分流：按书籍格式自动切换「图书界面 / PDF 界面」。
   // 此前 PDF 与 EPUB 共用同一套模板、靠散落的 isPdfBook() 拼装控件，两类格式互相干扰。
-  // 现在 PDF 专属控件收进 PdfToolbar / PdfSettings / PdfOverlay，图书专属控件收进 BookToolbar，
+  // 现在 PDF 专属控件收进 PdfToolbar / PdfOverlay，图书专属控件收进 BookToolbar，
   // 本文件只负责按 readerMode 决定挂载哪一套。
+  // PdfSettings.svelte 与 BindDropzone.svelte 已实现但尚未接入本视图，故此处不再 import
+  // （保留文件本体，待接线时直接挂载即可）。
   import { resolveReaderMode, isPdfFormat, type ReaderMode, bookTypeFromFormat, matchBookType, type BookType } from "./reader-mode.ts";
   import BookToolbar from "./BookToolbar.svelte";
+  // 2026-11-04 图片右键菜单（复制/保存），正文与灯箱共用
+  import ImageContextMenu from "./ImageContextMenu.svelte";
   import PdfToolbar from "./PdfToolbar.svelte";
-  import PdfSettings from "./PdfSettings.svelte";
   import PdfOverlay from "./PdfOverlay.svelte";
   // 2026-09-04 P1：PDF 文本标注自建覆盖层（高亮/下划线/波浪线单一视觉真源）
   import PdfTextHlLayer from "./PdfTextHlLayer.svelte";
-  // [REword 2026-09-01] 笔记导出绑定拖拽框（阅读摘录 / 书图谱目标文档绑定）
-  import BindDropzone from "./BindDropzone.svelte";
   import {
     inkState,
     // inkStrokes：擦除时直接 update 笔触列表（onInkPointerDown L1686）
@@ -85,6 +86,18 @@ import { getLogger } from "../core/logger.ts";
   // v1.3.0：本书前提上下文编辑器（思源原生 lite Protyle）+ token 估算
   import { AnnEditor } from "../annotation/ann-editor.ts";
   import { estimateTokens, PRIMER_WARN_CHARS } from "./book-primer.ts";
+  // 2026-11-04 AI 桥（Copilot → 内核 MCP → 前端）：协议常量与入参校验在纯逻辑层单测
+  import {
+    MAX_ANNOTATE_ITEMS,
+    MAX_LOCATE_CANDIDATES,
+    MAX_QUOTE_CHARS,
+    clampMaxChars,
+    findQuoteMatches,
+    isAiTextFormat,
+    normalizeQuote,
+    normalizeSectionIndex,
+    validateAnnotationItem,
+  } from "../ai/reader-bridge-protocol.ts";
   import type { BookshelfStore, BookMeta, BookMark } from "../reader/bookshelf-store";
   // [REword patch 2026-08-29] PDF 缩放：复用 ReadingProgress.zoom 字段
   import type { ZoomState } from "../reader/bookshelf-store";
@@ -118,19 +131,14 @@ import { getLogger } from "../core/logger.ts";
     NOTE_TEMPLATE_PRESETS,
     PROGRESS_STYLE_PRESETS,
     LAYOUT_PRESETS,
-    detectLayoutPreset,
     type ReaderSettings,
     type ReaderSettingsLike,
-    type ReaderLayoutPreset,
+    type ReaderLayoutPresetKey,
     type ReaderTheme,
     type ReaderFontMode,
     type NoteInsertPosition,
     type NoteTemplatePreset,
     type ReaderProgressStyle,
-    type ReaderBottomBarMode,
-    type ReaderTypographyPreset,
-    BOTTOM_BAR_MODE_PRESETS,
-    READER_TYPO_PRESETS,
   } from "../reader/reader-settings";
   import {
     FontStore,
@@ -164,7 +172,11 @@ import { getLogger } from "../core/logger.ts";
   import {
     rewriteFontKeywordsInAllContents,
     rewriteFontKeywordsInDocument,
+    // 2026-11-01 字重：书籍 CSS 里的 `font-weight: normal` → var(--reword-font-weight)
+    rewriteFontWeightInDocument,
   } from "../reader/reader-font-classify";
+  // 2026-11-01 对齐快照：保留书籍刻意排版的居中/右对齐块（Readest keepTextAlignment 同款）
+  import { keepTextAlignment } from "../reader/reader-align.ts";
   // 2026-08-27 重设计：双语段落注入（顶栏「双语」开关）
   // 2026-08-31：v1（bilingual.ts）已删除，统一走 v2 兄弟节点渲染
   import { type BilingualHandle } from "./bilingual-types";
@@ -200,6 +212,8 @@ import { getLogger } from "../core/logger.ts";
   import { getAnnotationStore } from "../annotation/store-singleton";
   // 2026-09-04 P1：PDF 自建覆盖层归一化矩形类型
   import type { PdfRect, AnnotationStore } from "../annotation/annotation-store.ts";
+  // 2026-10-27 开书日志版本戳（PLUGIN_VERSION 来自构建期 __REWORD_VERSION__ 注入）
+  import { PLUGIN_VERSION } from "../core/changelog.ts";
   // 2026-09-09 P1.3：矩形框选纯函数（页命中/归一化/markdown 构造），单测直连
   import { collectPageHits, normalizeSelToRect, buildRectMarkdown, dedupeNestedRects, RECT_MIN_PX, type SelRect, type RectMdEntry } from "./pdf-rect-util.ts";
   // 2026-10-06 设置改造：Readest 式弹窗（schema 驱动）
@@ -221,6 +235,7 @@ import { getLogger } from "../core/logger.ts";
     annotationCfis,
     type AnnotationStyle,
     type AnnotationType,
+    type AnnotationOrigin,
   } from "../annotation/annotation-store.ts";
   import {
     getDefaultAnnotationColor,
@@ -299,10 +314,23 @@ import { getLogger } from "../core/logger.ts";
   // 2026-10-06 竖排标点：把 HTML 变换挂到 foliate 的书内资源钩子（CSS 那支是 @font-face 中和）。
   // 竖排字形是 BMP 单码位、替换前后文本长度不变 ⇒ 不破坏 CFI 定位与已有标注（详见 vertical-punctuation.ts）。
   // 只做正向替换（多对多映射无法反推原字符）；关闭竖排时不挂本分支即天然保持原样。
+  /**
+   * 需要施加竖排标点变换的 HTML 类资源 MIME（2026-11-03 补）。
+   *
+   * 此前这里写的是 `HTML_TYPES.has(t)`，而 HTML_TYPES **全项目没有任何定义或导入**
+   * ⇒ 只要「竖排标点」开着（punctOn 为真才会求值），开书加载书内资源时直接抛
+   * ReferenceError。因 `&&` 短路，关闭竖排时碰不到，故一直没被发现。
+   * 取值与 vendor/foliate-js/epub.js 的 MIME.XHTML / MIME.HTML 一致。
+   */
+  const HTML_TYPES = new Set(["application/xhtml+xml", "text/html"]);
+
   function attachBookTransform(bt: any, punctOn: boolean, punctHant: boolean) {
     if (!bt || bt === lastTransformTarget) return;
+    // 换书时 bt 会换成新对象，旧 bt 上的 "data" 监听必须先解绑，
+    // 否则旧 target 被 foliate 缓存复用时会重复跑竖排标点/CSS 中和。
+    detachBookTransform();
     lastTransformTarget = bt;
-    bt.addEventListener("data", (ev: any) => {
+    lastTransformHandler = (ev: any) => {
       const t = ev?.detail?.type;
       if (punctOn && HTML_TYPES.has(t)) {
         ev.detail.data = Promise.resolve(ev.detail.data).then((h: string) =>
@@ -312,7 +340,19 @@ import { getLogger } from "../core/logger.ts";
       if (t !== "text/css") return;
       ev.detail.data = Promise.resolve(ev.detail.data).then((css: string) =>
         neutralizeBadFontFaces(css));
-    });
+    };
+    bt.addEventListener("data", lastTransformHandler);
+  }
+
+  /** 解绑上一个书内资源钩子上的 "data" 监听（换书 / 组件销毁时调用） */
+  function detachBookTransform() {
+    if (lastTransformTarget && lastTransformHandler) {
+      try {
+        lastTransformTarget.removeEventListener("data", lastTransformHandler);
+      } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · detachBookTransform", "debug"); }
+    }
+    lastTransformTarget = null;
+    lastTransformHandler = null;
   }
 
   /**
@@ -470,6 +510,7 @@ import { getLogger } from "../core/logger.ts";
   let view: any = null;
   // 2026-09-02：记录已挂接过 @font-face 中和监听的 transformTarget，避免重复注册
   let lastTransformTarget: any = null;
+  let lastTransformHandler: ((ev: any) => void) | null = null;
   // 2026-10-06 竖排标点替换：钩子闭包里直接读这两项，故用响应式派生保持实时性。
   // 开关口径：竖排开启 且 用户允许替换标点（verticalPunctuation 默认 true）。
   $: verticalPunctActive = settings.verticalWriting === true && settings.verticalPunctuation !== false;
@@ -750,6 +791,141 @@ import { getLogger } from "../core/logger.ts";
     if (sel && !sel.isCollapsed) return;
     if (img.offsetWidth < IMGV_MIN_PX || img.offsetHeight < IMGV_MIN_PX) return;
     openImageViewer(img.src);
+  }
+
+  /* ================= 图片右键菜单（2026-11-04，对标 Readest） =================
+   * 桌面右键正文图 → 自绘「复制图片 / 保存图片」。不用浏览器原生菜单的原因：
+   * 原生只给「复制图片地址」，而书里的图片是 foliate 造的 blob URL，复制出去毫无用处
+   * （Readest #6558 同因）。
+   * · 复制：Chromium 异步剪贴板只稳定接受 image/png ⇒ 非 PNG 经 canvas 转码，
+   *   并把 Blob 的 Promise 直接交给 ClipboardItem（写入在点击手势内发起）。
+   * · 保存：保留原始字节与扩展名，用 <a download> 交给浏览器的下载通道。
+   */
+  let imgCtx: { open: boolean; x: number; y: number; src: string } = { open: false, x: 0, y: 0, src: "" };
+
+  function openImageContextMenu(src: string, x: number, y: number): void {
+    if (!src) return;
+    imgCtx = { open: true, x, y, src };
+  }
+
+  function closeImageContextMenu(): void {
+    if (!imgCtx.open) return;
+    imgCtx = { open: false, x: 0, y: 0, src: "" };
+  }
+
+  /** 右键落点所属的图片地址；支持 <img> 与 SVG 里的 <image>（同 Readest）。 */
+  function imageSrcFromTarget(target: Element): string {
+    const img = target.closest("img") as HTMLImageElement | null;
+    if (img?.src) return img.src;
+    const svgImg = target.closest("image");
+    if (svgImg) {
+      const href =
+        svgImg.getAttribute("href") ||
+        svgImg.getAttributeNS("http://www.w3.org/1999/xlink", "href");
+      if (href) {
+        try { return new URL(href, svgImg.baseURI).href; } catch { return href; }
+      }
+    }
+    return "";
+  }
+
+  function onContentImageContextMenu(e: Event): void {
+    // 移动端长按归系统的统一压制逻辑（core/native-menu.ts），不做自绘菜单
+    if (isMobile()) return;
+    const ev = e as MouseEvent;
+    const target = ev.target as Element | null;
+    if (!target || typeof target.closest !== "function") return;
+    const src = imageSrcFromTarget(target);
+    if (!src) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    // iframe 局部坐标 → 宿主窗口 client 坐标（菜单是 position:fixed 在宿主里）
+    const fr = (target.ownerDocument?.defaultView as any)?.frameElement?.getBoundingClientRect?.();
+    openImageContextMenu(src, ev.clientX + (fr?.left ?? 0), ev.clientY + (fr?.top ?? 0));
+  }
+
+  async function fetchContextImageBlob(src: string): Promise<Blob> {
+    const res = await fetch(src);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.blob();
+  }
+
+  /** 非 PNG → canvas 转 PNG：Chromium 异步剪贴板的 image/png 是唯一稳妥类型。 */
+  function contextImageToPng(blob: Blob): Promise<Blob> {
+    if (blob.type === "image/png") return Promise.resolve(blob);
+    return new Promise<Blob>((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        try {
+          const canvas = document.createElement("canvas");
+          canvas.width = img.naturalWidth || img.width;
+          canvas.height = img.naturalHeight || img.height;
+          const ctx = canvas.getContext("2d");
+          if (!ctx || !canvas.width || !canvas.height) throw new Error("canvas unavailable");
+          ctx.drawImage(img, 0, 0);
+          canvas.toBlob((png) => {
+            URL.revokeObjectURL(url);
+            if (png) resolve(png);
+            else reject(new Error("PNG encode failed"));
+          }, "image/png");
+        } catch (err) {
+          URL.revokeObjectURL(url);
+          reject(err);
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        reject(new Error("image decode failed"));
+      };
+      img.src = url;
+    });
+  }
+
+  async function copyContextImage(): Promise<void> {
+    const src = imgCtx.src;
+    if (!src) return;
+    try {
+      if (typeof ClipboardItem === "undefined" || !navigator.clipboard?.write) {
+        throw new Error("clipboard unsupported");
+      }
+      const png = fetchContextImageBlob(src).then(contextImageToPng);
+      await navigator.clipboard.write([new ClipboardItem({ "image/png": png })]);
+      toast(t("图片已复制"));
+    } catch {
+      toast(t("复制图片失败"), 2600, "error");
+    }
+  }
+
+  /** 扩展名优先取 MIME；无类型（CBZ 页面等）再从原地址猜；都没有按 png。 */
+  function contextImageFileName(blob: Blob, src: string): string {
+    const mimeSub = /^image\/([a-z0-9.+-]+)$/i.exec(blob.type || "")?.[1]?.toLowerCase() ?? "";
+    const extFromMime =
+      mimeSub === "jpeg" ? "jpg" : mimeSub === "svg+xml" ? "svg" : mimeSub;
+    if (extFromMime) return `image.${extFromMime}`;
+    const extFromSrc = /\.([a-z0-9]{2,5})(?:[?#]|$)/i.exec(src)?.[1]?.toLowerCase() ?? "";
+    return `image.${extFromSrc || "png"}`;
+  }
+
+  async function saveContextImage(): Promise<void> {
+    const src = imgCtx.src;
+    if (!src) return;
+    try {
+      const blob = await fetchContextImageBlob(src);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = contextImageFileName(blob, src);
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // 下载是异步接管的，立即 revoke 会让部分浏览器拿到空文件
+      setTimeout(() => URL.revokeObjectURL(url), 10_000);
+      toast(t("图片已保存"));
+    } catch {
+      toast(t("保存图片失败"), 2600, "error");
+    }
   }
   // 2026-10-14 双语重设计：设置弹窗打开时聚焦的目标 Tab（null=沿用上次/默认）。
   // 顶栏「双语设置」入口用它直达新的「双语翻译」Tab，取代已下线的独立双语设置弹窗。
@@ -1229,16 +1405,6 @@ import { getLogger } from "../core/logger.ts";
   }
 
   /**
-   * 点击把手（中央圆点）：切换进度条浮起 / 收回。
-   * 2026-10-07：由 `toggleBottomBarPin` 改名 —— 它现在的语义就是「切换」，
-   * 不再是「点右下角唤出按钮那种固定」。
-   */
-  function toggleBottomBarPin() {
-    bottomBarPinned = !bottomBarPinned;
-    updateBottomBarReveal();
-  }
-
-  /**
    * 点击栏内「⌄」：立即完全收起（含 pinned）。
    * 与把手「切换」的区别：这是无条件收起，不做「若已收起则展开」的分支。
    */
@@ -1319,7 +1485,7 @@ function applyTopHandleHitHeight() {
       changed = true;
     }
     if (isTopBarFloating() && (topBarRevealed || topBarPinned)) {
-      // 顶栏收起联动收抽屉（与 toggleTopBarPin 收起分支同语义，防孤儿抽屉）
+      // 顶栏收起联动收抽屉（与 toggleChrome 收起分支同语义，防孤儿抽屉）
       closeAllPopovers();
       topBarPinned = false;
       topBarBarHover = false;
@@ -1348,20 +1514,35 @@ function applyTopHandleHitHeight() {
   }
   $: pokeBarAutoHide(topBarRevealed || bottomBarRevealed);
 
-  /** 点击顶部圆点：切换顶栏浮起 / 收回 */
-  function toggleTopBarPin() {
-    const willReveal = !topBarRevealed;
+  /**
+   * 统一开合顶/底两栏（2026-11-04，对标 Readest / 微信读书）。
+   *
+   * 两家都是「一次动作 = 整体阅读界面 chrome」：Readest 上下栏共用同一个
+   * hoveredBookKey，移动端点中心一起开关（usePagination.ts）；微信读书点屏幕
+   * 中间同上栏 + 下栏。此前这里上下各管各的，用户要看全两条栏必须点两次。
+   *
+   * 入口：顶部圆点 / 底部圆点 / 移动端中心点击 —— 三处都走这里。
+   * 收起时联动 closeAllPopovers：抽屉挂在顶栏锚点下，栏缩回后锚点消失（防孤儿抽屉）。
+   */
+  function toggleChrome() {
+    const willReveal = !(topBarRevealed || bottomBarRevealed);
     // 2026-10-13 修复（孤儿抽屉）：收起与展开两个方向都要联动收抽屉。
     //   - 展开：清残留抽屉，避免「锚点栏刚出现、抽屉挂在半空」；
     //   - 收起：抽屉全部挂在顶栏锚点下，顶栏缩回圆点后锚点消失，
     //     若不联动收起，抽屉会悬空成孤儿（真机截图：书签/标注面板悬在左上）。
     // 直接走 closeAllPopovers()（含 showToc/showMarks/showSearch/设置/搜索/词典/
     // 编辑态工具栏等全套），与「点空白收起」同一入口，语义一致；
-    // 它内部 releaseTopBarForPopover 只清 hover 保持态、不动 topBarPinned，
-    // 随后我们再覆写 topBarPinned，顺序安全。
+    // 它内部 releaseTopBarForPopover 只清 hover 保持态、不动 pinned，
+    // 随后我们再覆写 pinned，顺序安全。
     closeAllPopovers();
-    topBarPinned = willReveal;
-    updateTopBarReveal();
+    if (isTopBarFloating()) {
+      topBarPinned = willReveal;
+      topBarBarHover = false;
+      updateTopBarReveal();
+    }
+    bottomBarPinned = willReveal;
+    bottomBarBarHover = false;
+    updateBottomBarReveal();
   }
 
   /**
@@ -1453,7 +1634,7 @@ function applyTopHandleHitHeight() {
   /** 本次会话「有效阅读」累计，从不清零 —— 服务 ETA 的实测速度。
    *  ⚠️ 与旧的 sessionReadMs 语义不同：后者实为「30s 待落盘滚动桶」，
    *  每 30s 被清零 → updateEta 里 minsRead ≤ 0.5 → `minsRead > 1` 恒 false
-   *  → speed 恒回落 400 字/分，「按当前阅读速度估算」那个 tooltip 是假的（代码级必然，非概率）。 */
+   *  → speed 恒回落 400 字/分，ETA 只是估算值（2026-11-04 起不再常驻底栏，只在进度条 title 里）。 */
   let activeMs = 0;
   /** 待落盘累计：满 TIMER_FLUSH_MS 清零并写进 readingLog */
   let flushAcc = 0;
@@ -1500,6 +1681,19 @@ function applyTopHandleHitHeight() {
         applyStyles(); // blob 就绪后立即重刷 iframe 样式
       }
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · prepareHostFontBlobs", "debug"); }
+  }
+
+  /**
+   * 回收宿主字体 blob URL。
+   * URL.createObjectURL 产生的 URL 必须显式 revoke，否则每次开阅读 Tab 都会
+   * 在进程里留下一份字体二进制（关闭阅读 Tab 也不释放），长期使用会持续涨内存。
+   */
+  function revokeHostFontBlobs() {
+    for (const b of hostFontBlobs) {
+      try { URL.revokeObjectURL(b.blobUrl); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · revokeHostFontBlobs", "debug"); }
+    }
+    hostFontBlobs = [];
+    hostFontBlobsReady = false;
   }
   const FONT_ACCEPT = ".ttf,.otf,.woff,.woff2";
 
@@ -1572,6 +1766,32 @@ function applyTopHandleHitHeight() {
     try {
       const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
       return v || fallback;
+    } catch {
+      return fallback;
+    }
+  }
+
+  /**
+   * 把颜色 token 在父文档里解析成具体色值（rgb(...)）。
+   *
+   * 为什么不能只读变量原文：自定义属性的 computed value **原样保留 token**
+   * （Neo 的 `--b3-theme-primary` 是 `oklch(from var(--b3-theme-accent) …)`），
+   * 原样桥接进阅读器 iframe 后缺少 `--b3-theme-accent`，整条颜色声明失效。
+   * 用探针元素让浏览器在父文档完成解析，再把结果带进 iframe。
+   * 2026-11-04：目前只用于链接色（见 captureSiyuanThemeVars 的 resolveColor）。
+   */
+  function resolveSiyuanColor(raw: string, fallback: string): string {
+    const token = (raw ?? "").trim();
+    if (!token) return fallback;
+    try {
+      const probe = document.createElement("span");
+      probe.setAttribute("aria-hidden", "true");
+      probe.style.display = "none";
+      probe.style.color = token;
+      (document.body || document.documentElement).appendChild(probe);
+      const resolved = getComputedStyle(probe).color.trim();
+      probe.remove();
+      return resolved || fallback;
     } catch {
       return fallback;
     }
@@ -1913,7 +2133,7 @@ function applyTopHandleHitHeight() {
     const { fontFaceCss, fontFamilyStack } = buildFontInjection();
     // 2026-08-30 思源化：在父文档抓取思源调色板，经 :root 桥接注入阅读器 iframe，
     // 使 link/code/quote/译文块等样式能跟随思源外观（CSS 变量不跨 iframe 继承，必须显式抓取+注入）。
-    const siyuanVars = captureSiyuanThemeVars(getSiyuanVar);
+    const siyuanVars = captureSiyuanThemeVars(getSiyuanVar, resolveSiyuanColor);
     return buildReaderStyles(
       // 2026-10-07：把「跟随思源边距」的运行时缓存挂上去。
       // buildReaderStyles 第一参数就是 settings（形参名沿用 settings），
@@ -2221,6 +2441,7 @@ function applyTopHandleHitHeight() {
         // 模式切换后回到当前进度（foliate 重排可能复位到开头）
         if (progress > 0) {
           setTimeout(() => {
+            if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再操作已死的 view
             try {
               view.goToFraction(progress);
             } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · applyFlow", "debug"); }
@@ -2654,6 +2875,7 @@ function applyTopHandleHitHeight() {
     dictPopupSource = "hover";
     dictPopup = { visible: true, x, y, html: renderLoading(), word, source: "hover" };
     setTimeout(async () => {
+      if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再写浮层状态
       // 期间来源/单词已切换则丢弃旧结果
       if (dictPopupSource !== "hover" || hoverWord !== word) return;
       let html: string;
@@ -2713,6 +2935,8 @@ function applyTopHandleHitHeight() {
     };
 
     const HOVER_TOLERANCE = 16; // px：悬浮取词容差带，轻微移动不消失（2026-08-30）
+    // 2026-11-03：最近一次 mousemove 的视口坐标（keyup 事件本身不带坐标）
+    let lastHoverPointer = { vx: -1e9, vy: -1e9 };
     const onMove = (e: MouseEvent) => {
       // iframe 内部 clientX/Y 是相对 iframe 视口的坐标，需加 frame 偏移换算成视口坐标，
       // 才能与父窗口弹窗 rect（getBoundingClientRect 返回视口坐标）正确比对 —— 否则
@@ -2721,6 +2945,8 @@ function applyTopHandleHitHeight() {
       const fr0 = frameEl?.getBoundingClientRect();
       const vx = e.clientX + (fr0?.left ?? 0);
       const vy = e.clientY + (fr0?.top ?? 0);
+      // 2026-11-03：记录最近一次指针位置，供 keyup（键盘事件无坐标）判断「光标是否在弹窗上」。
+      lastHoverPointer = { vx, vy };
       if (!e.altKey) {
         // Option 释放：光标没落在弹窗上才宽限收起（落在弹窗上由 mouseenter 取消）
         if (dictPopupSource === "hover" && !isOverDictPopup(vx, vy)) {
@@ -2792,8 +3018,11 @@ function applyTopHandleHitHeight() {
         // 否则光标正好落在弹窗上时也被误判「未悬停」而提前收起。
         const frameEl = (doc.defaultView as any)?.frameElement as HTMLElement | null;
         const fr0 = frameEl?.getBoundingClientRect();
-        const vx = e.clientX + (fr0?.left ?? 0);
-        const vy = e.clientY + (fr0?.top ?? 0);
+        // 2026-11-03：keyup 是键盘事件，**没有 clientX/clientY** ⇒ 原写法取到 undefined，
+        // vx/vy 恒为 NaN ⇒ 「光标在弹窗上就不收起」这条永远不成立。
+        // 改用最近一次 mousemove 记录的视口坐标。
+        const vx = lastHoverPointer.vx;
+        const vy = lastHoverPointer.vy;
         if (!isOverDictPopup(vx, vy)) scheduleHoverHide();
       }
     }) as EventListener);
@@ -2992,7 +3221,7 @@ function applyTopHandleHitHeight() {
             });
             if (detection.verdict === "other") {
               settingsStore.update({ bilingual: false });
-              toast(t("本书未识别为英文书籍，已自动关闭双语对照"), 2800, "info" as any);
+              toast(t("本书未识别为英文书籍，已自动关闭双语对照"), 2800, "info");
               getLogger().info(
                 `[REword][双语] 恢复复核拦截非英文书：bookId=${bookId} source=${detection.source} conf=${detection.confidence}`,
               );
@@ -3018,6 +3247,10 @@ function applyTopHandleHitHeight() {
         attachBookTransform((view.book as any)?.transformTarget, verticalPunctActive, verticalPunctHant);
       } catch (__e) { logSwallow(__e, "openBook fontFaceNeutralize", "debug"); }
       console.log("[REword] openBook view.open 完成");
+      // 2026-10-27：开书日志带构建版本戳 —— 用户报障时第一眼就能判定
+      // 「跑的是不是新构建」（SiYuan 常驻进程可能仍持旧 index.js）。
+      // 走 changelog.PLUGIN_VERSION（内部裸标识符 __REWORD_VERSION__，vite define 才替换得到）
+      console.info("[REword] build:", PLUGIN_VERSION || "unknown");
       markStage("view.init（定位+首次渲染）");
       const saved = store.getProgress(bookId);
       // 2026-10-09 新增：在 view.init **之前**恢复「已读 N/M」的访问集。
@@ -3095,6 +3328,7 @@ function applyTopHandleHitHeight() {
           : (savedZoom ?? { kind: "fit-page" });
         // 用 setTimeout 0 让 foliate-js 先完成初始渲染再 applyZoom，避免被首次 render 覆盖
         setTimeout(() => {
+          if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再写缩放状态
           applyZoom(initialZoom, { silent: true });
         }, 0);
       }
@@ -3335,6 +3569,10 @@ function applyTopHandleHitHeight() {
       const cTop = {
         left: fr.left + cRect.left, top: fr.top + cRect.top,
         right: fr.left + cRect.left + cRect.width, bottom: fr.top + cRect.top + cRect.height,
+        // 2026-11-03：补 width/height —— 下面按 `canvas.width / cTop.width` 做
+        // CSS 坐标 → canvas 像素的换算，而 cTop 此前只有 left/top/right/bottom
+        // ⇒ cTop.width 是 undefined ⇒ 结果恒为 NaN ⇒ 划词选区矩形全是 NaN。
+        width: cRect.width, height: cRect.height,
       };
       const ix = {
         left: Math.max(sel.left, cTop.left), top: Math.max(sel.top, cTop.top),
@@ -3710,13 +3948,7 @@ function applyTopHandleHitHeight() {
         goNextChapter();
         return;
       case "openSearch":
-        showSearch = true;
-        showSettings = false;
-        showMoreMenu = false;
-        showToc = false;
-        setTimeout(() => {
-          try { searchInput?.focus(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · onGlobalKey", "debug"); }
-        }, 30);
+        openSearchPanel();
         return;
       case "toggleBookmark":
         void toggleCurrentBookmark();
@@ -5485,8 +5717,9 @@ function applyTopHandleHitHeight() {
     }
     // 2026-10-08 顶栏浮层化：中心点击切的是「浮起/收回」，不是 `toolbarVisible`
     //（后者在悬浮模式下已不再驱动顶栏的显示，只服务于 topBarFloating=false 的旧行为）。
+    // 2026-11-04：中心点击与两个圆点共用 toggleChrome —— 一次动作同时开合上下栏。
     if (isTopBarFloating()) {
-      toggleTopBarPin();
+      toggleChrome();
       return;
     }
     toolbarVisible = !toolbarVisible;
@@ -5497,22 +5730,6 @@ function applyTopHandleHitHeight() {
     applyStyles();
   }
 
-  // [2026-09-25] 页面宽度三档预设：铺满 95% / 正常 80% / 宽松 70%（内容宽度随窗口伸缩）。
-  // ⚠️ 点击时显式关掉「跟随思源页边」——否则 applyStyles 后 applySiyuanDocMargin 会把
-  // 左右边距覆盖回宿主 padding，预设点了等于白点（用户报障「点击没有用」的根因）。
-  function onSetLayoutPreset(p: string) {
-    const preset = LAYOUT_PRESETS[p as ReaderLayoutPreset];
-    settings = settingsStore.update({
-      layout: {
-        ...settings.layout,
-        widthPct: preset.widthPct,
-        marginTopPx: preset.margins.top,
-        marginBottomPx: preset.margins.bottom,
-        followSiyuanMargin: false,
-      },
-    });
-    applyStyles();
-  }
   /** 跟随思源文档边距：读取宿主 .protyle-wysiwyg 的水平 padding，作为阅读器左右边距 */
   function applySiyuanDocMargin() {
     if (!settings.layout.followSiyuanMargin) {
@@ -5705,7 +5922,7 @@ function applyTopHandleHitHeight() {
       toast(docId ? t("已启用译文归档，新建译文会同步写进思源") : t("启用失败：无法创建归档文档，请检查思源笔记本"), 2600);
     } catch (err) {
       console.warn("[REword] 启用译文归档失败:", err);
-      toast(t("启用译文归档失败，请重试"), 2600, "error" as any);
+      toast(t("启用译文归档失败，请重试"), 2600, "error");
     }
   }
 
@@ -5713,6 +5930,8 @@ function applyTopHandleHitHeight() {
 
   let primerOpen = false;
   let primerEditorEl: HTMLElement | null = null;
+  /** primer 编辑器的 input 监听（具名，便于 destroy 时解绑） */
+  let primerInputHandler: (() => void) | null = null;
   let primerEditor: AnnEditor | null = null;
   let primerChars = 0;
   let primerTokens = 0;
@@ -5812,7 +6031,7 @@ function applyTopHandleHitHeight() {
       toast(isCurrentBook ? t("本书翻译缓存已清空，下次翻页会重新翻译") : t("已清空所选书籍翻译缓存"));
     } catch (e) {
       console.warn("[REword] 清空翻译缓存失败:", e);
-      toast(t("清空缓存失败，请重试"), 2600, "error" as any);
+      toast(t("清空缓存失败，请重试"), 2600, "error");
     } finally {
       clearingCache = false;
     }
@@ -5832,7 +6051,7 @@ function applyTopHandleHitHeight() {
       toast(n > 0 ? t("已清理 {count} 份无效缓存", { count: n }) : t("没有需要清理的无效缓存"));
     } catch (e) {
       console.warn("[REword] 清理无效缓存失败:", e);
-      toast(t("清理无效缓存失败，请重试"), 2600, "error" as any);
+      toast(t("清理无效缓存失败，请重试"), 2600, "error");
     } finally {
       clearingOrphans = false;
     }
@@ -5860,14 +6079,17 @@ function applyTopHandleHitHeight() {
     primerEditor.mount();
     updatePrimerStats();
     // input 冒泡监听：实时更新字数/token + 防抖保存（Kramdown 落盘）
-    primerEditorEl.addEventListener("input", () => {
+    // 具名 handler：destroyPrimerEditor 只把 primerEditorEl 置 null 而 DOM 元素仍在，
+    // togglePrimerEditor 可再次挂载 → 匿名 handler 会在同一元素上叠加多个 input 监听。
+    primerInputHandler = () => {
       updatePrimerStats();
       if (primerSaveTimer) clearTimeout(primerSaveTimer);
       primerSaveTimer = setTimeout(() => {
         primerSaveTimer = null;
         savePrimer();
       }, 600);
-    });
+    };
+    primerEditorEl.addEventListener("input", primerInputHandler);
   }
 
   function updatePrimerStats() {
@@ -5906,6 +6128,13 @@ function applyTopHandleHitHeight() {
   }
 
   function destroyPrimerEditor() {
+    // 先摘掉 input 监听（否则同一 DOM 元素上会叠加多个 handler）
+    if (primerEditorEl && primerInputHandler) {
+      try {
+        primerEditorEl.removeEventListener("input", primerInputHandler);
+      } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · destroyPrimerEditor · removeEventListener", "debug"); }
+    }
+    primerInputHandler = null;
     try {
       primerEditor?.destroy?.();
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · destroyPrimerEditor", "debug"); }
@@ -6055,29 +6284,6 @@ function applyTopHandleHitHeight() {
   function setProgressStyle(key: string) {
     settings = settingsStore.update({ layout: { ...settings.layout, progressStyle: key as ReaderProgressStyle } });
   }
-  function setBottomBarMode(key: string) {
-    settings = settingsStore.update({ layout: { ...settings.layout, bottomBarMode: key as ReaderBottomBarMode } });
-    // 2026-10-07：底部热区态（bottomBarEdgeHover）已随「纯点击改造」删除，
-    // 原先在此清理热区态的分支随之移除。
-  }
-  /** 排版预设（紧凑/舒适/宽松/绘本）：一键套用边距 + 行距 + 段距 + 字距组合 */
-  function applyLayoutPreset(key: string) {
-    const p = READER_TYPO_PRESETS[key as ReaderTypographyPreset];
-    if (!p) return;
-    settings = settingsStore.update({
-      lineHeight: p.lineHeight,
-      text: { ...settings.text, letterSpacing: p.letterSpacing },
-      layout: {
-        ...settings.layout,
-        marginTopPx: p.marginTopPx,
-        marginBottomPx: p.marginBottomPx,
-        marginLeftPx: p.marginLeftPx,
-        marginRightPx: p.marginRightPx,
-        paragraphSpacing: p.paragraphSpacing,
-      },
-    });
-    applyStyles();
-  }
   function setReferencePageCount(v: number) {
     settings = settingsStore.update({ layout: { ...settings.layout, referencePageCount: clamp(Math.round(v), 0, 2000) } });
   }
@@ -6181,29 +6387,30 @@ function applyTopHandleHitHeight() {
       return;
     }
 
-    /* ---- 排版预设：一次性套用 widthPct + 上下边距 ---- */
+    /* ---- 阅读预设：一次性套用页宽 + 上下边距 + 行距 + 段距 + 字距 ---- */
     if (path === "__preset") {
-      const key = value as ReaderLayoutPreset;
-      // ⚠️ 2026-10-08「自定义」档改为**不覆写任何字段**。
-      //它的语义是「退出预设接管，由面板上的滑块决定」，
-      // 而 `LAYOUT_PRESETS.custom.margins` 全是 0 —— 若照旧覆写，
-      // 正文会上下左右全部贴框线（`padding: 0px 10% 0px 10%`），
-      // 正是用户反复投诉过的观感。
-      // 保留 early-return：点了「自定义」就什么也不做，这才是它的语义。
-      if (key === "custom") return;
+      const key = value as ReaderLayoutPresetKey;
+      // 「自定义」不是档位，而是「与三档都不完全一致」的派生状态。
+      // UI 只渲染三格，永远不会派发 custom；保留 early-return 作为防御。
+      if ((value as string) === "custom") return;
       const preset = LAYOUT_PRESETS[key];
-      if (preset) {
-        settings = settingsStore.update({
-          layout: {
-            ...settings.layout,
-            widthPct: preset.widthPct,
-            marginTopPx: preset.margins.top,
-            marginBottomPx: preset.margins.bottom,
-            followSiyuanMargin: false,
-          },
-        } as any);
-        applyStyles();
-      }
+      if (!preset) return;
+      settings = settingsStore.update({
+        lineHeight: preset.lineHeight,
+        text: { ...settings.text, letterSpacing: preset.letterSpacing },
+        paragraph: { ...settings.paragraph, paragraphSpacing: preset.paragraphSpacing },
+        layout: {
+          ...settings.layout,
+          // fixed 模式下 widthPct 被执行层忽略 ⇒ 必须切回 pct，否则「点了没反应」
+          widthMode: "pct",
+          widthPct: preset.widthPct,
+          marginTopPx: preset.margins.top,
+          marginBottomPx: preset.margins.bottom,
+          // 跟随思源页边会覆盖左右 padding ⇒ 同上，必须关掉
+          followSiyuanMargin: false,
+        },
+      } as any);
+      applyStyles();
       return;
     }
 
@@ -6376,9 +6583,9 @@ function applyTopHandleHitHeight() {
         store,
         bookId,
         bookTitle,
-        settings.autoNotebookId,
-        settings.autoNotebookName,
-        settings.autoArchivePath,
+        settings.autoNotebookId ?? "",
+        settings.autoNotebookName ?? "",
+        settings.autoArchivePath ?? "",
       );
       toast(
         t(r.created ? "已创建并绑定《{doc}》" : "已绑定已有文档《{doc}》", { doc: bookTitle }),
@@ -6573,7 +6780,7 @@ function applyTopHandleHitHeight() {
    *                    不收：圆点点开的顶栏（topBarPinned = 显式意图，显式操作显式收）
    *   · 点浮层内部   → 不动（豁免：data-dismiss-ignore 根元素，见下方守卫）
    *   · 点顶/底栏按钮 → 不动（click 自己 toggle）
-   *   · 点顶栏圆点收顶栏 → 联动收所有抽屉（toggleTopBarPin 两分支都走 closeAllPopovers）
+   *   · 点顶栏/底栏圆点 → 同时收两栏并联动收所有抽屉（toggleChrome 两分支都走 closeAllPopovers）
   *   · Esc / 点 .reader-backdrop → 等价点空白
   */
 
@@ -6585,7 +6792,10 @@ function applyTopHandleHitHeight() {
    * isTrusted=false、思源 Shift 模式、无毫秒级紧邻 pointerdown/scroll 的 mousedown/relocate
    * 一律不收起浮层；真用户操作（trusted + 毫秒级紧邻 pointer/scroll）完全不受影响。 */
   let lastPointerDownMs = -1e9;
-  window.addEventListener("pointerdown", () => { lastPointerDownMs = performance.now(); }, true);
+  // 具名 handler：匿名箭头函数在 onDestroy 里拿不到引用 → 每次进出阅读 Tab
+  // 都会残留一个 window 级 capture 监听（见 onDestroy 中的对称注销）。
+  const onGlobalPointerDown = () => { lastPointerDownMs = performance.now(); };
+  window.addEventListener("pointerdown", onGlobalPointerDown, true);
   /** iframe 口径最近 pointerdown / scroll 时间戳（attachContentDoc 内 capture 记录） */
   let contentPointerDownMs = -1e9;
   let lastContentScrollMs = -1e9;
@@ -6608,6 +6818,8 @@ function applyTopHandleHitHeight() {
     dictPopup = { ...dictPopup, visible: false };
     // 2026-10-15 图片灯箱一并纳入统一收起链路（Esc / 点空白 / 打开其它浮层）
     closeImageViewer();
+    // 2026-11-04 图片右键菜单同样走统一收起链路（Esc / 打开其它浮层）
+    closeImageContextMenu();
     // 编辑态划词工具栏一并收起（重置为 create 态，避免残留 editingId）
     if (selToolbar.visible) closeSelToolbar();
     // 2026-10-08 顶栏浮层化：抽屉全关了 ⇒ 解除「为浮层而保持顶栏可见」的临时状态。
@@ -6994,7 +7206,9 @@ function applyTopHandleHitHeight() {
   //   —— 典型的「死分支」：代码不会走到，却让模板多出近20 行重复 DOM。
   let noteEditor: {
     visible: boolean; x: number; y: number;
-    mode: "create" | "edit" | "highlight";
+    // 2026-11-03：补 "preview" —— showPreviewViewer 赋的正是它（mode:"preview"），
+    // 类型里没有 ⇒ 该分支被判为「不可能比较」而报错。
+    mode: "create" | "edit" | "highlight" | "preview";
     id: string | null; cfi: string; text: string;
     style: AnnotationStyle; color: string; note: string; group: string;
     time: string; // 格式化时间（查看态展示，updatedAt / createdAt）
@@ -7191,8 +7405,11 @@ function applyTopHandleHitHeight() {
   const docCleanups = new Map<Document, Array<{ type: string; fn: EventListenerOrEventListenerObject; opts?: boolean | AddEventListenerOptions }>>();
 
   /** 给内容文档加监听并登记，确保 detachAllContentDocs 能统一移除（根治重复绑定/翻两页） */
-  function trackDocListener(doc: Document, type: string, fn: EventListenerOrEventListenerObject, opts?: boolean | AddEventListenerOptions) {
-    doc.addEventListener(type, fn, opts);
+  // 2026-11-03：回调形参放宽为 `(e: any) => void` —— 之前只收 EventListener，
+  // 而 keydown/touchstart/mouseup 等各自的 handler 形参是 KeyboardEvent/TouchEvent/MouseEvent
+  // （函数形参逆变 ⇒ 更具体的参数类型不能赋给 EventListener）。
+  function trackDocListener(doc: Document, type: string, fn: EventListenerOrEventListenerObject | ((e: any) => void), opts?: boolean | AddEventListenerOptions) {
+    doc.addEventListener(type, fn as EventListenerOrEventListenerObject, opts);
     let arr = docCleanups.get(doc);
     if (!arr) { arr = []; docCleanups.set(doc, arr); }
     arr.push({ type, fn, opts });
@@ -7228,6 +7445,10 @@ function applyTopHandleHitHeight() {
     // 2026-10-15 图片灯箱：正文图片单击放大（冒泡阶段委托，判定见 onContentImageClick）。
     // 挂这里而不是 relocate —— foliate 翻页会重建内容文档，只有这里能保证每个 section 都被覆盖。
     trackDocListener(doc, "click", onContentImageClick as EventListener);
+    // 2026-11-04 图片右键菜单（桌面）：Readest 同款「复制图片 / 保存图片」。
+    // 必须挂内容文档：右键发生在 iframe 内，宿主 window 收不到；且与灯箱的 click 同处，
+    // 才能保证 foliate 重建 section 后每个文档都被覆盖。
+    trackDocListener(doc, "contextmenu", onContentImageContextMenu as EventListener);
     // 2026-08-29：点击脚注气泡外部（内容区）关闭；捕获阶段先于 onBookLink 的 link 事件
     trackDocListener(doc, "pointerdown", onFootnoteOutsidePointerDown as EventListener, true);
     // 2026-08-27 晚（P2.2）：专注模式滚动高亮（capture 捕获内部滚动容器）
@@ -7272,6 +7493,21 @@ function applyTopHandleHitHeight() {
         rewriteFontKeywordsInDocument(doc);
       } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · try { rewriteFontKeywordsInDocument(doc); }", "debug"); }
     }
+    // 2026-11-01 字重重写：书籍 CSS 里的 `font-weight: normal` → var(--reword-font-weight)。
+    // 与字体族无关（字重设置在所有字体模式下都生效），故无条件执行。
+    // 放在这里而不是「设置变更时」—— 内容文档是 foliate 翻页时新建的，
+    // 每份文档都要重写一次（CSSOM 改动随文档重建自然消失）。
+    try {
+      rewriteFontWeightInDocument(doc);
+    } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · try { rewriteFontWeightInDocument(doc); }", "debug"); }
+    // 2026-11-01 对齐快照（Readest keepTextAlignment 同款）：
+    // 读取每个块级元素**作者声明**的对齐并打标，使诗/题词这类刻意居中的块
+    // 在「两端对齐」下依然保留原样。
+    // ⚠️ 依赖「我们的对齐默认值只作用在 body 层」—— 段落级 !important 会把
+    //   作者的声明压平成同一个值，快照就失去意义（见 reader-style.ts 施加层注释）。
+    try {
+      keepTextAlignment(doc);
+    } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · try { keepTextAlignment(doc); }", "debug"); }
   }
 
   /** 卸载所有内容文档上的监听（与 attachContentDoc 对称），反复进出阅读 Tab 不泄漏 */
@@ -7670,7 +7906,7 @@ function applyTopHandleHitHeight() {
     const c = toContainerCoords(anchorX, anchorY);
     // 新工具栏要开 → 收起动画作废（字面量本身也清掉 closing，这里连计时器一起摘）。
     cancelSelToolbarOut();
-    selToolbar = { visible: true, x: c.x, y: c.y, text, mode, editingId, place, narrow: selToolbarNarrow(bounds) };
+    selToolbar = { visible: true, x: c.x, y: c.y, text, mode, editingId, place, narrow: selToolbarNarrow(bounds), annId: null, annCfi: null, annStyle: null, annColor: null };
     if (DEBUG_READER) {
       console.log("[REword][pos] positionToolbarAbove", {
         mode, editingId,
@@ -8485,7 +8721,7 @@ function applyTopHandleHitHeight() {
         const a = nc(it.cfi);
         return a === target || (a && (a.startsWith(target) || target.startsWith(a)));
       });
-      if (hit) rec = { id: hit.id, cfi: hit.cfi, color: hit.color };
+      if (hit?.cfi) rec = { id: hit.id, cfi: hit.cfi, color: hit.color ?? "" };
     }
     if (!rec) { toast(t("未找到该阅读批注")); return; }
     showViewerForRec(rec, null);
@@ -8506,6 +8742,337 @@ function applyTopHandleHitHeight() {
   // 自动聚焦批注输入框（create/edit 态 textarea 渲染后聚焦，readest 批注即打字）
   function focusNoteInput(node: HTMLTextAreaElement) {
     node.focus();
+  }
+
+  /* ============================================================
+   * 2026-11-04 AI 桥（方案 B）：Copilot → 内核 MCP 工具 → 前端导出方法
+   *
+   * 三层边界：
+   *  · kernel.js 只做「转发 + 超时」，不碰书的内容（书在 foliate 前端）；
+   *  · 本组件导出语义化方法（章节文本 / 定位 / 写入），不暴露 DOM/view 句柄；
+   *  · 参数校验与格式白名单在 reader-bridge-protocol.ts（可单测）。
+   * 只读链路：get_state → get_chapter → locate；写入链路：annotate(dryRun) → annotate(commit)。
+   * ============================================================ */
+
+  /** 章节标题：不受「显示页眉」开关门控（AI 读取与 UI 展示解耦） */
+  function resolveChapterTitle(idx: number): string {
+    if (idx < 0 || !Array.isArray(tocItems) || !tocItems.length) return "";
+    let best = "";
+    for (const item of tocItems) {
+      const at = sectionIndexOfTocItem(item);
+      if (at >= 0 && at <= idx) best = item.title;
+      else if (at > idx) break;
+    }
+    return best.trim();
+  }
+
+  /** AI 桥：当前阅读器状态（供 Copilot 判断「有没有书 / 能不能读 / 在哪一章」） */
+  export function getReaderAiState() {
+    const format = String(meta?.format || "").toLowerCase();
+    const total = view?.book?.sections?.length ?? 0;
+    return {
+      ok: true,
+      open: true,
+      bookId,
+      title: meta?.title || title,
+      format,
+      bookType: currentBookType(),
+      textCapable: isAiTextFormat(format),
+      sectionIndex: currentSectionIndex,
+      totalSections: total,
+      chapterTitle: resolveChapterTitle(currentSectionIndex),
+    };
+  }
+
+  /** 段落选择器：与双语分段器同口径（p/li/blockquote）+ 标题与定义列表 */
+  const AI_PARA_SELECTOR = "p, li, blockquote, h1, h2, h3, h4, h5, h6, dd, dt, pre";
+
+  /**
+   * AI 桥：读取一章的段落文本。
+   * 默认读当前章；超长按 maxChars 截断并给出 nextFromPara，AI 可续读下一页。
+   * 不用 iframe DOM 抓取：同一段在分页下会被拆成多页片段，语义层才稳定。
+   */
+  export async function getChapterSnapshot(
+    opts: { sectionIndex?: number; fromPara?: number; maxChars?: number } = {},
+  ) {
+    const format = String(meta?.format || "").toLowerCase();
+    if (!isAiTextFormat(format)) {
+      return { ok: false, error: "unsupported_format", format };
+    }
+    const sections: any[] = view?.book?.sections ?? [];
+    const idx = normalizeSectionIndex(opts.sectionIndex, sections.length) ?? currentSectionIndex;
+    if (idx < 0 || idx >= sections.length) return { ok: false, error: "no_chapter" };
+    const section = sections[idx];
+    if (!section || typeof section.createDocument !== "function") {
+      return { ok: false, error: "chapter_load_failed", sectionIndex: idx };
+    }
+    let doc: any = null;
+    try {
+      doc = await section.createDocument();
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · getChapterSnapshot · createDocument", "warn");
+      doc = null;
+    }
+    if (!doc) return { ok: false, error: "chapter_load_failed", sectionIndex: idx };
+
+    const paras: string[] = [];
+    try {
+      const els = Array.from(doc.querySelectorAll(AI_PARA_SELECTOR)) as Element[];
+      // 选择器会同时命中 <blockquote><p>…</p></blockquote> 这类嵌套：
+      // 只保留最外层，避免同一段正文重复喂给 AI。
+      const set = new Set(els);
+      for (const el of els) {
+        let parent = el.parentElement;
+        let nested = false;
+        while (parent && parent !== doc.body) {
+          if (set.has(parent)) { nested = true; break; }
+          parent = parent.parentElement;
+        }
+        if (nested) continue;
+        const text = normalizeQuote(el.textContent || "");
+        if (text) paras.push(text);
+      }
+      if (!paras.length) {
+        // 兜底：某些排版（如纯 div 段落）没有语义标签，退化为整章文本
+        const fallback = normalizeQuote(doc.body?.textContent || "");
+        if (fallback) paras.push(fallback);
+      }
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · getChapterSnapshot · extract", "warn");
+      return { ok: false, error: "chapter_load_failed", sectionIndex: idx };
+    }
+
+    const start = Math.max(0, Math.min(paras.length, Math.floor(Number(opts.fromPara) || 0)));
+    const maxChars = clampMaxChars(opts.maxChars);
+    const out: { i: number; text: string }[] = [];
+    let used = 0;
+    let i = start;
+    for (; i < paras.length; i++) {
+      const text = paras[i];
+      // 至少返回一段：单段超预算时也整段给出，避免 AI 拿到空数组
+      if (out.length && used + text.length > maxChars) break;
+      out.push({ i, text });
+      used += text.length;
+    }
+    return {
+      ok: true,
+      bookId,
+      title: meta?.title || title,
+      format,
+      sectionIndex: idx,
+      totalSections: sections.length,
+      chapterTitle: resolveChapterTitle(idx),
+      totalParagraphs: paras.length,
+      paragraphs: out,
+      returnedChars: used,
+      truncated: i < paras.length,
+      nextFromPara: i < paras.length ? i : null,
+    };
+  }
+
+  /**
+   * 归一化整章正文（空白压成一个空格、去零宽），同时保留
+   * 「归一化字符下标 → 原始文本节点/偏移」映射，供 quote → Range 反查。
+   */
+  function buildTextIndex(doc: any): { text: string; chars: { node: Text; offset: number }[] } {
+    const chars: { node: Text; offset: number }[] = [];
+    let text = "";
+    let pendingSpace = false;
+    try {
+      const walker = doc.createTreeWalker(doc.body, 4 /* SHOW_TEXT */, {
+        acceptNode(node: any) {
+          const tag = node.parentElement?.tagName?.toLowerCase?.() || "";
+          return tag === "script" || tag === "style" ? 2 /* REJECT */ : 1 /* ACCEPT */;
+        },
+      });
+      let node: Node | null;
+      while ((node = walker.nextNode())) {
+        const s = (node as Text).nodeValue || "";
+        for (let k = 0; k < s.length; k++) {
+          const ch = s[k];
+          if (ch === "\u200b" || ch === "\u200c" || ch === "\u200d" || ch === "\ufeff") continue;
+          if (/\s/.test(ch)) {
+            if (text) pendingSpace = true;
+            continue;
+          }
+          if (pendingSpace) {
+            // 合成空格映射到下一个非空白字符的位置：quote 首尾已 trim，
+            // 不会以合成空格作为 Range 端点。
+            if (text) {
+              text += " ";
+              chars.push({ node: node as Text, offset: k });
+            }
+            pendingSpace = false;
+          }
+          text += ch;
+          chars.push({ node: node as Text, offset: k });
+        }
+      }
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · buildTextIndex", "warn");
+    }
+    return { text, chars };
+  }
+
+  // 2026-11-04：查找逻辑放协议模块（findQuoteMatches），便于单测。
+  function rangeFromTextIndex(doc: any, chars: { node: Text; offset: number }[], start: number, length: number) {
+    const a = chars[start];
+    const b = chars[start + length - 1];
+    if (!a || !b) return null;
+    try {
+      const range = doc.createRange();
+      range.setStart(a.node, a.offset);
+      range.setEnd(b.node, Math.min(b.offset + 1, (b.node.nodeValue || "").length));
+      return range;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 在当前章节内定位一段原文 → CFI。
+   * 自建只读匹配，不走 view.search —— 后者会清空用户搜索结果并把命中画成
+   * 临时搜索高亮（只读定位与 dryRun 预演不该产生任何视觉副作用）。
+   * 只返回位置与候选，不写入任何数据。
+   */
+  async function locateQuoteInSection(quoteRaw: unknown, sectionIndex: number) {
+    const quote = normalizeQuote(quoteRaw);
+    if (!quote) return { ok: false as const, error: "invalid_args" as const };
+    if (quote.length > MAX_QUOTE_CHARS) return { ok: false as const, error: "quote_too_long" as const };
+    const sections: any[] = view?.book?.sections ?? [];
+    const section = sections[sectionIndex];
+    if (!section || typeof section.createDocument !== "function" || typeof view?.getCFI !== "function") {
+      return { ok: false as const, error: "no_reader_open" as const };
+    }
+    let doc: any = null;
+    try {
+      doc = await section.createDocument();
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · locateQuoteInSection · createDocument", "warn");
+      return { ok: false as const, error: "chapter_load_failed" as const };
+    }
+    if (!doc) return { ok: false as const, error: "chapter_load_failed" as const };
+
+    const { text, chars } = buildTextIndex(doc);
+    if (!text) return { ok: false as const, error: "chapter_load_failed" as const };
+    const hits: { cfi: string; excerpt: string }[] = [];
+    for (const hit of findQuoteMatches(text, quote)) {
+      const range = rangeFromTextIndex(doc, chars, hit.start, hit.length);
+      if (!range) continue;
+      let cfi = "";
+      try {
+        cfi = view.getCFI(sectionIndex, range);
+      } catch {
+        cfi = "";
+      }
+      if (!cfi) continue;
+      const from = Math.max(0, hit.start - 40);
+      const to = Math.min(text.length, hit.start + hit.length + 40);
+      const excerpt = `${from > 0 ? "…" : ""}${text.slice(from, to)}${to < text.length ? "…" : ""}`;
+      hits.push({ cfi, excerpt });
+      if (hits.length >= MAX_LOCATE_CANDIDATES) break;
+    }
+    if (!hits.length) return { ok: false as const, error: "quote_not_found" as const, quote };
+    return {
+      ok: true as const,
+      quote,
+      cfi: hits[0].cfi,
+      excerpt: hits[0].excerpt,
+      candidates: hits,
+    };
+  }
+
+  /** AI 桥：定位（只读），AI 可先确认原文确实存在再决定是否划线 */
+  export async function locateAiQuote(opts: { quote?: unknown; sectionIndex?: number } = {}) {
+    const format = String(meta?.format || "").toLowerCase();
+    if (!isAiTextFormat(format)) return { ok: false, error: "unsupported_format", format };
+    const sections: any[] = view?.book?.sections ?? [];
+    const idx = normalizeSectionIndex(opts.sectionIndex, sections.length) ?? currentSectionIndex;
+    if (idx < 0) return { ok: false, error: "no_chapter" };
+    const loc = await locateQuoteInSection(opts.quote, idx);
+    return loc.ok ? { ...loc, sectionIndex: idx, chapterTitle: resolveChapterTitle(idx) } : { ...loc, sectionIndex: idx };
+  }
+
+  /**
+   * AI 桥：写入划线/备注。
+   * dryRun=true 只做定位预演（返回命中位置与上下文），不落库、不绘制；
+   * 只有 commit（dryRun=false）才走 saveHighlight，且 origin 标为 "ai"，
+   * 便于「我的标记」按来源筛选与批量删除。
+   * 写入限定在当前章节：跨章写入会要求 AI 先让用户翻页，避免视角被悄悄带走。
+   */
+  export async function applyAiAnnotations(
+    items: unknown,
+    opts: { dryRun?: boolean; sectionIndex?: number } = {},
+  ) {
+    const format = String(meta?.format || "").toLowerCase();
+    if (!isAiTextFormat(format)) return { ok: false, error: "unsupported_format", format };
+    const arr = Array.isArray(items) ? items.slice(0, MAX_ANNOTATE_ITEMS) : [];
+    if (!arr.length) return { ok: false, error: "invalid_args" };
+    const sections: any[] = view?.book?.sections ?? [];
+    if (currentSectionIndex < 0) return { ok: false, error: "no_chapter" };
+    const asked = normalizeSectionIndex(opts.sectionIndex, sections.length);
+    if (asked !== null && asked !== currentSectionIndex) {
+      return { ok: false, error: "section_not_active", sectionIndex: asked, activeSection: currentSectionIndex };
+    }
+    const idx = currentSectionIndex;
+    const dryRun = opts.dryRun !== false; // 默认只预演：AI 必须显式关掉才写入
+    const results: any[] = [];
+    for (const raw of arr) {
+      const v = validateAnnotationItem(raw);
+      if (!v.ok) {
+        results.push({ ok: false, quote: normalizeQuote((raw as any)?.quote), error: v.error });
+        continue;
+      }
+      const loc = await locateQuoteInSection(v.item.quote, idx);
+      if (!loc.ok) {
+        results.push({ ok: false, quote: v.item.quote, error: loc.error });
+        continue;
+      }
+      if (dryRun) {
+        results.push({
+          ok: true,
+          dryRun: true,
+          quote: v.item.quote,
+          cfi: loc.cfi,
+          excerpt: loc.excerpt,
+          candidates: loc.candidates,
+        });
+        continue;
+      }
+      try {
+        await saveHighlight(
+          loc.cfi,
+          v.item.quote,
+          v.item.style as AnnotationStyle,
+          v.item.color || lastColor,
+          v.item.note,
+          undefined,
+          undefined,
+          "ai",
+        );
+        results.push({
+          ok: true,
+          quote: v.item.quote,
+          cfi: loc.cfi,
+          excerpt: loc.excerpt,
+          id: annByValue.get(loc.cfi)?.id ?? null,
+        });
+      } catch (__swallowErr) {
+        logSwallow(__swallowErr, "ReaderView.svelte · applyAiAnnotations · saveHighlight", "warn");
+        results.push({ ok: false, quote: v.item.quote, error: "write_failed" });
+      }
+    }
+    const okCount = results.filter((r) => r.ok).length;
+    return {
+      ok: true,
+      dryRun,
+      bookId,
+      sectionIndex: idx,
+      chapterTitle: resolveChapterTitle(idx),
+      total: results.length,
+      okCount,
+      results,
+    };
   }
 
   /** C 跳转定位（由 ReaderTabController.focusAnnotation 调用）：等待 foliate view 就绪 → goTo 跳转 → 弹查看气泡 */
@@ -8852,11 +9419,50 @@ function applyTopHandleHitHeight() {
     };
   }
 
-  function toast(msg: string) {
+  /**
+   * 快捷键「切换主题（明/暗）」：跟随 → 亮 → 暗 循环。
+   * 2026-11-03：此前该 case 调用了一个**根本不存在**的 toggleTheme() ⇒ 按快捷键直接
+   * ReferenceError。此处按设置面板的真实口径实现（只改 themeMode，不动配色 theme）。
+   */
+  function toggleTheme() {
+    const cur = settings.themeMode ?? "auto";
+    const next = cur === "auto" ? "light" : cur === "light" ? "dark" : "auto";
+    settings = settingsStore.update({ themeMode: next } as any);
+    applyStyles();
+  }
+
+  /**
+   * 打开搜索面板（快捷键与「划词后自动搜」共用）。
+   * 2026-11-03：此前划词路径调用了一个**不存在**的 openSearch() ⇒ 划词后自动搜会
+   * ReferenceError；这里把快捷键分支里的逻辑抽成函数，两处共用。
+   */
+  function openSearchPanel() {
+    showSearch = true;
+    showSettings = false;
+    showMoreMenu = false;
+    showToc = false;
+    setTimeout(() => {
+      try { searchInput?.focus(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · onGlobalKey", "debug"); }
+    }, 30);
+  }
+
+  /** 提示条类型（2026-11-03）：error 用于失败提示，加红色描边以便一眼分辨。 */
+  let toastKind: "info" | "error" = "info";
+
+  /**
+   * 顶部提示条。
+   *
+   * 2026-11-03：此前签名只有 `toast(msg)`，但**全项目有 11 处调用传了 3 个参数**
+   * （消息 + 停留时长 + info/error 类型），且都写了 `as any` 压类型错误
+   * ⇒ 这些参数从未生效：所有提示（含「AI 翻译失败」这类错误）一律 1.8 秒后消失。
+   * 现在把两个参数真正实现：时长按调用点生效，error 加红色描边。
+   */
+  function toast(msg: string, durationMs = 1800, kind: "info" | "error" = "info") {
     toastMsg = msg;
     toastUndo = false;
+    toastKind = kind;
     if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => { toastMsg = ""; toastUndo = false; }, 1800);
+    toastTimer = setTimeout(() => { toastMsg = ""; toastUndo = false; toastKind = "info"; }, durationMs);
   }
 
   /** 带「撤销」按钮的提示（用于删除标注，3 秒内可恢复） */
@@ -8915,6 +9521,7 @@ function applyTopHandleHitHeight() {
     dictPopupSource = source;
     dictPopup = { visible: true, x, y, html: renderLoading(), word, source };
     setTimeout(async () => {
+      if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再写浮层状态
       let html: string;
       /** 命中词条时的词头（自动发音用）；落到候选建议列表时保持空串 */
       let headword = "";
@@ -8973,7 +9580,7 @@ function applyTopHandleHitHeight() {
     searchQuery = text;
     // 复用面板的「按章节/全书」范围与大小写开关，不另设一套
     searchScope = "chapter";
-    openSearch();
+    openSearchPanel();
   }
   // ============ Phase 2：划词高亮 + 批注（阅读器 / foliate 集成） ============
 
@@ -9028,6 +9635,7 @@ function applyTopHandleHitHeight() {
             annotationsDirty = true;
             // 兜底：若 foliate 未在重显时触发 relocate，延迟补绘一次
             setTimeout(() => {
+              if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再补绘
               if (annotationsDirty) { redrawBookAnnotations(); annotationsDirty = false; }
             }, 450);
           }
@@ -9364,6 +9972,51 @@ function applyTopHandleHitHeight() {
    * 跳转成功与否用户自己看得见（页面会滚过去），不打扰；
    * 只在**明确可预知**的越界情况下提示一次。
    */
+  /** 2026-10-28 修正版 relocate 观察器。
+   *  ⚠️ 上一版（waitRelocateOnce）的 instrumentation 有竞态：在 `await view.goTo()`
+   *  **之后**才挂监听，而台架早已实证 relocate 在 goTo 的 promise resolve **之前**
+   *  就发出（bench 里 lastRelocate 在 goTo 返回时已就位）——监听必然扑空，
+   *  把「实际成功」误报成「3s 未收到」再走兜底重复跳。现在要求调用方
+   *  **先取观察器再调 goTo**；并用 fraction 前后对比判定「真移动」，
+   *  关气泡触发的 resize 也会发 relocate，不能见 relocate 就算成功。 */
+  function observeRelocateOnce(v: any, timeoutMs: number): {
+    done: Promise<{ moved: boolean; before: number | null; after: number | null }>;
+  } {
+    const fail = { moved: false, before: null as number | null, after: null as number | null };
+    if (!v?.addEventListener) return { done: Promise.resolve(fail) };
+    const before = typeof progress === "number" ? progress : null;
+    const done = new Promise<{ moved: boolean; before: number | null; after: number | null }>((resolve) => {
+      let settled = false;
+      let latest: number | null = null;
+      const finish = (detail: any) => {
+        if (settled) return;
+        settled = true;
+        v.removeEventListener("relocate", onRel);
+        clearTimeout(timer);
+        const after = typeof detail?.fraction === "number" ? detail.fraction : null;
+        // before/after 都可判时：位置没变 = 假 relocate（resize 等），不算成功；
+        // before 缺失（进度未知）时保守：收到 relocate 即算成功
+        const moved = before != null && after != null ? Math.abs(after - before) > 1e-9 : after != null;
+        resolve({ moved, before, after });
+      };
+      const onRel = (e: any) => {
+        const after = typeof e?.detail?.fraction === "number" ? e.detail.fraction : null;
+        latest = after;
+        const moved = before != null && after != null ? Math.abs(after - before) > 1e-9 : after != null;
+        // 位置变了 → 立即判定成功；同位置（关气泡 resize 等假信号）→ 继续等
+        // 真正的滚动 relocate，直到超时用最后一次的值下结论
+        if (moved) finish(e?.detail);
+      };
+      v.addEventListener("relocate", onRel);
+      const timer = setTimeout(() => {
+        v.removeEventListener("relocate", onRel);
+        if (latest != null) finish({ fraction: latest });
+        else resolve(fail);
+      }, timeoutMs);
+    });
+    return { done };
+  }
+
   async function jumpToFootnotePage() {
     // 2026-10-26 重做：改走 view.goTo(解析href)——与目录跳转同一条正路。
     //
@@ -9381,28 +10034,115 @@ function applyTopHandleHitHeight() {
     const target = footnoteTarget;
     const resolvedHref = footnoteResolvedHref;
     closeFootnote(); // 先关：它会把 footnoteTarget/footnoteResolvedHref 清掉，所以提前取出
-    console.debug("[REword] 脚注跳转", { resolvedHref, target });
+    // 2026-10-27：debug → info（Chromium 默认不显示 debug 级，用户报障时控制台里什么都看不到）
+    console.info("[REword] 脚注跳转开始", { resolvedHref, target });
+    // 2026-10-28：观察器必须在 goTo **之前**创建（relocate 在 goTo resolve 前发出）
+    const obs = observeRelocateOnce(view, 3000);
+    let mainTried = false;
     if (resolvedHref) {
+      mainTried = true;
       try {
         await view?.goTo?.(resolvedHref);
-        return;
       } catch (e) {
-        logSwallow(e, "ReaderView.svelte · jumpToFootnotePage(view.goTo)", "debug");
+        // 2026-10-28：异常必须可见（此前 debug 级被 Chromium 默认隐藏，
+        // 主路若在 pushState/解析处抛错会完全隐形）
+        console.warn("[REword] 脚注跳转异常（主路 view.goTo）", e);
       }
     }
-    if (!target || target.index == null) return;
-    // 越界 = 章节已被移除/索引失效，属唯一能预判的失败
-    const total = view?.book?.sections?.length ?? 0;
-    if (total > 0 && (target.index < 0 || target.index >= total)) {
-      toast(t("未能定位到脚注所在页"));
+    const mainResult = await obs.done;
+    console.info("[REword] 脚注跳转结果（主路）", { tried: mainTried, ...mainResult, resolvedHref });
+    if (mainResult.moved) return;
+    // 主路未移动（静默 no-op / 假 relocate）→ {index,anchor} 兜底再试一次
+    console.warn("[REword] 脚注跳转主路未移动，走 {index,anchor} 兜底", { resolvedHref, target });
+    let fallbackMoved = false;
+    if (target && target.index != null) {
+      // 越界 = 章节已被移除/索引失效，属唯一能预判的失败
+      const total = view?.book?.sections?.length ?? 0;
+      if (total > 0 && (target.index < 0 || target.index >= total)) {
+        toast(t("未能定位到脚注所在页"));
+        return;
+      }
+      const obs2 = observeRelocateOnce(view, 3000);
+      try {
+        await view?.renderer?.goTo?.(target);
+      } catch (e2) {
+        console.warn("[REword] 脚注跳转异常（兜底 renderer.goTo）", e2);
+      }
+      const r2 = await obs2.done;
+      console.info("[REword] 脚注跳转结果（兜底）", { ...r2, target });
+      fallbackMoved = r2.moved;
+    }
+    if (!fallbackMoved) toast(t("若未跳转到脚注，请重试一次"));
+  }
+
+  /**
+   * 2026-10-27 气泡内链接接管（点击 .reader-footnote-body 委托）。
+   *
+   * 此前 `.reader-footnote-body a { pointer-events: none }` 一刀切禁点——
+   * 但链接样式（主题蓝 + hover 下划线）还在，托尔斯泰日记的脚注回链「[1]」
+   * 看着能点、点了必无反应（用户报障点名的就是这个）。
+   *
+   * 现在：书内链 → 解析成全径后 view.goTo（回链「[1]」= 跳回正文原位置，
+   * 正好是「跳到对应页面」）；外链 → 系统浏览器（思源桌面端 window.open
+   * 对外部 URL 会走系统浏览器）。不再把链接暴露给浏览器默认导航，
+   * 此前注释担心的「思源页面异常导航」由接管层根除。
+   */
+  async function onFootnoteBodyClick(e: MouseEvent) {
+    const a = (e.target as Element | null)?.closest?.("a");
+    if (!a) return;
+    const raw = a.getAttribute("href") || "";
+    if (!raw) {
+      e.preventDefault(); // 无 href 的占位锚（书里偶见 <a id>）：点了别动
       return;
     }
-    try {
-      await view?.renderer?.goTo?.(target);
-    } catch (e) {
-      logSwallow(e, "ReaderView.svelte · jumpToFootnotePage", "debug");
-      toast(t("跳转到脚注页失败"));
+    // 外链：系统浏览器
+    if (/^https?:/i.test(raw)) {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        window.open(raw, "_blank");
+      } catch (err) {
+        logSwallow(err, "ReaderView.svelte · onFootnoteBodyClick window.open", "debug");
+      }
+      return;
     }
+    // 书内链：全径解析后走 view.goTo（与目录跳转同一条正路）
+    const full = bubbleHrefToFull(raw);
+    if (!full) {
+      toast(t("脚注内链接无法解析"));
+      return;
+    }
+    e.preventDefault();
+    e.stopPropagation();
+    closeFootnote();
+    try {
+      await view?.goTo?.(full);
+    } catch (err) {
+      logSwallow(err, "ReaderView.svelte · onFootnoteBodyClick goTo", "debug");
+    }
+  }
+
+  /** 气泡内书内链接 → 全径 href。
+   *  气泡锚点在主文档，resolveFootnoteHref 的「按 ownerDocument 找 section」
+   *  路走不通（ownerDocument 是宿主文档，匹配不到内容 iframe）——改为相对
+   *  footnoteResolvedHref 的章节路径解析（相对当前气泡脚注所在章节）。
+   *  fragment 语义：取**第一个** # 之后全部（与 hrefFragment/浏览器一致）。 */
+  function bubbleHrefToFull(raw: string): string | null {
+    if (!raw || !footnoteResolvedHref) return null;
+    const i = footnoteResolvedHref.indexOf("#");
+    const basePath = i < 0 ? footnoteResolvedHref : footnoteResolvedHref.slice(0, i);
+    if (raw.startsWith("#")) return basePath ? basePath + raw : null;
+    // 带协议或根路径：已是全径，原样给 goTo
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw) || raw.startsWith("/")) return raw;
+    if (!basePath) return null;
+    // 章节相对路径（同章跨脚注引用、跨章互引）：相对 basePath 所在目录展开
+    const dir = basePath.slice(0, basePath.lastIndexOf("/") + 1);
+    const out: string[] = [];
+    for (const part of (dir + raw).split("/")) {
+      if (part === "..") out.pop();
+      else if (part !== "." && part !== "") out.push(part);
+    }
+    return out.length ? out.join("/") : null;
   }
 
   /** 点击脚注气泡外部关闭：注册在 main document + 每个内容文档 capture 阶段。
@@ -9441,7 +10181,7 @@ function applyTopHandleHitHeight() {
     // 原生 SVG 层与 PDF 文本层的缩放 transform 坐标系不匹配 → 叠一层漂移高亮。
     if (isPdfBook()) return;
     const color = it.color;
-    const style = normalizeAnnotationStyle(it.style) as AnnotationStyle;
+    const style = normalizeAnnotationStyle(typeof it.style === "string" ? it.style : undefined) as AnnotationStyle;
     let cfis = annotationCfis(it);
     if (onlyCfis) cfis = cfis.filter((c) => onlyCfis.has(c));
     if (!cfis.length) return;
@@ -9464,7 +10204,12 @@ function applyTopHandleHitHeight() {
       // 2026-10-13 P1-5：it.id 可能尚未落库（saveHighlight 改为视觉先行、upsert 并行），
       // 此处不得把已登记的真实 id 覆盖成 undefined。
       const prev = annByValue.get(cfi);
-      annByValue.set(cfi, { id: it.id ?? prev?.id, cfi, color });
+      // 2026-11-03：it.id 尚未落库时（saveHighlight 视觉先行、upsert 并行），
+      // 此处**不写入** annByValue —— 写进去就是一条 id=undefined 的脏记录，
+      // 而 onShowAnnotation 已有一条专门的补全路径会按 CFI 反查真实 id
+      // （见该函数「防御性补全」注释）。原来直接 set 会把 prev 的真实 id 也丢掉。
+      const recId = it.id ?? prev?.id;
+      if (recId) annByValue.set(cfi, { id: recId, cfi, color });
     } catch (err) {
       recentDirectDraws.delete(cfi); // 绘制失败 ⇒ 收回标记，reconcile 兜底补绘
       dbgHud.addAnnotationErrors++;
@@ -9632,7 +10377,7 @@ function applyTopHandleHitHeight() {
           return a && (a.startsWith(target) || target.startsWith(a));
         });
       if (hit) {
-        rec = { id: hit.id, cfi: hit.cfi, color: hit.color };
+        rec = { id: hit.id, cfi: hit.cfi ?? "", color: hit.color ?? "" };
         // 同步回 annByValue，后续点击走快路径
         annByValue.set(value, rec);
       }
@@ -9654,7 +10399,7 @@ function applyTopHandleHitHeight() {
       const cx = (readerViewEl?.clientWidth ?? window.innerWidth) / 2;
       // 2026-08-25 修复：ghost 分支也必须带上 cfi，否则 applyEditStyle/Color 拿不到定位键 → 样式改不了。
       // foliate 以 CFI 标识标注，无需数据库 id 即可重绘。
-      selToolbar = { visible: true, x: cx, y: 80, text: "", mode: "edit", editingId: null, place: "above", ghostCfi: value, annCfi: value, narrow: selToolbarNarrow(getContentBounds()) };
+      selToolbar = { visible: true, x: cx, y: 80, text: "", mode: "edit", editingId: null, place: "above", ghostCfi: value, annCfi: value, narrow: selToolbarNarrow(getContentBounds()), annId: null, annStyle: null, annColor: null };
       selInfo = { index: -1, cfi: value, range: null };
       // 2026-08-24 根治：残留高亮只有视觉、无数据记录，缓存 cfi 供 onClearGhostHighlight 使用
       activeAnnId = null;
@@ -9678,7 +10423,7 @@ function applyTopHandleHitHeight() {
         });
       if (hit?.id) {
         console.log("[REword] onShowAnnotation: id 补全成功", { oldId: rec.id, newId: hit.id, cfi: target });
-        rec = { id: hit.id, cfi: rec.cfi || hit.cfi, color: rec.color || hit.color };
+        rec = { id: hit.id, cfi: rec.cfi || hit.cfi || "", color: rec.color || hit.color || "" };
         annByValue.set(value, rec);  // 修复缓存，后续走快路径不再命中脏数据
       } else {
         console.warn("[REword] onShowAnnotation: id 补全失败！store 中也找不到该 CFI 的记录，降级为 ghost", { target, byBookCount: byBook.length });
@@ -9738,7 +10483,7 @@ function applyTopHandleHitHeight() {
         noteType: typeof stored?.note,
         noteLength: stored?.note?.length,
         noteTrimmed: (stored?.note || "").trim(),
-        selectedText: stored?.selectedText,
+        selectedText: stored?.selectedText ?? "",
         selectedTextTrimmed: (stored?.selectedText || "").trim(),
         isPureHighlight: pure,
         classify: stored ? classifyAnnotation(stored) : "?",
@@ -9754,14 +10499,26 @@ function applyTopHandleHitHeight() {
   }
 
   /** 持久化一条书籍批注 + 在 foliate 中渲染高亮（直接接收 style/color/type） */
-  async function saveHighlight(cfi: string, selectedText: string, style: AnnotationStyle, color: string, note: string, group?: string, type?: AnnotationType) {
+  async function saveHighlight(
+    cfi: string,
+    selectedText: string,
+    style: AnnotationStyle,
+    color: string,
+    note: string,
+    group?: string,
+    type?: AnnotationType,
+    // 2026-11-04 AI 桥：AI 写入标 origin="ai"（数据层早已有该字段与 ai 元信息槽），
+    // 便于「我的标记」按来源筛选/批量删除；手动划线保持默认值，行为不变。
+    origin: AnnotationOrigin = "manual",
+  ) {
     if (!annStore) {
       try { annStore = getAnnotationStore(); } catch { annStore = null; }
     }
     if (!annStore || !bookId) { toast(t("批注存储不可用")); return; }
     // 2026-10-24 跨页续接：选区跨到下一 section 时，selInfo.segments 里有**多段** CFI。
     // 只在首段与当前 cfi 一致时带上（防止旧选区残留的 segments 误挂到别的标注上）。
-    const segs = (selInfo?.segments && selInfo.cfi === cfi) ? selInfo.segments : undefined;
+    // 2026-11-04 AI 桥：AI 写入没有真实选区，绝不能继承用户残留的 selInfo.segments。
+    const segs = (origin === "manual" && selInfo?.segments && selInfo.cfi === cfi) ? selInfo.segments : undefined;
     const allCfis = segs && segs.length ? segs.map((s) => s.cfi).filter(Boolean) : [cfi];
     const input: any = {
       blockId: `book:${bookId}`,   // 派生虚拟块 ID，复用现有去重/聚合逻辑
@@ -9772,7 +10529,7 @@ function applyTopHandleHitHeight() {
       sentence: selectedText,       // 书籍场景：上下文即选中文本
       selectedText,
       note,
-      origin: "manual",
+      origin,
       color,
       style,
       type: type || (note && note.trim() ? "annotate" : "highlight"), // 缺省按有无 note 推断
@@ -9851,10 +10608,15 @@ function applyTopHandleHitHeight() {
   // edit 态「批注」按钮：打开该标注的查看气泡（时间 + 原文 + 批注 + 标签 + 即时改色/样式 + 复制/编辑/删除）。
   function onEditAnnotate() {
     if (selToolbar.mode !== "edit" || !selToolbar.annId) return;
+    // 2026-11-03：先把 annId 取到局部 —— 下面 selToolbar 被整体重赋值，
+    // TS 的收窄随之失效（原先直接在重赋值后读 selToolbar.annId ⇒ 可能是 null）。
+    const annId = selToolbar.annId;
+    const annCfi = selToolbar.annCfi || "";
+    const annColor = selToolbar.annColor || "";
     // 2026-08-25 机制级修复：关闭工具栏 + 抑制 selectionchange 重建
     selToolbar = { ...selToolbar, visible: false };
     suppressNextCreateToolbar = true;
-    showViewerForRec({ id: selToolbar.annId, cfi: selToolbar.annCfi || "", color: selToolbar.annColor || "" }, lastSelRect);
+    showViewerForRec({ id: annId, cfi: annCfi, color: annColor }, lastSelRect);
   }
 
   // 「批注」按钮（create 模式）：打开统一批注浮层（mode='create'），文本预览 + 样式/颜色 + note 输入 + 取消/保存。
@@ -10471,7 +11233,7 @@ function applyTopHandleHitHeight() {
       );
       const tr = (res?.[0] || "").trim();
       if (!tr) {
-        toast(t("AI 未返回译文，请稍后重试"), 2400, "error" as any);
+        toast(t("AI 未返回译文，请稍后重试"), 2400, "error");
         return;
       }
 
@@ -10489,7 +11251,7 @@ function applyTopHandleHitHeight() {
 
     } catch (e) {
       console.warn("[REword] 段落 AI 重译失败:", e);
-      toast(t("AI 重译失败，请检查 AI 配置或稍后重试"), 2600, "error" as any);
+      toast(t("AI 重译失败，请检查 AI 配置或稍后重试"), 2600, "error");
     } finally {
       if (btn) {
         btn.disabled = false;
@@ -10632,7 +11394,7 @@ function applyTopHandleHitHeight() {
         // 否则 AI 配置错误/网络/限流被静默吞掉、用户无感知。8 秒冷却防刷屏。
         if (total > 0 && done === 0 && Date.now() - bilingualFailToastAt > 8000) {
           bilingualFailToastAt = Date.now();
-          toast(t("双语翻译失败：请检查「双语翻译 → 腾讯翻译凭据」的密钥与网络"), 3200, "error" as any);
+          toast(t("双语翻译失败：请检查「双语翻译 → 腾讯翻译凭据」的密钥与网络"), 3200, "error");
         }
         if (done >= total) {
           setTimeout(() => {
@@ -10664,7 +11426,7 @@ function applyTopHandleHitHeight() {
       refreshCacheStats(bookId);
       refreshCacheBookList();
     } else {
-      toast(t("请先在「双语翻译 → 腾讯翻译凭据」中配置密钥"), 3200, "info" as any);
+      toast(t("请先在「双语翻译 → 腾讯翻译凭据」中配置密钥"), 3200, "info");
     }
   }
 
@@ -10707,7 +11469,7 @@ function applyTopHandleHitHeight() {
         getLogger().info(
           `[REword][双语] 非英文书籍，不开启双语：bookId=${bookId} source=${detection.source} conf=${detection.confidence}`,
         );
-        toast(t("未识别为英文书籍，双语对照暂不可用"), 2600, "info" as any);
+        toast(t("未识别为英文书籍，双语对照暂不可用"), 2600, "info");
         return;
       }
       getLogger().info(
@@ -10717,7 +11479,7 @@ function applyTopHandleHitHeight() {
       const configured = !isTranslationConfigured || isTranslationConfigured();
       console.log("[REword] 双语: 开启检查, isTranslationConfigured=", configured);
       if (!configured) {
-        toast(t("请先在「双语翻译 → 腾讯翻译凭据」中配置密钥"), 3200, "info" as any);
+        toast(t("请先在「双语翻译 → 腾讯翻译凭据」中配置密钥"), 3200, "info");
         return;
       }
       // 2026-10-14 双语重设计：运行时收敛为**渐进式单模式**——边读边按需翻译、命中即本地缓存。
@@ -10730,7 +11492,7 @@ function applyTopHandleHitHeight() {
       bilingualOn = false;
       bilingualProgress = { done: 0, total: 0, active: false };
       settingsStore.update({ bilingual: false });
-      toast(t("双语功能异常，请重试或重启插件"), 2500, "error" as any);
+      toast(t("双语功能异常，请重试或重启插件"), 2500, "error");
     }
   }
 
@@ -10992,7 +11754,7 @@ function applyTopHandleHitHeight() {
       const fallbackCfi = selInfo?.cfi ?? "";
       if (fallbackCfi) {
         const hit = annStore.getByBook(bookId).find((it: any) => it.cfi === fallbackCfi);
-        if (hit) { stored = annStore.get(hit.id); cfi = hit.cfi; }
+        if (hit) { stored = annStore.get(hit.id); cfi = hit.cfi ?? ""; }
       }
       if ((!stored || !cfi) && fallbackCfi && annByValue.has(fallbackCfi)) {
         const rec = annByValue.get(fallbackCfi)!;
@@ -11531,6 +12293,14 @@ function applyTopHandleHitHeight() {
     if (selHandleLiveRaf) { cancelAnimationFrame(selHandleLiveRaf); selHandleLiveRaf = 0; }
     // 2026-10-12 P1-A：收起动画的到点卸载定时器，组件销毁后不能再跑（回调会写已卸载组件的状态）
     cancelSelToolbarOut();
+    // 2026-11-03 泄漏清理：以下句柄此前只在各自的业务路径里复位，
+    // 组件销毁时未回收 → 每次进出阅读 Tab 残留一个定时器 / 动画帧循环。
+    if (rateSaveTimer != null) { clearTimeout(rateSaveTimer); rateSaveTimer = null; }
+    if (wheelEaseRafId != null) { cancelAnimationFrame(wheelEaseRafId); wheelEaseRafId = null; }
+    if (focusScrollRaf != null) { cancelAnimationFrame(focusScrollRaf); focusScrollRaf = null; }
+    cancelPendingClose(); // pendingCloseRaf：收起动画的到点帧
+    detachBookTransform(); // 书内资源 "data" 钩子（换书后旧 target 上的监听）
+    revokeHostFontBlobs(); // 宿主字体 blob URL（不 revoke 会常驻进程内存）
     if (timeTimer) clearInterval(timeTimer);
     if (attachTimer1) clearTimeout(attachTimer1);
     if (attachTimer2) clearTimeout(attachTimer2);
@@ -11563,6 +12333,8 @@ function applyTopHandleHitHeight() {
     if (typeof window !== "undefined") {
       window.removeEventListener("resize", onDeviceClassResize);
       window.removeEventListener("orientationchange", onDeviceClassResize);
+      // 2026-11-03 泄漏清理：与注册处对称（此前是匿名箭头函数，无法解绑）
+      window.removeEventListener("pointerdown", onGlobalPointerDown, true);
     }
     // 2026-08-30：清理 resize 重排防抖定时器
     if (readerRelayoutTimer) clearTimeout(readerRelayoutTimer);
@@ -11752,7 +12524,6 @@ function applyTopHandleHitHeight() {
             completionTokens={bilingualTokenUsage?.completionTokens ?? null}
             totalTokens={bilingualTokenUsage?.totalTokens ?? null}
             onToggleBilingual={toggleBilingual}
-            onOpenBilingualSettings={openBilingualSettingsPanel}
           />
         {/if}
         <!-- 图书与 PDF 共用：设置 + 搜索 -->
@@ -11800,14 +12571,15 @@ function applyTopHandleHitHeight() {
 
   <!-- 2026-10-08 · 顶栏「把手」：常驻顶部中央的小圆点（对标底栏 .reader-bottom-handle）。
        收起态贴顶显示圆点；展开态被顶栏顶到下方中央，再次点击收起。
+       2026-11-04：两个圆点语义合并 —— 点任意一个都同时开合上下两栏（toggleChrome）。
        ⚠️ 命中区高度由 CSS 的 --reword-top-hit-h 夹到「不越过正文顶边」
        （Readest #4977/#5427：触发区压过第一行会吞掉那里的划词与点击）。 -->
   {#if isTopBarFloating()}
   <button
     class="reader-top-handle"
     class:reader-top-handle-revealed={topBarRevealed}
-    title={topBarRevealed ? t("点击收起顶栏") : t("点击展开顶栏")}
-    on:click={toggleTopBarPin}
+    title={topBarRevealed ? t("点击收起工具栏") : t("点击展开工具栏")}
+    on:click={toggleChrome}
     data-dismiss-ignore
   >
     <span class="reader-top-handle-dot"></span>
@@ -11909,6 +12681,10 @@ function applyTopHandleHitHeight() {
         draggable="false"
         style="transform: translate({imgViewPanX}px, {imgViewPanY}px) scale({imgViewScale})"
         on:dblclick={onImageViewerDblClick}
+        on:contextmenu={(e) => {
+          e.preventDefault();
+          openImageContextMenu(imgView.src, e.clientX, e.clientY);
+        }}
         on:pointerdown={onImageViewerPointerDown}
         on:pointermove={onImageViewerPointerMove}
         on:pointerup={onImageViewerPointerUp}
@@ -11938,6 +12714,17 @@ function applyTopHandleHitHeight() {
         >{t("关闭查看")}</button>
       </div>
     </div>
+  {/if}
+
+  {#if imgCtx.open}
+    <!-- 2026-11-04 图片右键菜单：正文（iframe 内右键）与灯箱共用同一份状态/动作 -->
+    <ImageContextMenu
+      x={imgCtx.x}
+      y={imgCtx.y}
+      onCopy={copyContextImage}
+      onSave={saveContextImage}
+      on:close={closeImageContextMenu}
+    />
   {/if}
 
   {#if showSearch}
@@ -12258,8 +13045,8 @@ function applyTopHandleHitHeight() {
   <!-- 底部控制栏：翻页 + 进度条。独立在 .reader-stage 之外（2026-08-25 修复：
        此前误置于 stage 内，被 position:absolute 的 .reader-container 遮挡 + overflow:hidden 裁切导致不可见）。
        2026-08-30 改造：① 目录 / 书签 / 摘录三个入口已统一上移到顶栏左侧，底栏不再重复摆放；
-       ② 进度条默认完全隐藏（macOS 程序坞机制）：仅鼠标悬浮底部边框热区 或 点击右下角唤出按钮（固定）时平滑显现，
-          移开即自动隐藏；隐藏态移出文档流，绝不遮挡正文文字。 -->
+       ② 进度条默认完全隐藏（macOS 程序坞机制）：纯点击唤起 —— 底部中央圆点与顶部圆点
+          共用一个开关，点任意一个同时浮起上下两栏；隐藏态移出文档流，绝不遮挡正文文字。 -->
   <div
     class="reader-bottom-bar"
     class:bottom-bar-revealed={bottomBarRevealed}
@@ -12288,40 +13075,36 @@ function applyTopHandleHitHeight() {
         max="1000"
         value={Math.round(progress * 1000)}
         style="--progress: {progress * 100}%"
+        title={[progressText, etaText, remainingText].filter(Boolean).join(" · ")}
         on:input={onProgressInput}
         on:change={onProgressChange}
       />
     </div>
-    <!-- 2026-10-07 接通「显示页眉页脚」：章节名（页眉位） -->
+    <!-- 2026-10-07 接通「显示页眉页脚」：章节名（页眉位）。
+         2026-11-04 方案 C：页脚位的剩余章节与 ETA 不再常驻，
+         合并进上面进度条的 title —— 底栏原先把 9 个控件 + 3 段 11px 文字
+         挤在一行，是「显小」的主因；收掉后字号才放得开。 -->
     {#if currentChapterTitle}
       <span class="reader-chapter-name" title={currentChapterTitle}>{currentChapterTitle}</span>
     {/if}
     <span class="reader-progress-text">{progressText}</span>
-    {#if etaText}
-      <span class="reader-eta" title={t("按当前阅读速度估算")}>{etaText}</span>
-    {/if}
-    <!-- 2026-10-07 接通「显示页眉页脚」：剩余章节（页脚位） -->
-    {#if remainingText}
-      <span class="reader-remaining">{remainingText}</span>
-    {/if}
     <button class="reader-btn" title={t("下一页")} on:click={turnNext}>▶</button>
     <button class="reader-btn" title={t("下一章（Alt+→）")} on:click={goNextChapter}>⏩</button>
     <button class="reader-btn" title={t("最后一页（End）")} on:click={goLastPage}>⏭</button>
   </div>
 
-  <!-- 2026-08-30 · 底部进度条「把手」：常驻（dot / both 模式）。
+  <!-- 2026-08-30 · 底部进度条「把手」：常驻底部中央的小圆点。
        收起态在底部中央显示小圆点，点击固定展开；展开态圆点被进度条顶到上方中央，
-       再次点击即可收起（无需去左侧找向下箭头）。hover 模式由底部热区临时唤出，无圆点。 -->
-  {#if settings.layout.bottomBarMode !== "hover"}
+       再次点击即可收起（无需去左侧找向下箭头）。
+       2026-11-04：与顶栏圆点共用一个开关（toggleChrome），点一次上下两栏一起开合。 -->
   <button
     class="reader-bottom-handle"
     class:reader-bottom-handle-revealed={bottomBarRevealed}
-    title={bottomBarRevealed ? t("点击收起进度条") : t("点击展开进度条")}
-    on:click={toggleBottomBarPin}
+    title={bottomBarRevealed ? t("点击收起工具栏") : t("点击展开工具栏")}
+    on:click={toggleChrome}
   >
     <span class="reader-bottom-handle-dot"></span>
   </button>
-  {/if}
 
   <!-- 2026-08-28：连续朗读控制条（参考 Readest 朗读体验） -->
   {#if showTtsBar}
@@ -12726,11 +13509,11 @@ function applyTopHandleHitHeight() {
             class="reader-footnote-jump"
             on:click={jumpToFootnotePage}
             title={t("跳转到脚注所在页")}
-          >↗</button>
+          >{t("跳到脚注")}</button>
         {/if}
         <button class="reader-footnote-close" on:click={closeFootnote} title={t("关闭")}>✕</button>
       </div>
-      <div class="reader-footnote-body">
+      <div class="reader-footnote-body" on:click={onFootnoteBodyClick}>
         {#if footnoteLoading && !footnoteHTML}
           <div class="reader-footnote-loading">⌛ {t("脚注加载中…")}</div>
         {:else}
@@ -12766,7 +13549,7 @@ function applyTopHandleHitHeight() {
       <!-- annEditor 卡片内容已移除（无调用方） -->
 
   {#if toastMsg}
-    <div class="reader-toast">
+    <div class="reader-toast" class:reader-toast--error={toastKind === "error"}>
       <span>{toastMsg}</span>
       {#if toastUndo}
         <button class="reader-toast-undo" on:click={undoDelete}>{t("撤销")}</button>
@@ -12783,6 +13566,10 @@ function applyTopHandleHitHeight() {
    */
 
   .reader-view {
+    /* 2026-11-04 方案 C：顶栏浮起后的底沿锚点（基准档 = 8 顶距 + 44 栏高 + 2 呼吸）。
+       所有靠顶浮层（backdrop / 抽屉 / 搜索 / 设置 / ⋯ / 把手）统一消费此变量，
+       宽屏档在文件末尾覆写为 59px —— 改顶栏尺寸只需动这一处，避免六处锚点各自漂移。 */
+    --reword-chrome-top: 54px;
     display: flex;
     flex-direction: column;
     /* 2026-08-24 修复（方案 B）：改为相对 flex 子项撑满 holder，
@@ -12817,12 +13604,12 @@ function applyTopHandleHitHeight() {
        （旧的 auto|1fr|auto 会被左右不等宽的工具组挤偏，视觉上不居中。） */
     grid-template-columns: 1fr minmax(0, auto) 1fr;
     align-items: center;
-    gap: 6px;
-    padding: 6px 8px;
+    gap: 8px;
+    padding: 8px 10px;
     /* 2026-08-29 Phase 1：顶部安全区（刘海 / 灵动岛） */
-    padding-top: calc(6px + env(safe-area-inset-top, 0px));
-    padding-left: calc(8px + env(safe-area-inset-left, 0px));
-    padding-right: calc(8px + env(safe-area-inset-right, 0px));
+    padding-top: calc(8px + env(safe-area-inset-top, 0px));
+    padding-left: calc(10px + env(safe-area-inset-left, 0px));
+    padding-right: calc(10px + env(safe-area-inset-right, 0px));
     /* 2026-08-28 B2：柔和底 + 细边 + 轻投影，提升原生感（仍低于思源原生 UI） */
     background: var(--b3-theme-surface, var(--b3-theme-background, #fff));
     border-bottom: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
@@ -12852,9 +13639,9 @@ function applyTopHandleHitHeight() {
    */
   .reader-toolbar-floating {
     position: absolute;
-    top: 6px;
-    left: 6px;
-    right: 6px;
+    top: 8px;
+    left: 8px;
+    right: 8px;
     /* z-index 高于 stage(0) / backdrop(1) / floating-layer(2)，与底栏(5)同级；
        圆点把手(7)在其之上。仍远低于思源原生 UI（同底栏的取值口径）。
        2026-10-24 Phase 1：z 值 token 化（--rz-*，见 reader-ui.less 分层表），下同。 */
@@ -12933,15 +13720,15 @@ function applyTopHandleHitHeight() {
   .reader-top-handle:hover {
     opacity: 1;
   }
-  /* 浮起态：从顶部 4px 上移到顶栏下方中央（顶栏高约 30 + 6px 顶距 + 8px 间隔）。
-     与底栏把手的 .reader-bottom-handle-revealed{bottom:56px} 对称。 */
+  /* 浮起态：从顶部 4px 上移到顶栏下方中央（消费顶栏底沿变量，
+     与底栏把手的 .reader-bottom-handle-revealed 对称）。 */
   .reader-top-handle.reader-top-handle-revealed {
-    top: 44px;
+    top: var(--reword-chrome-top, 54px);
   }
   .reader-top-handle-dot {
     display: block;
-    width: 7px;
-    height: 7px;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: var(--b3-theme-on-surface, #666);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
@@ -13040,7 +13827,7 @@ function applyTopHandleHitHeight() {
   /* 书名与章节之间的分隔点（章节名与书名相同时整组不渲染） */
   .reader-title-sep {
     color: var(--b3-theme-on-surface-light, #888);
-    font-size: 12px;
+    font-size: 13px;
     flex-shrink: 0;
   }
   /* ⚠️ 2026-10-08：这条**只服务「顶栏悬浮」关闭时的旧行为**（topBarFloating=false，
@@ -13060,9 +13847,9 @@ function applyTopHandleHitHeight() {
     background: none;
     border: none;
     cursor: pointer;
-    font-size: 13px;
+    font-size: 15px;
     line-height: 1;
-    padding: 5px 7px;
+    padding: 6px 8px;
     border-radius: var(--b3-border-radius-s, 6px);
     color: var(--b3-theme-on-background, #333);
     transition: background 150ms ease, color 150ms ease;
@@ -13078,7 +13865,7 @@ function applyTopHandleHitHeight() {
      全局 src/reader/reader-controls.less（2026-09-02）——这些 DOM 现在由
      BookToolbar / PdfToolbar 渲染，Svelte scoped 样式命中不到子组件内部元素。 */
   .reader-title {
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 500;
     /* 2026-08-30 改造：grid 居中布局，去掉 34% 硬上限，让 ellipsis 由父容器 .reader-toolbar-title 的 min-width:0 控制 */
     max-width: 100%;
@@ -13130,7 +13917,7 @@ function applyTopHandleHitHeight() {
     max-width: 40%;
   }
   .reader-chapter {
-    font-size: 12px;
+    font-size: 13px;
     color: var(--b3-theme-on-surface-light, #888);
     /* 2026-10-10：原为 max-width:36% —— 章节名被硬限在很窄的宽度，
        「4. 越笨...」这类稍长的章节名必然被截断（真机反馈）。
@@ -13148,7 +13935,7 @@ function applyTopHandleHitHeight() {
     flex: 1;
   }
   .reader-progress {
-    font-size: 12px;
+    font-size: 13px;
     color: var(--b3-theme-on-surface-light, #888);
     min-width: 36px;
     text-align: right;
@@ -13163,14 +13950,11 @@ function applyTopHandleHitHeight() {
      transparent 而非无背景，确保可接收点击（pointer-events 默认 auto）。 */
   .reader-backdrop {
     position: absolute;
-    /* ⚠️ 2026-10-08 顶栏浮层化：34 → 44。
-     * 旧值 34 是「顶栏在文档流里占 34px」的硬编码锚点。
-     * 顶栏浮起时它是 `top: 6px + 高约 30px = 底沿约 36px` 的**浮层**，
-     * backdrop 若还从 34 开始，就会**盖住顶栏最下方的 2~10px**
-     * —— 那段区域点空白会命中 backdrop（关抽屉）而不是顶栏按钮，
-     * 顶栏下沿会变成一条「点不动的死带」。
-     * 44 = 浮起态顶栏底沿(≈36) + 8px 余量，稳定覆盖不到交互元素。 */
-    top: 44px;
+    /* ⚠️ 靠顶锚点必须跟随顶栏真实高度（2026-11-04 方案 C 起统一走
+     * --reword-chrome-top）。顶栏是浮层，backdrop 若从栏内开始，
+     * 那段区域点空白会命中 backdrop（关抽屉）而不是顶栏按钮，
+     * 顶栏下沿会变成一条「点不动的死带」。 */
+    top: var(--reword-chrome-top, 54px);
     left: 0;
     right: 0;
     bottom: 0;
@@ -14234,6 +15018,11 @@ function applyTopHandleHitHeight() {
     align-items: center;
     gap: 10px;
   }
+  /* 2026-11-03：error 类提示（失败/异常）加红色描边，与普通 info 提示一眼可分。 */
+  .reader-toast--error {
+    border: 1px solid rgba(255, 120, 120, 0.85);
+    color: #ffd9d9;
+  }
   .reader-toast-undo {
     pointer-events: auto;
     border: none;
@@ -14550,15 +15339,15 @@ function applyTopHandleHitHeight() {
   /* 2026-08-30 改造：3 个抽屉（.reader-toc / .reader-bookmarks / .reader-annots）
      位置保持原样（相对 .reader-view 顶部、左 8px），但加统一角标 + 入场动效
      抽屉在 top-level 渲染（不是 toolbar 子元素），所以仍用 .reader-view 作定位上下文
-     ⚠️ 2026-10-08 顶栏浮层化：top 36 → 44。
-     * 旧值是「顶栏在文档流里占位」的锚点；浮层化后顶栏是 `top: 6px` 的浮层，
-     * 底沿在 36px 附近。原值会让抽屉**压到顶栏下方、角标插进栏身里**，
+     ⚠️ 顶栏浮层化后，抽屉起点必须跟随栏高（--reword-chrome-top）；
+     * 写死旧值会让抽屉**压到顶栏下方、角标插进栏身里**，
      * 看起来像抽屉从栏里长出来（其实是被盖住一截）。 */
   .reader-toc,
   .reader-bookmarks,
   .reader-annots,
   .reader-marks {
-    top: 44px;         /* 略大于浮起态顶栏底沿（top 6 + 高约 30 = 36），留 8px 呼吸 + 角标 */
+    /* 顶栏浮层底沿 + 2px 呼吸（高度变化由 --reword-chrome-top 统一托管） */
+    top: var(--reword-chrome-top, 54px);
     left: 8px;
     max-height: 70vh;
     display: flex;
@@ -14574,10 +15363,10 @@ function applyTopHandleHitHeight() {
     animation: reader-drawer-in 180ms ease-out;
   }
   /* 2026-10-24 移动端适配 Phase 2.1：紧凑顶栏 ⋯ 溢出菜单（isCompactToolbar 时右组收敛）。
-     锚定顶栏右组（top:44px 与各抽屉一致；right:8px 对齐 ⋯ 按钮列）。
+     锚定顶栏右组（与各抽屉同用 --reword-chrome-top；right:8px 对齐 ⋯ 按钮列）。
      触屏命中区 ≥44px（同 (pointer:coarse) 基线，菜单项无条件放大——菜单本就是手机入口）。 */
   .reader-more-menu {
-    top: 44px;
+    top: var(--reword-chrome-top, 54px);
     right: 8px;
     left: auto;
     width: 216px;
@@ -15175,18 +15964,13 @@ function applyTopHandleHitHeight() {
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
-  .reader-eta {
-    font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #888);
-    flex-shrink: 0;
-  }
 
   .reader-search {
     /* 2026-10-23 修复：搜索面板原本硬编码在左下角（bottom/left），
        但 2026-10-08 顶栏浮层化把 🔍 按钮移到了顶栏右上角，导致
        「按钮右上、面板左下」对角错位。这里对齐 🔍 改为 top/right。
        width 用 min() 适配窄屏，避免溢出视口。 */
-    top: 44px;
+    top: var(--reword-chrome-top, 54px);
     right: 8px;
     width: min(300px, 92vw);
     /* z-index 从 .reader-popover 继承的 2 提到 3：划词工具栏容器
@@ -15416,8 +16200,11 @@ function applyTopHandleHitHeight() {
     border-radius: 5px;
     color: var(--b3-theme-primary, #378add);
     cursor: pointer;
-    padding: 1px 7px;
+    /* 2026-10-27：纯「↗」图标太隐蔽（用户没发现这是跳转入口），改文字
+       「跳到脚注」并加大一档（padding/字重），让它在一排小按钮里先被看见 */
+    padding: 2px 9px;
     font-size: 12px;
+    font-weight: 600;
     line-height: 1.5;
     flex-shrink: 0;
   }
@@ -15447,10 +16234,12 @@ function applyTopHandleHitHeight() {
   .reader-footnote-body :global(a) {
     color: var(--b3-theme-primary, #0f6bff);
     text-decoration: none;
-    /* 气泡内链接（如脚注里的「返回正文 ↩」锚点）在容器层无目标上下文，点击会触发
-       思源页面异常导航；气泡仅为展示，禁用其点击（文字仍可读/可复制）。 */
-    pointer-events: none;
-    cursor: default;
+    /* 2026-10-27 链接接管：此前 pointer-events:none 一刀切禁点，「[1]」回链/
+       裸 URL 看着像链接、点了没反应（用户报障）。现在点击统一由
+       onFootnoteBodyClick 接管（书内链 → view.goTo，外链 → 系统浏览器），
+       浏览器默认导航不再触达，思源页面异常导航由接管层根除。 */
+    cursor: pointer;
+    overflow-wrap: anywhere; /* 长 URL 换行，不撑破气泡 */
   }
   .reader-footnote-body :global(a:hover) {
     text-decoration: underline;
@@ -15467,9 +16256,9 @@ function applyTopHandleHitHeight() {
   .reader-settings {
     /* 2026-08-25 紧凑化：4 大分组 26+ setting-row 弹窗高度溢出，max-height 提到 80vh、宽度 300px、
        padding/gap 减小 40% 左右，保证 4 大分组一屏可览 70% 内容 */
-    /* ⚠️ 2026-10-08 顶栏浮层化：34 → 44。旧值是「顶栏占位」的锚点；
-       浮层化后顶栏底沿在 36px 附近，原值会把设置面板顶栏压住一截。 */
-    top: 44px;
+    /* ⚠️ 顶栏是浮层：面板起点必须跟随栏高（--reword-chrome-top），
+       写死旧值会把设置面板顶栏压住一截。 */
+    top: var(--reword-chrome-top, 54px);
     right: 8px;
     width: 300px;
     padding: 8px;
@@ -16295,10 +17084,10 @@ function applyTopHandleHitHeight() {
   .reader-bottom-bar {
     display: flex;
     align-items: center;
-    gap: 4px;
-    padding: 5px 8px;
+    gap: 6px;
+    padding: 8px 10px;
     /* 2026-08-29 Phase 1：底部安全区（Home Indicator） */
-    padding-bottom: calc(5px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(8px + env(safe-area-inset-bottom, 0px));
     /* 2026-08-28 B2：悬浮药丸条质感——思源 surface 底 + 圆角 + 柔和投影，
        替代原 border-top 直条，更贴合思源原生工具栏观感。
        2026-10-07：底栏改为**纯浮层**（浮在文字上层、盖住部分正文，正文不动），
@@ -16316,9 +17105,9 @@ function applyTopHandleHitHeight() {
        移出文档流（absolute + translateY(140%)）以免占据/遮挡阅读高度；
        显现时从底部平滑滑入、覆盖底部，隐藏态不拦截任何事件、不挡正文。 */
     position: absolute;
-    left: 6px;
-    right: 6px;
-    bottom: 6px;
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
     z-index: var(--rz-toolbar);
     opacity: 0;
     pointer-events: none;
@@ -16345,7 +17134,7 @@ function applyTopHandleHitHeight() {
   }
   /* 收起按钮：进度条左上角，点击即收起（解除固定） */
   .reader-bottom-collapse {
-    font-size: 14px;
+    font-size: 15px;
     line-height: 1;
     padding: 0 7px;
     color: var(--b3-theme-on-surface-light, #888);
@@ -16381,14 +17170,14 @@ function applyTopHandleHitHeight() {
   .reader-bottom-handle:hover {
     opacity: 1;
   }
-  /* 展开态：从底部 8px 上移到进度条上方中央（进度条高约 40px + 6px 底距） */
+  /* 展开态：从底部 8px 上移到进度条上方中央（基准栏高 44 + 16 呼吸） */
   .reader-bottom-handle.reader-bottom-handle-revealed {
-    bottom: 56px;
+    bottom: 68px;
   }
   .reader-bottom-handle-dot {
     display: block;
-    width: 7px;
-    height: 7px;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: var(--b3-theme-on-surface, #666);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
@@ -16477,7 +17266,7 @@ function applyTopHandleHitHeight() {
     position: absolute;
     top: 50%;
     width: 2px;
-    height: 9px;
+    height: 10px;
     margin-left: -1px;
     background: var(--b3-theme-on-surface-light, rgba(128, 128, 128, 0.6));
     border-radius: 1px;
@@ -16489,7 +17278,7 @@ function applyTopHandleHitHeight() {
     -webkit-appearance: none;
     appearance: none;
     width: 100%;
-    height: 5px;
+    height: 6px;
     border-radius: 999px;
     background: linear-gradient(to right,
       var(--b3-theme-primary, #378add) 0%,
@@ -16503,7 +17292,7 @@ function applyTopHandleHitHeight() {
   }
   /* 跨浏览器：细滑块圆点 + 主色填充（webkit / firefox） */
   .reader-progress-bar::-webkit-slider-runnable-track {
-    height: 5px;
+    height: 6px;
     border-radius: 999px;
     background: linear-gradient(to right,
       var(--b3-theme-primary, #378add) 0%,
@@ -16515,16 +17304,16 @@ function applyTopHandleHitHeight() {
   .reader-progress-bar::-webkit-slider-thumb {
     -webkit-appearance: none;
     appearance: none;
-    width: 13px;
-    height: 13px;
-    margin-top: -4px;
+    width: 15px;
+    height: 15px;
+    margin-top: -4.5px;
     border-radius: 50%;
     background: var(--b3-theme-primary, #378add);
     border: 2px solid var(--b3-theme-background, #fff);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
   }
   .reader-progress-bar::-moz-range-track {
-    height: 5px;
+    height: 6px;
     border-radius: 999px;
     background: linear-gradient(to right,
       var(--b3-theme-primary, #378add) 0%,
@@ -16534,34 +17323,33 @@ function applyTopHandleHitHeight() {
     );
   }
   .reader-progress-bar::-moz-range-thumb {
-    width: 13px;
-    height: 13px;
+    width: 15px;
+    height: 15px;
     border-radius: 50%;
     background: var(--b3-theme-primary, #378add);
     border: 2px solid var(--b3-theme-background, #fff);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
   }
   .reader-progress-text {
-    font-size: 11px;
+    font-size: 12px;
     color: var(--b3-theme-on-surface-light, #888);
     min-width: 34px;
     text-align: right;
   }
 
-  /* 2026-10-07 · 底栏页眉/页脚位（接通 showHeaderFooter，此前是完全死设置）。
-     章节名与剩余章节各占一段，宽度用 flex:1 分摊，避免把翻页按钮挤出可视区。 */
-  .reader-chapter-name,
-  .reader-remaining {
-    font-size: 11px;
+  /* 2026-10-07 · 底栏页眉位（showHeader）。2026-11-04 方案 C：
+     页脚位的「剩余章节」与 ETA 不再常驻（最挤的一排），
+     合并进进度条的 title，底栏只留章节名 + 百分比。 */
+  .reader-chapter-name {
+    font-size: 12px;
     color: var(--b3-theme-on-surface-light, #888);
     /* 章节名可能很长；单行截断 + 完整名挂 title（避免底栏被长标题撑变形） */
     max-width: 30%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    flex: 0 1 auto;
   }
-  .reader-chapter-name { flex: 0 1 auto; }
-  .reader-remaining { flex: 0 0 auto; white-space: nowrap; }
 
   .reader-error {
     position: absolute;
@@ -16638,5 +17426,72 @@ function applyTopHandleHitHeight() {
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
     pointer-events: none;
     white-space: nowrap;
+  }
+
+  /* ================================================================
+   * 2026-11-04 方案 C · 上下栏视觉放大（宽屏档）
+   * ----------------------------------------------------------------
+   * 基准档（所有设备）：按钮/书名 15、章节 13、底栏文字 12、轨道 6、内边距 6–8。
+   * 本档只在「宽屏 + 鼠标」再放一档：按钮/书名 16、章节 14、底栏文字 13、轨道 7。
+   * 两栏都是浮层 —— 增高只改覆盖范围，不参与分页几何，正文不重排。
+   * ⚠️ 改这里的栏高必须同步 --reword-chrome-top 与底栏把手的展开偏移，
+   *    它们都按「顶距 8 + 栏高 + 呼吸」推导（49 + 8 = 57 → 59；底栏 57 + 16 → 73）。
+   * ================================================================ */
+  @media (min-width: 900px) and (pointer: fine) {
+    .reader-view {
+      --reword-chrome-top: 59px;
+    }
+    .reader-toolbar {
+      gap: 9px;
+      padding: 9px 12px;
+      padding-top: calc(9px + env(safe-area-inset-top, 0px));
+      padding-left: calc(12px + env(safe-area-inset-left, 0px));
+      padding-right: calc(12px + env(safe-area-inset-right, 0px));
+    }
+    .reader-btn {
+      font-size: 16px;
+      padding: 7px 9px;
+    }
+    .reader-title {
+      font-size: 16px;
+    }
+    .reader-chapter,
+    .reader-title-sep {
+      font-size: 14px;
+    }
+    .reader-bottom-bar {
+      gap: 9px;
+      padding: 9px 12px;
+      padding-bottom: calc(9px + env(safe-area-inset-bottom, 0px));
+    }
+    .reader-bottom-collapse {
+      font-size: 16px;
+    }
+    .reader-progress-text,
+    .reader-chapter-name {
+      font-size: 13px;
+    }
+    .reader-chapter-tick {
+      height: 11px;
+    }
+    .reader-progress-bar,
+    .reader-progress-bar::-webkit-slider-runnable-track {
+      height: 7px;
+    }
+    .reader-progress-bar::-webkit-slider-thumb {
+      width: 16px;
+      height: 16px;
+      margin-top: -4.5px;
+    }
+    .reader-progress-bar::-moz-range-track {
+      height: 7px;
+    }
+    .reader-progress-bar::-moz-range-thumb {
+      width: 16px;
+      height: 16px;
+    }
+    .reader-bottom-handle.reader-bottom-handle-revealed {
+      bottom: 73px;
+    }
   }
 </style>

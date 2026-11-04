@@ -94,28 +94,26 @@ export type NoteInsertPosition = "clipboard" | "doc";
 export type NoteTemplatePreset = "simple" | "heading" | "quote" | "custom";
 /** 进度样式：分数（如 5/100）/ 页码（如 12）/ 百分比（如 5%） */
 export type ReaderProgressStyle = "fraction" | "page" | "percent";
-/** 底部进度条「程序坞」唤出方式（2026-08-30）：小圆点常驻 / 悬浮热区 / 两者 */
-export type ReaderBottomBarMode = "dot" | "hover" | "both";
-
-/** 排版预设（2026-08-30）：一键套用边距 / 行距 / 段距 / 字距组合（与边距预设 LAYOUT_PRESETS 并存，维度更全） */
-export type ReaderTypographyPreset = "compact" | "comfort" | "spacious" | "picture";
 
 /** 文本设置（2026-08-24 新增） */
 export interface ReaderTextSettings {
   /** 字重 100-900，step 100（默认 400） */
   fontWeight: number;
   /**
-   * 字距0 ~ 4 px，step 0.5（默认 0）
+   * 字距 0 ~ 0.3 em，step 0.01（默认 0）
    *
    * 2026-10-07 **去掉负值区间**（原 -1 ~ 4）。
    * 原因：`letter-spacing` 作用在**所有相邻字符之间（含词内）**，
    * 负值会让西文单词的字母互相粘连（`word` 的 w 与 o 挤在一起）。
    * 要调「词与词之间的疏密」应该用下面的 `wordSpacing`，那才是正确的旋钮。
    * Readest 的 letterSpacing 区间同样是 0~2。
+   *
+   * ⚠️ 2026-11-04 由 px 改 em：px 不随字号缩放 —— 17px 下 1px≈0.059em，
+   * 调到 22px 只剩 0.045em，同一档观感会漂。老档由 `_migrateSpacingEm` 迁移。
    */
   letterSpacing: number;
   /**
-   * 词间距 0 ~ 8 px，step 0.5（默认 0）
+   * 词间距 0 ~ 0.6 em，step 0.01（默认 0）
    *
    * 2026-10-07 新增（对标 Readest 的 `wordSpacing`，我们此前完全没有）。
    * 只作用在词与词之间，不影响词内 letter-spacing。
@@ -188,8 +186,6 @@ export interface ReaderLayoutSettings {
   showProgress: boolean;
   /** 进度样式（默认 fraction） */
   progressStyle: ReaderProgressStyle;
-  /** 底部进度条「程序坞」唤出方式（默认 both：小圆点常驻 + 悬浮热区） */
-  bottomBarMode: ReaderBottomBarMode;
   /**
    * 顶栏悬浮（默认 true，2026-10-08）。
    *
@@ -642,10 +638,17 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
   // 2026-10-06 设置弹窗补齐：夜间阅读痛点两项
   invertImagesInDark: false, // 深色主题下图片反色
   overrideBookColor: false, // 覆盖书籍自带配色
-  // 分类字体默认值（对齐 Readest 面板默认：衬线=霞鹜文楷 / 无衬线=微软雅黑 / 等宽=Fira Code）
+  // 2026-11-01 拉丁/中文分工（对标 Readest）：
+  //   衬线/无衬线两槽改为**西文首选**（Readest 默认 serifFont='Bitter'/sansSerifFont='Roboto'，
+  //   都是真·拉丁字体）。此前默认本身就是中文字体（衬线=霞鹜文楷 / 无衬线=苹方）⇒
+  //   英文正文被中文字体的**拉丁字形**接管（宽、圆、字腔扁），这是英文观感不如
+  //   Readest 的首要原因。
+  //   中文改由「中文字体」槽（defaultCJKFont）承担：浏览器**按字符逐个回退**，
+  //   拉丁字符命中西文首选、汉字落到中文槽 —— 天然分离，无需两套排版。
+  //   ⚠️ 存量设置档靠 _migrateFontChain 迁移（把旧默认的中文字体搬进中文槽）。
   defaultFontFamily: "serif",
-  serifFont: "霞鹜文楷",
-  sansSerifFont: "苹方",
+  serifFont: "Georgia",
+  sansSerifFont: "Helvetica Neue",
   monospaceFont: "Fira Code",
   defaultCJKFont: "",
   overridePublisherFont: true,
@@ -764,7 +767,6 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
     showFooter: true,
     showProgress: true,
     progressStyle: "fraction",
-    bottomBarMode: "both",
     // 2026-10-08 新增：顶栏浮层化。默认开—— 用户明确要求「上面这个栏也做成悬浮的，
     // 在上面做一个圆点，点击就展开」，且收起时文字更靠近上边框、更有阅读感。
     topBarFloating: true,
@@ -819,10 +821,36 @@ export const DEFAULT_FONT_FAMILY_PRESETS: Record<
  * 排序原则：思源笔记常用字体 → macOS → Windows → 跨平台开源 → 通用兜底。
  * 静态预设覆盖主流场景；未命中的字体浏览器自动跳过，由链尾 CJK 兜底栈接管。
  * 2026-10-14 方案 A：用 document.fonts 动态枚举 + 合并到 Svelte store，下拉自动更新。
+ *
+ * 2026-11-01 拉丁/中文分离（Readest 对标）：
+ *   此前衬线池 10 个中文 + 3 个西文、无衬线池 6 个中文 + 5 个西文，且**默认值本身
+ *   就是中文字体**（衬线=霞鹜文楷 / 无衬线=苹方）。后果：英文正文被中文字体的
+ *   拉丁字形接管（霞鹜文楷的拉丁是宽/圆的 Lato 系）——实测这是英文观感不如
+ *   Readest 的**首要原因**（Readest 默认 serifFont='Bitter'，真·拉丁衬线）。
+ *   ⇒ 衬线/无衬线两槽改为**西文优先**，中文集中到「中文字体」槽（defaultCJKFont）。
+ *   浏览器按**字符**逐个回退：拉丁字符命中西文首选，中文字符落到中文槽 —— 天然分离。
  */
 
-/** 衬线链候选池 */
-export const SERIF_FONT_PRESETS: string[] = [
+/** 西文衬线候选池（英文正文首选；2026-11-01 与中文池分离） */
+export const SERIF_LATIN_PRESETS: string[] = [
+  "Georgia",
+  "Times New Roman",
+  "Literata",
+  "Merriweather",
+  "Charter",
+  "Iowan Old Style",
+  "Baskerville",
+  "Hoefler Text",
+  "Palatino",
+  "Cambria",
+  "Constantia",
+  "PT Serif",
+  "Source Serif 4",
+  "EB Garamond",
+];
+
+/** 中文字体衬线候选池（中文槽 + 衬线链尾部兜底） */
+export const CJK_SERIF_PRESETS: string[] = [
   "霞鹜文楷",
   "LXGW WenKai",
   "LXGW WenKai Screen",
@@ -832,14 +860,30 @@ export const SERIF_FONT_PRESETS: string[] = [
   "Source Han Serif CN",
   "Noto Serif CJK SC",
   "Noto Serif SC",
-  "Georgia",
-  "Times New Roman",
-  "Literata",
-  "Merriweather",
 ];
 
-/** 无衬线链候选池 */
-export const SANS_SERIF_FONT_PRESETS: string[] = [
+/** 衬线链候选池（西文优先）：衬线字体下拉 + 衬线链回退用 */
+export const SERIF_FONT_PRESETS: string[] = [
+  ...SERIF_LATIN_PRESETS,
+  ...CJK_SERIF_PRESETS,
+];
+
+/** 西文无衬线候选池（英文正文首选；2026-11-01 与中文池分离） */
+export const SANS_SERIF_LATIN_PRESETS: string[] = [
+  "Helvetica Neue",
+  "Helvetica",
+  "Arial",
+  "Roboto",
+  "Open Sans",
+  "Noto Sans",
+  "PT Sans",
+  "Segoe UI",
+  "Verdana",
+  "Tahoma",
+];
+
+/** 中文字体无衬线候选池（中文槽 + 无衬线链尾部兜底） */
+export const CJK_SANS_SERIF_PRESETS: string[] = [
   "苹方",
   "PingFang SC",
   "微软雅黑",
@@ -847,10 +891,12 @@ export const SANS_SERIF_FONT_PRESETS: string[] = [
   "思源黑体",
   "Source Han Sans CN",
   "Noto Sans SC",
-  "Helvetica",
-  "Arial",
-  "Roboto",
-  "Open Sans",
+];
+
+/** 无衬线链候选池（西文优先） */
+export const SANS_SERIF_FONT_PRESETS: string[] = [
+  ...SANS_SERIF_LATIN_PRESETS,
+  ...CJK_SANS_SERIF_PRESETS,
 ];
 
 /** 等宽链候选池（代码块 / <pre> / <code> 专用） */
@@ -1019,42 +1065,6 @@ export const PROGRESS_STYLE_PRESETS: Record<ReaderProgressStyle, { label: string
   percent: { label: t("百分比"), hint: t("如 5%") },
 };
 
-/** 底部进度条「程序坞」唤出方式（2026-08-30） */
-export const BOTTOM_BAR_MODE_PRESETS: Record<ReaderBottomBarMode, { label: string; hint: string }> = {
-  dot: { label: t("小圆点"), hint: t("底部中央常驻小圆点，点击展开进度条") },
-  hover: { label: t("悬浮"), hint: t("平时收起，鼠标移至阅读器底部边框才平滑显现") },
-  both: { label: t("两者"), hint: t("小圆点常驻 + 悬浮热区都能唤出") },
-};
-
-/**
- * 排版预设（2026-08-30）：一行选「紧凑 / 舒适 / 宽松 / 绘本」，一键套用
- * 边距（上下/左右）+ 行距 + 段距 + 字距的组合，免去逐个拖滑块。
- * - compact  紧凑：小边距、小行距，适合手机小屏或想多装字。
- * - comfort  舒适（默认基线）：适中边距行距，通读最舒服。
- * - spacious 宽松：大边距、大行距，适合大屏 / 长时间阅读。
- * - picture  绘本：图文书（儿童绘本 / 画册）友好——边距适中、行距略紧、
- *   段距偏小，让文图更紧凑成块（避免短句被拉太散）。
- */
-export const READER_TYPO_PRESETS: Record<
-  ReaderTypographyPreset,
-  {
-    label: string;
-    hint: string;
-    lineHeight: number;
-    letterSpacing: number;
-    marginTopPx: number;
-    marginBottomPx: number;
-    marginLeftPx: number;
-    marginRightPx: number;
-    paragraphSpacing: number;
-  }
-> = {
-  compact: { label: t("紧凑"), hint: t("小边距小行距，适合手机小屏"), lineHeight: 1.5, letterSpacing: 0, marginTopPx: 8, marginBottomPx: 8, marginLeftPx: 12, marginRightPx: 12, paragraphSpacing: 0.5 },
-  comfort: { label: t("舒适"), hint: t("适中边距行距，通读最舒服"), lineHeight: 1.7, letterSpacing: 0.2, marginTopPx: 16, marginBottomPx: 16, marginLeftPx: 18, marginRightPx: 18, paragraphSpacing: 0.8 },
-  spacious: { label: t("舒展"), hint: t("大边距大行距，适合大屏长读"), lineHeight: 1.9, letterSpacing: 0.4, marginTopPx: 28, marginBottomPx: 28, marginLeftPx: 30, marginRightPx: 30, paragraphSpacing: 1.2 },
-  picture: { label: t("绘本"), hint: t("图文书友好，文图紧凑成块"), lineHeight: 1.55, letterSpacing: 0, marginTopPx: 12, marginBottomPx: 12, marginLeftPx: 14, marginRightPx: 14, paragraphSpacing: 0.6 },
-};
-
 /** 8 款预设主题 + 自定义（参考 sireader 色板） */
 export const THEME_PRESETS: Record<ReaderTheme, { label: string; bg: string; fg: string; fg2: string }> = {
   light: { label: t("默认"), bg: "#ffffff", fg: "#222222", fg2: "#888888" },
@@ -1075,58 +1085,106 @@ export const LINE_WIDTH_PRESETS: Record<ReaderLineWidth, { label: string; paddin
   wide: { label: t("宽"), padding: "2em 0.6em" },
 };
 
-/* ================= 2026-09-25 页面宽度三档预设（用户定稿：铺满 95% / 正常 80% / 宽松 70%） =================
- * 语义从「四边 px 边距」改为「内容宽度占视口百分比」：widthPct 驱动 body 左右 padding =
- * (100-pct)/2 %（随窗口伸缩，见 reader-style.ts layoutMarginStyles）。
- * 点击预设时须同时关掉「跟随思源页边」，否则左右边距会被宿主 padding 覆盖（点击无效的根因）。
- * margins 只保留上/下两边（px）；custom 仅作 UI 态（拖「页面宽度」滑块即进入该态）。
+/* ================= 阅读预设（2026-11-04 重构：固定三档，打包「页宽 + 节奏」） =================
+ *
+ * 语义：一键套用 widthPct + 上下边距 + 行距 + 段距 + 字距。
+ * 「自定义」不是档位，而是「三项以上被手动改过」的状态（见 detectLayoutPreset），
+ * UI 只渲染三格，进入自定义态时以文字提示 —— 这样档位永远清晰。
+ *
+ * 点击预设时须同时关掉「跟随思源页边」并切回 pct 模式：
+ *   · 跟随思源页边 → 左右边距会被宿主 padding 覆盖；
+ *   · fixed 模式 → widthPct 被执行层忽略。
+ * 两者都是「点了没反应」的历史根因（真机报障过）。
  */
-export type ReaderLayoutPreset = "fill" | "normal" | "loose" | "custom";
+export const LAYOUT_PRESET_KEYS = ["fill", "normal", "loose"] as const;
+export type ReaderLayoutPresetKey = (typeof LAYOUT_PRESET_KEYS)[number];
+/** custom = 与任一档都不完全一致（不落盘，纯派生状态） */
+export type ReaderLayoutPreset = ReaderLayoutPresetKey | "custom";
+
 /**
- * 排版预设（一键套用边距 / 行距 / 段距 / 字距组合）
+ * 三档参数。
  *
  * 2026-10-07 边距口径统一为「上下比左右宽」（对标 Readest `DEFAULT_BOOK_LAYOUT`：
  * 上下 44 / 左右 16）。此前「正常」档上下只给 16~20，与左右同量级 ——
  * 真机观感是正文紧贴上下框线，扫行起止没有呼吸感。
+ *
+ * ⚠️ 2026-10-08 校准：normal 档的边距 / 行距 / 段距 / 字距必须与
+ * `READER_DEFAULT_SETTINGS` **逐项相等**，否则点「标准」会把用户/出厂的
+ * 默认值打回旧值（历史上就发生过 marginBottom 44 被打回 36）。
+ * 有测试锁住这一点。
  */
 export const LAYOUT_PRESETS: Record<
-  ReaderLayoutPreset,
-  { label: string; widthPct: number; margins: { top: number; right: number; bottom: number; left: number } }
+  ReaderLayoutPresetKey,
+  {
+    label: string;
+    hint: string;
+    widthPct: number;
+    margins: { top: number; right: number; bottom: number; left: number };
+    lineHeight: number;
+    paragraphSpacing: number;
+    /** em（随字号缩放） */
+    letterSpacing: number;
+  }
 > = {
-  // ⚠️ 2026-10-08 校准：这三档的上下边距必须与
-  // `READER_DEFAULT_SETTINGS.layout` 保持一致，否则用户点一下预设
-  // 就会把刚调好的边距打回旧值。
-  //
-  //## 真实踩坑（不是预防性担忧，是已发生的 bug）
-  // 上一轮把默认下边距从 32 提到 44（对齐 Readest），但 normal 档
-  // 仍是 bottom: 36。宿主 `path === "__preset"` 会一次性覆写
-  // marginTopPx / marginBottomPx ⇒ **点「正常」预设，44px 被打回 36px**。
-  //
-  //## 校准后的设计意图
-  //  · normal = **出厂默认**（点了等于没动，只把宽度设成 80%）
-  //  · fill   = 上下更紧，但仍留呼吸，不贴框线
-  //  · loose  = 上下更宽，适合大屏与慢读
-  // 「上下 > 上下」的递增关系必须保持 —— 那是用户判断「更宽松」的依据。
-  //
-  // 有测试锁住「normal.top === 默认 top」与「normal.bottom === 默认 bottom」，
-  // 改默认值时会被抓到。
-  //
-  // ⚠️ 2026-10-08 顶栏浮层化：normal.top 随默认上边距 32 → 24 同步下调，
-  //   fill.top 24 → 16（保持 normal > fill 的递增关系，否则「铺满」看起来反而更松）。
-  fill: { label: t("铺满"), widthPct: 95, margins: { top: 16, right: 16, bottom: 32, left: 12 } },
-  normal: { label: t("正常"), widthPct: 80, margins: { top: 24, right: 24, bottom: 44, left: 20 } },
-  loose: { label: t("宽松"), widthPct: 70, margins: { top: 56, right: 56, bottom: 64, left: 48 } },
-  // ⚠️ custom 的 margins 全部为 0，但宿主对 custom **不覆写任何字段**
-  //（见 ReaderView 的 `path === "__preset"` 分支）——
-  // 它的语义是「退出预设接管」，真实值由面板上那6 个滑块决定。
-  // 若真按 0 覆写，正文会上下左右全部贴框线（用户反复投诉过的观感）。
-  custom: { label: t("自定义"), widthPct: 80, margins: { top: 0, right: 0, bottom: 0, left: 0 } },
+  fill: {
+    label: t("紧凑"),
+    hint: t("页宽铺满、行距段距收紧，一屏装更多字"),
+    widthPct: 92,
+    margins: { top: 16, right: 16, bottom: 32, left: 12 },
+    lineHeight: 1.55,
+    paragraphSpacing: 0.5,
+    letterSpacing: 0,
+  },
+  normal: {
+    label: t("标准"),
+    hint: t("出厂默认的页宽与节奏，长读最稳"),
+    widthPct: 80,
+    margins: { top: 24, right: 24, bottom: 44, left: 20 },
+    lineHeight: 1.7,
+    paragraphSpacing: 0.8,
+    letterSpacing: 0,
+  },
+  loose: {
+    label: t("宽松"),
+    hint: t("窄页宽、大行距大段距，适合大屏慢读"),
+    widthPct: 68,
+    margins: { top: 40, right: 40, bottom: 60, left: 36 },
+    lineHeight: 1.9,
+    paragraphSpacing: 1.3,
+    letterSpacing: 0.02,
+  },
 };
 
-/** 根据内容宽度百分比反推当前落在哪个预设（都不匹配则「自定义」） */
-export function detectLayoutPreset(layout: ReaderLayoutSettings): ReaderLayoutPreset {
-  for (const key of ["fill", "normal", "loose"] as ReaderLayoutPreset[]) {
-    if (layout.widthPct === LAYOUT_PRESETS[key].widthPct) return key;
+/**
+ * 反查当前落在哪一档（全部被预设接管的键都相等才算命中）。
+ *
+ * 只比 widthPct 会出现「行距早被改过、档位还亮着」的谎报，所以这里逐项比对。
+ * 固定书页 / 跟随思源页边时页宽不由 widthPct 决定 ⇒ 一律视为自定义。
+ */
+export function detectLayoutPreset(input: {
+  layout?: ReaderLayoutSettings;
+  lineHeight?: number;
+  paragraph?: ReaderParagraphSettings;
+  text?: ReaderTextSettings;
+}): ReaderLayoutPreset {
+  const layout = input?.layout;
+  if (!layout) return "custom";
+  if (layout.widthMode === "fixed") return "custom";
+  if (layout.followSiyuanMargin === true) return "custom";
+  const near = (a: number | undefined, b: number) =>
+    Math.abs(Number(a) - b) < 1e-6;
+  for (const key of LAYOUT_PRESET_KEYS) {
+    const p = LAYOUT_PRESETS[key];
+    if (
+      near(layout.widthPct, p.widthPct) &&
+      near(layout.marginTopPx, p.margins.top) &&
+      near(layout.marginBottomPx, p.margins.bottom) &&
+      near(input.lineHeight, p.lineHeight) &&
+      near(input.paragraph?.paragraphSpacing, p.paragraphSpacing) &&
+      near(input.text?.letterSpacing, p.letterSpacing)
+    ) {
+      return key;
+    }
   }
   return "custom";
 }
@@ -1156,6 +1214,8 @@ export interface ReaderSettingsLike {
   update(patch: Partial<ReaderSettings>): ReaderSettings;
   subscribe(run: (value: ReaderSettings) => void, invalidate?: (value?: ReaderSettings) => void): () => void;
   load(): Promise<void>;
+  /** 重置为默认（按 scope 重置整份设置；2026-11-03 补进接口 —— 实现早有，此处是调用方唯一入口） */
+  resetAll(): void;
 }
 
 export class ReaderSettingsStore {
@@ -1274,6 +1334,61 @@ export class ReaderSettingsStore {
     data.__migratedTextAlign = true;
   }
 
+  /**
+   * 存量设置迁移：拉丁/中文字体分工（2026-11-01，对标 Readest）。
+   *
+   * ## 背景
+   * 旧版的「衬线 / 无衬线」两槽默认值本身就是**中文字体**（衬线=霞鹜文楷 / 无衬线=苹方），
+   * 而浏览器是**按字符逐个回退**的：中文正文没问题，但**英文正文也被中文字体的拉丁字形
+   * 接走了**（霞鹜文楷/苹方的拉丁是宽、圆、字腔扁的一路）⇒ 英文书的观感明显不如
+   * Readest（Readest 两槽默认都是真·拉丁字体，中文另设 defaultCJKFont 槽）。
+   *
+   * ## 处理
+   * 只在「该槽仍等于**历史默认值**」时才动（沿用 _migrateMargins 的口径：
+   * 用户自己挑过的值一律尊重）：
+   *   · serifFont    === "霞鹜文楷"（旧默认）→ 换成 "Georgia"，并把它搬进「中文字体」槽
+   *   · sansSerifFont === "苹方"  （旧默认）→ 换成 "Helvetica Neue"，并把它搬进「中文字体」槽
+   * 「中文字体」槽只有一个，若两个槽都是旧默认，则按当前正文族（衬线/无衬线）取对应的那个，
+   * 保证**升级前后中文观感不变**（中文仍是同一个字体），只有英文换成拉丁字体。
+   *
+   * ⚠️ 已知取舍：用户在旧版里**主动**把「苹方」选成无衬线正文时，本迁移也会把它搬走 ——
+   *   设置档无法区分「沿用默认」与「主动挑选」。但搬迁后该字体仍在链上（中文槽），
+   *   中文观感不变，只有英文的字体来源改变 —— 这正是本次修复的目标，可接受。
+   */
+  private _migrateFontChain(data: any): void {
+    if (!data || typeof data !== "object") return;
+    // 幂等标记：本迁移只应执行一次
+    if (data.__migratedFontChain === true) return;
+    data.__migratedFontChain = true;
+
+    const OLD_SERIF_DEFAULT = "霞鹜文楷";
+    const OLD_SANS_DEFAULT = "苹方";
+    const NEW_SERIF_DEFAULT = "Georgia";
+    const NEW_SANS_DEFAULT = "Helvetica Neue";
+
+    const serif = typeof data.serifFont === "string" ? data.serifFont.trim() : "";
+    const sans = typeof data.sansSerifFont === "string" ? data.sansSerifFont.trim() : "";
+    const cjk = typeof data.defaultCJKFont === "string" ? data.defaultCJKFont.trim() : "";
+
+    const serifIsOld = serif === OLD_SERIF_DEFAULT;
+    const sansIsOld = sans === OLD_SANS_DEFAULT;
+    if (!serifIsOld && !sansIsOld) return;
+
+    // 中文槽只塞一个：两个槽都是旧默认时按正文族取；否则取被迁走的那个
+    let movedCJK = "";
+    if (serifIsOld && sansIsOld) {
+      movedCJK = (data.defaultFontFamily ?? "serif") === "serif" ? OLD_SERIF_DEFAULT : OLD_SANS_DEFAULT;
+    } else if (serifIsOld) {
+      movedCJK = OLD_SERIF_DEFAULT;
+    } else {
+      movedCJK = OLD_SANS_DEFAULT;
+    }
+    // 中文槽已有用户指定值 → 不覆盖，只换拉丁槽
+    if (!cjk) data.defaultCJKFont = movedCJK;
+    if (serifIsOld) data.serifFont = NEW_SERIF_DEFAULT;
+    if (sansIsOld) data.sansSerifFont = NEW_SANS_DEFAULT;
+  }
+
   private _migrateMargins(data: any): void {
     // ⚠️ OLD_DEFAULTS 必须**枚举全部历史默认值**，不是只列第一个。
     //   只写 16 的话：已在上一轮迁到 32 的档（本项目实测档就是 32）
@@ -1301,6 +1416,32 @@ export class ReaderSettingsStore {
     }
   }
 
+  /**
+   * 存量设置迁移：字距 / 词距 px → em（2026-11-04）。
+   *
+   * ## 为什么要改
+   * px 不随字号缩放：17px 下 1px ≈ 0.059em，调到 22px 只剩 0.045em ——
+   * 同一档设置在换字号后观感会漂，用户会以为「字距自己变了」。
+   *
+   * ## 换算口径
+   * `em = px / fontSize`（缺字号时退回出厂 17px），并按 UI 步长 0.005 吸附，
+   * 保证「默认字号下升级前后视觉一致」。原有值为 0 的保持 0（不产生声明）。
+   */
+  private _migrateSpacingEm(data: any): void {
+    if (!data || typeof data !== "object") return;
+    if (data.__migratedSpacingEm === true) return;
+    data.__migratedSpacingEm = true;
+    const text = data.text;
+    if (!text || typeof text !== "object") return;
+    const base = Number(data.fontSize) > 0 ? Number(data.fontSize) : READER_DEFAULT_SETTINGS.fontSize;
+    for (const key of ["letterSpacing", "wordSpacing"] as const) {
+      const v = Number(text[key]);
+      if (!Number.isFinite(v) || v === 0) continue;
+      const em = Math.round(v / base / 0.005) * 0.005;
+      text[key] = Math.max(0.005, Math.round(em * 1000) / 1000);
+    }
+  }
+
   /** 旧数据 → 补齐默认值（顶层 + text/paragraph/layout/note 子对象逐层合并） */
   private _mergeDefaults(data: any): ReaderSettings {
     this._migrateTheme(data);
@@ -1314,6 +1455,11 @@ export class ReaderSettingsStore {
     }
     this._migrateMargins(data);
     this._migrateTextAlign(data);
+    // 2026-11-04：字距/词距 px → em（依赖 fontSize，须在合并默认值前跑）。
+    this._migrateSpacingEm(data);
+    // 2026-11-01：拉丁/中文字体分工迁移（把旧默认的中文字体搬进「中文字体」槽）。
+    // 放在最后：它依赖 defaultFontFamily 与另两个字体槽的**旧值**，需在其它迁移后判定。
+    this._migrateFontChain(data);
     return {
       ...READER_DEFAULT_SETTINGS,
       ...data,
@@ -1391,17 +1537,17 @@ export class ReaderSettingsStore {
 
   /** 双分片作用域视图：duck-typed 与 ReaderSettingsStore 同签名（get/update/subscribe/load），
    *  但读写固定路由到指定 scope——ReaderView 及其子组件零改动即可按 Tab 类型隔离。 */
-  scopeView(scope: ReaderSettingsScope): {
-    get(): ReaderSettings;
-    update(patch: Partial<ReaderSettings>): ReaderSettings;
-    subscribe(run: (value: ReaderSettings) => void, invalidate?: (value?: ReaderSettings) => void): () => void;
-    load(): Promise<void>;
-  } {
+  scopeView(scope: ReaderSettingsScope): ReaderSettingsLike {
     return {
       get: () => this.get(scope),
       update: (patch) => this.update(patch, scope),
       subscribe: (run, invalidate) => this.subscribe(run, invalidate, scope),
       load: () => this.load(),
+      // 2026-11-03：scopeView 此前**没有** resetAll，而 ReaderView 的「重置阅读设置」
+      // 调的正是 settingsStore.resetAll()，settingsStore 传进来的又是 scopeView 的返回值
+      // ⇒ 点该按钮直接 TypeError（resetAll is not a function）。
+      // 语义与本体一致：两个分片一起恢复出厂。
+      resetAll: () => this.resetAll(),
     };
   }
 

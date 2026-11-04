@@ -188,12 +188,14 @@ export class AnnEditor {
               }
               this.opts.onEmptyChange?.(!hasContent);
             };
+            // 2026-11-03 泄漏清理：先记录元素引用再注册监听，
+            // 否则 destroy() 若在此刻被调用，this.wysiwygEl 还没指向新元素 → 解绑不到。
+            this.wysiwygEl = wysiwyg;
             wysiwyg.addEventListener("input", refreshEmpty);
             const obs = new MutationObserver(() => refreshEmpty());
             obs.observe(wysiwyg, { childList: true, subtree: true, characterData: true });
             this.emptyObserver = obs;
             this.inputHandler = refreshEmpty;
-            this.wysiwygEl = wysiwyg;
             refreshEmpty();
             p.focus();
           }

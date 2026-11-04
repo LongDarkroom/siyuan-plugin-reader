@@ -21,6 +21,8 @@ import {
   READER_FONT_SIZE_MAX,
   THEME_PRESETS,
   LAYOUT_PRESETS,
+  LAYOUT_PRESET_KEYS,
+  detectLayoutPreset,
   FONT_MODE_PRESETS,
   SERIF_FONT_PRESETS,
   SANS_SERIF_FONT_PRESETS,
@@ -49,6 +51,7 @@ export type Ctrl =
   | "colorRow" // 取色器 + 快速色块
   | "swatches" // 色板宫格（主题）
   | "segmented" // 分段按钮（二选一/多选一）
+  | "presetCards" // 整宽预设卡（标题 + 指标副标，三档并列）
   | "chips" // 胶囊标签（多值单选，比 segmented 更宽松、可换行）
   | "entry" // 文本输入
   | "action" // 入口按钮（打开二级页，不落值）
@@ -80,8 +83,11 @@ export interface RowDef {
   step?: number;
   /** 单位后缀（如 px / % / em） */
   unit?: string;
-  /** 下拉选项 */
-  options?: { value: string | number; label: string; bg?: string; fg?: string }[];
+  /**
+   * 下拉 / 分段 / 预设卡选项。
+   * `meta` 仅 presetCards 用：卡片第二行的指标副标（如「页宽 80% · 行距 1.7」）。
+   */
+  options?: { value: string | number; label: string; bg?: string; fg?: string; meta?: string }[];
   /** 选项来源：静态数组或 Svelte store（字体列表等动态选项） */
   optionsFrom?: readonly string[] | import("svelte/store").Writable<string[]> | import("svelte/store").Writable<{ value: string; label: string }[]>;
   /** 条件显示 */
@@ -108,6 +114,14 @@ export interface RowDef {
    * 真实取值交给 readonlyPath。
    */
   readonlyPath?: string;
+  /**
+   * 派生取值（2026-11-04）。
+   *
+   * 虚拟 path（`__preset` 这类不落盘的 UI 态）需要「显示什么」由当前设置反查：
+   * 预设的选中档 = detectLayoutPreset(settings)。声明成函数而不是在控件里特判，
+   * 让 schema 仍是唯一真源（新增派生行不必改 RowControl）。
+   */
+  valueFrom?: (settings: any, extra: any) => any;
   /** 依赖的外部数据（如 TTS 配置、readerMode） */
   needs?: "tts" | "readerMode";
   /**
@@ -192,16 +206,12 @@ export interface RowDef {
    * - fontSizeSync  「跟随思源 / 自定义」二选一：schema 用 "sync"/"custom"
    *                 两个可读值，设置字段是布尔 fontSizeSync → 控件内转换
    */
-  transform?:
-    | "marginPair"
-    // 注：`widthWithMode` 已于 2026-10-08 删除 —— 它只有声明没有实现
-    // （RowControl 从不读它），留着会让人以为标签会随模式切换。
-    | "themeColor"
-    | "ttsEngine"
-    | "layoutPreset"
-    | "dictManager"
-    | "translateEngine"
-    | "fontSizeSync";
+  // 2026-11-03：收窄为「真正被实现」的两个。
+  // 历史遗留：`widthWithMode`(2026-10-08 已删)、`ttsEngine`(2026-10-06 已删)、
+  // 以及 themeColor / layoutPreset / dictManager / translateEngine / glossary / cache
+  // 都只有声明没有实现 —— RowControl 只读 marginPair 与 fontSizeSync（见 RowControl.svelte:204/281），
+  // 留着会让人以为这些行有 transform 行为。
+  transform?: "marginPair" | "fontSizeSync";
 }
 
 /** 分组（小节标题 + 卡片容器） */
@@ -448,6 +458,9 @@ export const TABS: TabDef[] = [
             ctrl: "select",
             optionsFrom: serifFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
+            // 2026-11-01 拉丁/中文分工：这两槽是**西文**槽（英文正文走这里），
+            // 汉字由「中文字体」槽接手（浏览器按字符逐个回退）。
+            hint: t("英文正文的衬线字体（西文）；汉字走「中文字体」"),
           },
           {
             path: "sansSerifFont",
@@ -455,6 +468,7 @@ export const TABS: TabDef[] = [
             ctrl: "select",
             optionsFrom: sansSerifFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
+            hint: t("英文正文的无衬线字体（西文）；汉字走「中文字体」"),
           },
           {
             path: "monospaceFont",
@@ -475,7 +489,7 @@ export const TABS: TabDef[] = [
             // 2026-10-14 方案 A：CJK 也改为动态 store，但首项保留翻译标签。
             optionsFrom: cjkFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
-            hint: t("插在每条字体链的次位；留空则用跨平台中文兜底栈"),
+            hint: t("插在每条字体链的西文段之后（汉字自动回退到此）；留空则用跨平台中文兜底栈"),
           },
         ],
       },
@@ -507,6 +521,32 @@ export const TABS: TabDef[] = [
     label: t("布局"),
     icon: ICON_LAYOUT,
     groups: [
+      {
+        // 2026-11-04：预设从 Tab 底部移到最前 —— 它一键套用的正是下面所有滑块的组合，
+        // 放底部等于「先让你拖十个滑块，最后才告诉你有一键」。
+        // 只渲染三档（custom 不是档位，而是派生状态）。
+        rows: [
+          {
+            path: "__preset",
+            label: t("阅读预设"),
+            ctrl: "presetCards",
+            hint: t("一键套用页宽、边距、行距与段距；之后仍可用下方滑块微调（改动后显示为自定义）"),
+            // 选中档由当前设置反查：不再依赖一个永远不存在的 settings 字段
+            valueFrom: (s) => detectLayoutPreset(s ?? {}),
+            options: LAYOUT_PRESET_KEYS.map((k) => {
+              const p = LAYOUT_PRESETS[k];
+              return {
+                value: k,
+                label: p.label,
+                meta: t("页宽 {w}% · 行距 {h}", { w: p.widthPct, h: p.lineHeight.toFixed(1) }),
+              };
+            }),
+            // PDF 是固定版式，排版设置不生效（fixed-layout 不接 setStyles）——
+            // 显示一排点了没反应的预设比不显示更糟。
+            showIf: (_s, extra) => extra?.readerMode !== "pdf",
+          },
+        ],
+      },
       {
         rows: [
           // M1 合并：旧的「排版让位」同时充当 Readest 的「覆盖版式布局」+「使用书籍排版」
@@ -595,18 +635,22 @@ export const TABS: TabDef[] = [
       {
         title: t("段落"),
         rows: [
-          { path: "paragraph.paragraphSpacing", label: t("段间距"), ctrl: "stepper", min: 0, max: 3, step: 0.1 },
+          { path: "paragraph.paragraphSpacing", label: t("段间距"), ctrl: "stepper", min: 0, max: 3, step: 0.1,
+            hint: t("以字号为单位的倍数：0.8 倍约 14px，1.3 倍约 22px") },
           { path: "lineHeight", label: t("行间距"), ctrl: "stepper", min: 1, max: 2.6, step: 0.1 },
           // 从旧「文本设置」移来（Readest 把它放在布局里）
           //
           // 2026-10-07：字间距去掉负值（原 min: -1）。
           // letter-spacing 作用在**所有相邻字符之间（含词内）**，负值会让西文单词
           // 的字母粘连。Readest 的区间同样是 0 起的正值。
-          { path: "text.letterSpacing", label: t("字间距"), ctrl: "stepper", min: 0, max: 4, step: 0.5, unit: "px" },
+          // 2026-11-04：单位 px → em。px 不随字号缩放（17px 下 1px≈0.059em，
+          // 22px 下只剩 0.045em），同一档设置在换字号后观感会漂。
+          { path: "text.letterSpacing", label: t("字间距"), ctrl: "stepper", min: 0, max: 0.3, step: 0.01, unit: "em",
+            hint: t("随字号缩放；1em = 一个汉字宽") },
           // 词间距（Readest 有，我们此前完全没有）：
           // 只作用在词与词之间，是调西文/中英混排疏密的正确旋钮。
-          { path: "text.wordSpacing", label: t("词间距"), ctrl: "stepper", min: 0, max: 8, step: 0.5, unit: "px",
-            hint: t("只调整单词之间的间隔，不影响单词内部的字距") },
+          { path: "text.wordSpacing", label: t("词间距"), ctrl: "stepper", min: 0, max: 0.6, step: 0.01, unit: "em",
+            hint: t("只调整单词之间的间隔，不影响单词内部的字距；随字号缩放") },
           { path: "paragraph.textIndent", label: t("首行缩进"), ctrl: "stepper", min: 0, max: 4, step: 0.1, unit: "em" },
           // N2/N3 补齐：Readest 有，我们完全没有
           // 2026-10-07 接通：此前两端对齐是**完全死设置**（执行层硬编码 justify）。
@@ -685,19 +729,6 @@ export const TABS: TabDef[] = [
           { path: "layout.showFooter", label: t("底栏显示剩余章节"), ctrl: "switch" },
         ],
       },
-      {
-        title: t("快捷预设"),
-        rows: [
-          // D11 建议保留：一键还原出厂排版，实用
-          {
-            path: "__preset",
-            label: t("排版预设"),
-            ctrl: "segmented",
-            transform: "layoutPreset",
-            options: Object.entries(LAYOUT_PRESETS).map(([value, v]) => ({ value, label: (v as any).label ?? value })),
-          },
-        ],
-      },
     ],
   },
 
@@ -737,7 +768,6 @@ export const TABS: TabDef[] = [
             path: "theme",
             label: t("配色"),
             ctrl: "swatches",
-            transform: "themeColor",
             // 2026-10-07 对齐 Readest 色板：每格用该档**真实 bg/fg** 上色，
             // 让用户「看见颜色」而不是只读文字名。
             // 顺序「默认 → 亮色系 → 暗色系 → 自定义」。
@@ -986,7 +1016,6 @@ export const TABS: TabDef[] = [
             path: "__dict",
             label: t("词典管理"),
             ctrl: "action",
-            transform: "dictManager",
             action: "dictManager",
             apply: "dict",
             scope: "global",
@@ -1020,7 +1049,6 @@ export const TABS: TabDef[] = [
             path: "__translateEngine",
             label: t("腾讯翻译凭据"),
             ctrl: "action",
-            transform: "translateEngine",
             action: "translateEngine",
             apply: "translate",
             scope: "global",
@@ -1031,7 +1059,9 @@ export const TABS: TabDef[] = [
             path: "__glossary",
             label: t("术语表"),
             ctrl: "action",
-            transform: "glossary",
+            // 2026-11-03：transform 已删 —— RowControl 只实现了 marginPair /
+            // fontSizeSync（见 RowControl.svelte:204/281），其余 transform 无任何
+            // 代码读取；action 字段才是二级页入口，行为不变。
             action: "glossary",
             apply: "render",
             scope: "global",
@@ -1042,7 +1072,9 @@ export const TABS: TabDef[] = [
             path: "__cache",
             label: t("翻译缓存"),
             ctrl: "action",
-            transform: "cache",
+            // 2026-11-03：transform 已删 —— RowControl 只实现了 marginPair /
+            // fontSizeSync（见 RowControl.svelte:204/281），其余 transform 无任何
+            // 代码读取；action 字段才是二级页入口，行为不变。
             action: "cache",
             apply: "render",
             scope: "global",

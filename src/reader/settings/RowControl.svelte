@@ -23,6 +23,8 @@
     bg?: string;
     /** 色板格前景色（仅 swatches 用） */
     fg?: string;
+    /** 预设卡副标（仅 presetCards 用） */
+    meta?: string;
   }
 
   /** 当前设置对象（顶层 ReaderSettings） */
@@ -77,9 +79,11 @@
    * → 永远 undefined：引擎下拉空白、语速/音高/音量滑块显示 0（safeValue 兜底成 0）、
    * 重新打开面板像「设置丢了」。按前缀路由到 extra 即修好（写回仍走 onChange→宿主）。
    */
-  $: value = (row.readonlyPath ?? row.path).startsWith("tts.")
-    ? getByPath(extra, row.readonlyPath ?? row.path)
-    : getByPath(settings, row.readonlyPath ?? row.path);
+  $: value = row.valueFrom
+    ? row.valueFrom(settings ?? {}, extra ?? {})
+    : (row.readonlyPath ?? row.path).startsWith("tts.")
+      ? getByPath(extra, row.readonlyPath ?? row.path)
+      : getByPath(settings, row.readonlyPath ?? row.path);
 
   /** 控件展示值：数字类缺值时用 0，避免 stepper 渲染出 "undefined" */
   $: safeValue = value === undefined || value === null || Number.isNaN(Number(value)) && typeof value !== "string"
@@ -100,7 +104,9 @@
   $: rawOptions = (() => {
     try {
       if ((row.options ?? []).length > 0) return row.options;
-      if (row.optionsFrom && typeof row.optionsFrom.subscribe === "function") {
+      // optionsFrom 是联合类型（readonly string[] | Writable<...>），只有 store 那一支
+      // 有 subscribe ⇒ 用 in 收窄，不做 as any（2026-11-03）。
+      if (row.optionsFrom && "subscribe" in row.optionsFrom && typeof row.optionsFrom.subscribe === "function") {
         // Svelte store：读 onMount 订阅维护的 storeValue，值变化时 $: 自动重算
         if (!Array.isArray(storeValue)) return [];
         return storeValue.map((v: any) => (typeof v === "string" ? { value: v, label: v } : v));
@@ -279,6 +285,13 @@
 
   /** marginPair 变换：上下边距合一行时，label 显示当前上边距值，作用于 top */
   $: isMarginPair = row.transform === "marginPair";
+  /** 预设卡：整宽三格，选中档由 valueFrom 反查（见 settings-schema 的 __preset 行） */
+  $: isPresetCards = row.ctrl === "presetCards";
+  $: presetCurrent = (() => {
+    if (!isPresetCards) return "";
+    const hit = options.find((o) => String(o.value) === String(segValue));
+    return hit ? hit.label : t("自定义");
+  })();
   $: marginBottom = isMarginPair ? (getByPath(settings, "layout.marginBottomPx") ?? 0) : 0;
   $: displayValue = isMarginPair
     ? (getByPath(settings, row.readonlyPath ?? row.path) ?? 0)
@@ -319,7 +332,12 @@
 </script>
 
 {#if visible}
-  <div class="rw-row" class:rw-row-pair={isMarginPair} class:rw-row-readonly={ro}>
+  <div
+    class="rw-row"
+    class:rw-row-pair={isMarginPair}
+    class:rw-row-wide={isPresetCards}
+    class:rw-row-readonly={ro}
+  >
     <div class="rw-label">
       <span class="rw-label-text">{row.label}</span>
       {#if row.hint}
@@ -405,6 +423,31 @@
               on:click={() => emitSegment(o.value)}
             >{o.label}</button>
           {/each}
+        </div>
+
+      {:else if row.ctrl === "presetCards"}
+        <!-- 整宽三格预设卡。与 segmented 的区别：
+             · 选项少但每个都要带「指标副标」，塞进 176px 控件列必截断；
+             · 选中态来自 valueFrom 反查（settings 里没有这个字段），
+               所以点击后高亮会立刻跟随真实排版变化，而不是只在本地闪一下。 -->
+        <div class="rw-preset-cards" role="group" aria-label={row.label}>
+          {#each options as o}
+            {@const on = String(segValue) === String(o.value)}
+            <button
+              type="button"
+              class="rw-preset-card"
+              class:on
+              disabled={ro}
+              aria-pressed={on}
+              on:click={() => emit(o.value)}
+            >
+              <span class="rw-preset-name">{o.label}</span>
+              {#if o.meta}<span class="rw-preset-meta">{o.meta}</span>{/if}
+            </button>
+          {/each}
+        </div>
+        <div class="rw-preset-current" aria-live="polite">
+          {t("当前：{name}", { name: presetCurrent })}
         </div>
 
       {:else if row.ctrl === "chips"}
