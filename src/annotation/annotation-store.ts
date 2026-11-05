@@ -313,9 +313,21 @@ export function annotationCfis(a: Pick<AnnotationItem, "cfi" | "segments">): str
   return a.cfi ? [a.cfi] : [];
 }
 
-/** 批注去重键（blockId + 句子 + 选中文本，跨会话稳定） */
-export function annotationKey(blockId: string, sentence: string, selectedText = ""): string {
+/**
+ * 批注去重键。
+ *  - 思源正文块：blockId + 句子 + 选中文本（跨会话稳定）。
+ *  - 书籍批注：以 CFI 为身份（同一本书里同一段文字可能出现在多个位置，
+ *    按文本去重会把两处误合成一条，且不会更新 cfi ⇒ 新位置高亮丢失）。
+ */
+export function annotationKey(blockId: string, sentence: string, selectedText = "", cfi?: string): string {
+  const c = normCfiLoose(cfi);
+  if (c && String(blockId).startsWith("book:")) return `${blockId}::@cfi::${c}`;
   return `${blockId}::${sentence}::${selectedText}`;
+}
+
+/** 宽松 CFI 比较（去 epubcfi() 包装 + 互为前缀），与 ReaderView/annotation-visual 同口径 */
+function normCfiLoose(s: unknown): string {
+  return String(s || "").replace(/^epubcfi\(/i, "").replace(/\)+$/, "");
 }
 
 /** 推断批注性质（无显式 type 时按 note 兜底）：有内容 → annotate，否则 highlight */
@@ -451,7 +463,7 @@ export class AnnotationStore {
           segments: sanitizeSegments(item.segments),
         };
         this.items.set(normalized.id, normalized);
-        this.byKey.set(annotationKey(normalized.blockId, normalized.sentence || "", normalized.selectedText || ""), normalized.id);
+        this.byKey.set(annotationKey(normalized.blockId, normalized.sentence || "", normalized.selectedText || "", normalized.cfi), normalized.id);
         this.indexByBlockAdd(normalized);
       }
     }
@@ -525,6 +537,26 @@ export class AnnotationStore {
     return this.byKey.has(annotationKey(blockId, sentence, selectedText));
   }
 
+  /**
+   * 按 CFI 反查某本书的活跃批注（任一段命中即可）。
+   * 默认宽松（互为前缀，兼容 epubcfi() 包装差异）；exact=true 时仅做归一化后相等，
+   * 用于「新选区是否就是已有标注」的绑定判定。
+   */
+  getByCfi(bookId: string, cfi: string, exact = false): AnnotationItem | null {
+    const target = normCfiLoose(cfi);
+    if (!bookId || !target) return null;
+    for (const it of this.getByBook(bookId)) {
+      for (const candidate of annotationCfis(it)) {
+        const c = normCfiLoose(candidate);
+        if (!c) continue;
+        // exact=true：用于「新选区是否就是已有标注」的绑定判定，
+        // 前缀匹配会把「包含关系」的相邻选区误判成同一条。
+        if (c === target || (!exact && (c.startsWith(target) || target.startsWith(c)))) return it;
+      }
+    }
+    return null;
+  }
+
   /** 某块下是否有任意批注 */
   hasBlock(blockId: string): boolean {
     return this.getByBlock(blockId).length > 0;
@@ -556,6 +588,9 @@ export class AnnotationStore {
     if (input.id && this.items.has(input.id)) {
       const prev = this.items.get(input.id)!;
       const note = input.note !== undefined ? cleanNote : prev.note;
+      // 高亮↔批注是同一记录的两个形态：note 变了 type 必须跟着变，
+      // 否则列表徽标永远停在创建时的类型（用户看到「加完笔记还是高亮」）。
+      const nextType = input.type ?? inferType({ ...prev, note });
       const updated: AnnotationItem = {
         ...prev,
         blockId: input.blockId || prev.blockId,
@@ -565,6 +600,7 @@ export class AnnotationStore {
         start: input.start ?? prev.start,
         end: input.end ?? prev.end,
         note,
+        type: nextType,
         noteFormat: "kramdown",
         version: (prev.version ?? 0) + 1,
         origin: input.origin || prev.origin,
@@ -592,15 +628,17 @@ export class AnnotationStore {
       return updated;
     }
 
-    // 2) 按 (blockId, sentence, selectedText) 去重覆盖
-    const key = annotationKey(String(input.blockId), cleanSentence, cleanSelected);
+    // 2) 去重覆盖（书籍按 CFI，正文块按文本）
+    const key = annotationKey(String(input.blockId), cleanSentence, cleanSelected, input.cfi);
     const existingId = this.byKey.get(key);
     if (existingId && this.items.has(existingId)) {
       const prev = this.items.get(existingId)!;
       const note = input.note !== undefined ? cleanNote : prev.note;
+      const nextType = input.type ?? inferType({ ...prev, note });
       const updated: AnnotationItem = {
         ...prev,
         note,
+        type: nextType,
         noteFormat: "kramdown",
         version: (prev.version ?? 0) + 1,
         start: input.start ?? prev.start,
@@ -728,7 +766,7 @@ export class AnnotationStore {
   private reindexKeys(): void {
     this.byKey.clear();
     for (const it of this.items.values()) {
-      this.byKey.set(annotationKey(it.blockId, it.sentence || "", it.selectedText || ""), it.id);
+      this.byKey.set(annotationKey(it.blockId, it.sentence || "", it.selectedText || "", it.cfi), it.id);
     }
   }
 }

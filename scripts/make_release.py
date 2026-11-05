@@ -3,7 +3,7 @@
 
 集市规范：
   - zip 解压后必须【直接】是插件根文件，不能有外层父目录。
-  - 必需：plugin.json, index.js, index.css, icon.png, preview.png, README.md, i18n/（多语言时）。
+  - 必需：plugin.json, index.js, index.css, icon.png, 预览图（plugin.json 的 preview 字段，≤512KB）, README.md, i18n/（多语言时）。
   - 体积建议 < 10MB：词典(dict/，约 64MB) 与废弃 sql.js 资源不随包，运行时按需下载。
     当前实际约 4-5MB：主包 index.js 之外，cmaps/(1.6M) + standard_fonts/(800K)
     为 PDF CJK 渲染必需，虽占 2.4M 但不可省（见下方 INCLUDE_DIRS 注释）。
@@ -21,6 +21,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # [2026-10-25 集市检查修复] 思源集市自动索引对清单字段 icon 声明的 icon.png 有
 # 64.0KB 硬上限（GitHub Actions 开 issue 且索引不更新）。KB 口径与集市一致 = 1024 字节。
 ICON_LIMIT_KB = 64.0
+# 集市预览图上限 512KB（plugin.json 的 preview 字段指向的文件）
+PREVIEW_LIMIT_KB = 512.0
 
 # 直接平铺到 zip 根的【白名单文件】
 INCLUDE_FILES = [
@@ -31,8 +33,7 @@ INCLUDE_FILES = [
     # plugin.json 已声明 kernels: ["all"]，漏掉本文件 → Copilot 看不到 reader 工具。
     "kernel.js",
     "icon.png",
-    "preview.png",
-    "preview.webp",   # plugin.json 的 preview 字段指向此文件（全分辨率 WebP，208KB）
+    "preview.webp",  # plugin.json 的 preview 字段指向此文件（1920×1400 品牌预览图，约 204KB）
     "README.md",
     # [2026-10-26] 版本更新弹窗：升级后弹一次「本次更新了什么」，日志正文来自包内
     # 插件根的 CHANGELOG.md（src/core/changelog.ts 走 POST /api/file/getFile 读
@@ -63,7 +64,7 @@ INCLUDE_DIRS = [
     # copy-dist 的产物，反而正常，故该缺陷长期未被发现）。
     "cmaps",
     "standard_fonts",
-    # README.md 内嵌 `![RE 阅读器](assets/RE-Reader-preview.webp)`；
+    # README.md 内嵌预览图与三步教程图（assets/RE-Reader-tutorial-*.jpg）；
     # 集市详情页从发布包离线渲染 README，图片缺失会显示破图 → 必须随包。
     "assets",
 ]
@@ -155,8 +156,24 @@ def check_icon_size() -> None:
     print(f"[自检] icon.png {kb:.1f}KB ≤ {ICON_LIMIT_KB:.1f}KB 上限，通过")
 
 
+def check_preview_size() -> None:
+    """预览图必须存在且 ≤ 512KB；超限时集市详情页不展示。"""
+    with open(os.path.join(ROOT, "plugin.json"), encoding="utf-8") as f:
+        name = json.load(f).get("preview", "preview.png")
+    fp = os.path.join(ROOT, name)
+    if not os.path.isfile(fp):
+        print(f"[错误] plugin.json 声明的预览图不存在: {name}")
+        sys.exit(1)
+    kb = os.path.getsize(fp) / 1024
+    if kb > PREVIEW_LIMIT_KB:
+        print(f"[错误] {name} 超限：{kb:.1f}KB > {PREVIEW_LIMIT_KB:.1f}KB")
+        sys.exit(1)
+    print(f"[自检] {name} {kb:.1f}KB ≤ {PREVIEW_LIMIT_KB:.1f}KB 上限，通过")
+
+
 def main():
     check_icon_size()
+    check_preview_size()
     paths = collect_paths()
     if not paths:
         print("没有可打包的文件，请先 npm run build")

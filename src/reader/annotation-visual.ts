@@ -33,9 +33,22 @@ export function notifyAnnotationsChanged(bookId: string): void {
   }
 }
 
-/** 与 ReaderView.onShowAnnotation 一致的宽松归一化（去 epubcfi() 包装、去尾部括号） */
+/** 批注气泡 overlay 的 key 前缀（必须与 vendor/foliate-js/view.js 的 NOTE_PREFIX 一致） */
+export const NOTE_KEY_PREFIX = "foliate-note:";
+
+/**
+ * 与 ReaderView.onShowAnnotation 一致的宽松归一化（去 epubcfi() 包装、去尾部括号）。
+ * 2026-11-05：额外剥掉 `foliate-note:` 前缀 —— 批注气泡是独立 overlay key
+ * （`foliate-note:<cfi>`），不剥前缀的话：
+ *   · syncVisualWithStore 会把它当成「无主 overlay」每轮删掉；
+ *   · eraseOverlayKey 删高亮时删不掉气泡。
+ * 剥掉后气泡与其高亮共享同一个归一化身份，删除/对账天然成对。
+ */
 export function normCfi(s: unknown): string {
-  return String(s || "").replace(/^epubcfi\(/i, "").replace(/\)+$/, "");
+  return String(s || "")
+    .replace(/^foliate-note:/i, "")
+    .replace(/^epubcfi\(/i, "")
+    .replace(/\)+$/, "");
 }
 
 /**

@@ -161,6 +161,8 @@ export class ReaderTabController {
         self.plugin?.checkTranslationCacheHits?.(bookId, texts) ?? Promise.resolve(new Array(texts.length).fill(false)),
       isTranslationConfigured: () => !!self.plugin?.isTranslationConfigured?.(),
       getAiSettings: () => (self.plugin as any)?.getAiSettings?.() ?? null,
+      // 2026-11-05：右侧助手 → 思源页签（手机端无页签，ReaderView 也会按 aiOverlay 隐藏入口）
+      onOpenAiTab: (bid: string) => (self.plugin as any)?.openAiTab?.(bid),
       onSaveTencentLock: (chars: number) => (self.plugin as any)?.saveTencentCharsLock?.(chars) ?? Promise.resolve(),
       onSaveAiSettings: (partial: any) => (self.plugin as any)?.updateAiSettings?.(partial) ?? Promise.resolve(),
       onAddToVocab: (w: string) => self.plugin?.getVocabStore?.()?.addWord?.(w),
@@ -316,6 +318,19 @@ export class ReaderTabController {
     }
     const last = records[records.length - 1];
     return { bookId: last[0], comp: last[1].comp, tab: last[1].tab };
+  }
+
+  /** 按书取已挂载的 ReaderView（AI 页签锁定某本时用；未开返回 null） */
+  getReaderComp(bookId: string): any {
+    return bookId ? this.openTabs.get(bookId)?.comp ?? null : null;
+  }
+
+  /** 已打开的阅读器列表（含移动端浮层镜像），供 AI 页签判断「锁定书是否还开着」 */
+  listOpenBooks(): { bookId: string; title: string }[] {
+    return Array.from(this.openTabs.entries()).map(([bookId, rec]) => ({
+      bookId,
+      title: rec.title || "",
+    }));
   }
 
   /** 打开一本书的阅读 Tab；已打开则聚焦（不重复开），未打开则新建并激活 */

@@ -13,7 +13,28 @@ import { getLogger } from "../core/logger.ts";
 import type { AiSettings, AiTransportMode } from "./types.ts";
 import { t as T } from "../i18n/index.ts";
 
-export type AiRole = "system" | "user" | "assistant";
+export type AiRole = "system" | "user" | "assistant" | "tool";
+
+/** 模型发起的一次工具调用（OpenAI 兼容） */
+export interface AiToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    /** JSON 字符串；可能为空串（模型没给参数） */
+    arguments: string;
+  };
+}
+
+/** 提供给模型的工具声明 */
+export interface AiToolDef {
+  type: "function";
+  function: {
+    name: string;
+    description?: string;
+    parameters: Record<string, any>;
+  };
+}
 
 export interface AiMessage {
   role: AiRole;
@@ -21,6 +42,18 @@ export interface AiMessage {
   /** 2026-09-08：用户消息展开后的正文（占位符已替换为块/文档正文），用于多轮发送上下文；
    *  历史恢复时可能缺失，发送前若仍含占位符则兜底展开 */
   expandedContent?: string;
+  /** assistant：本轮发起的工具调用（下一轮必须原样回传给模型） */
+  toolCalls?: AiToolCall[];
+  /** assistant：本轮思考过程。DeepSeek 等推理模型要求工具轮把 reasoning_content 原样回传 */
+  reasoning?: string;
+  /** tool：本消息应答的调用 id */
+  toolCallId?: string;
+}
+
+export interface AiToolOptions {
+  tools?: AiToolDef[];
+  /** 缺省 auto；none 表示本轮禁止调用（用于不支持工具的模型回落） */
+  toolChoice?: "auto" | "none" | "required";
 }
 
 /** token 用量（部分服务商返回；缺失则 undefined） */
@@ -51,7 +84,7 @@ export interface AiTransportResponse {
 /** 可注入的传输实现（生产 = forwardProxyFetch，测试 = mock） */
 export type AiTransport = (req: AiTransportRequest) => Promise<AiTransportResponse>;
 
-export interface AiGenerateOptions {
+export interface AiGenerateOptions extends AiToolOptions {
   messages: AiMessage[];
   settings: AiSettings;
   jsonMode?: boolean;
@@ -70,10 +103,12 @@ export interface AiGenerateResult {
   truncated?: boolean;
   /** token 用量（部分服务商返回；缺失则 undefined） */
   usage?: AiUsage;
+  /** 模型要求调用工具（有值时 content 通常为空） */
+  toolCalls?: AiToolCall[];
 }
 
 /** 流式生成请求参数 */
-export interface AiStreamOptions {
+export interface AiStreamOptions extends AiToolOptions {
   messages: AiMessage[];
   settings: AiSettings;
   jsonMode?: boolean;
@@ -102,6 +137,8 @@ export interface AiStreamResult {
   usage?: AiUsage;
   /** 是否走了内核代理缓冲回退（直连 CORS/网络失败）：UI 可据此提示「缓冲模式」 */
   buffered?: boolean;
+  /** 模型要求调用工具（有值时 content 通常为空） */
+  toolCalls?: AiToolCall[];
 }
 
 /**
@@ -125,18 +162,44 @@ export function buildChatUrl(baseUrl: string): string {
   return raw + "/v1/chat/completions";
 }
 
+/** 把内部消息收敛成 OpenAI 兼容形状：丢掉 expandedContent 等本地字段，补工具字段 */
+export function toApiMessages(messages: AiMessage[]): any[] {
+  return (Array.isArray(messages) ? messages : []).map((m) => {
+    if (m?.role === "tool") {
+      return { role: "tool", tool_call_id: m.toolCallId || "", content: m.content || "" };
+    }
+    if (m?.role === "assistant" && Array.isArray(m.toolCalls) && m.toolCalls.length) {
+      return {
+        role: "assistant",
+        // 空串比 null 兼容面更广（DeepSeek/部分网关只接受字符串）
+        content: m.content || "",
+        tool_calls: m.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: "function",
+          function: { name: tc.function?.name || "", arguments: tc.function?.arguments || "" },
+        })),
+        // 仅推理模型会给 reasoning；DeepSeek 在工具轮缺这个字段会直接 400
+        ...(m.reasoning ? { reasoning_content: m.reasoning } : {}),
+      };
+    }
+    return { role: m?.role || "user", content: m?.content || "" };
+  });
+}
+
 /** 构造 OpenAI 兼容请求体 */
 export function buildRequestBody(
   messages: AiMessage[],
   settings: AiSettings,
-  jsonMode: boolean
+  jsonMode: boolean,
+  tools?: AiToolDef[],
+  toolChoice?: AiToolOptions["toolChoice"],
 ): Record<string, any> {
   // 注：T6 的「按模型覆写参数」不在这里做 —— 本函数是翻译等其他路径的共用入口，
   // 那些路径会显式指定 temperature（如 trTemperature），覆写会把它们盖掉。
   // 覆写只在精读/对话的窄化点 toEngineSettings 生效。
   const body: Record<string, any> = {
     model: settings.model,
-    messages: messages,
+    messages: toApiMessages(messages),
     temperature: settings.temperature,
     max_tokens: settings.maxTokens,
     stream: false,
@@ -148,7 +211,36 @@ export function buildRequestBody(
   if (jsonMode) {
     body.response_format = { type: "json_object" };
   }
+  if (Array.isArray(tools) && tools.length) {
+    body.tools = tools;
+    body.tool_choice = toolChoice || "auto";
+  }
   return body;
+}
+
+/**
+ * 归一化模型返回的 tool_calls。
+ * 缺 id 时补一个本地 id（回传时仍需成对）；arguments 非字符串时序列化。
+ * 没有函数名的条目直接丢弃（无法执行）。
+ */
+export function normalizeToolCalls(raw: any): AiToolCall[] {
+  if (!Array.isArray(raw)) return [];
+  const out: AiToolCall[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const tc = raw[i];
+    const name = String(tc?.function?.name || "").trim();
+    if (!name) continue;
+    let args = tc?.function?.arguments;
+    if (typeof args !== "string") {
+      try { args = args == null ? "" : JSON.stringify(args); } catch { args = ""; }
+    }
+    out.push({
+      id: String(tc?.id || `call_${Date.now().toString(36)}_${i}`),
+      type: "function",
+      function: { name, arguments: args },
+    });
+  }
+  return out;
 }
 
 /**
@@ -412,10 +504,11 @@ export async function fetchModelList(
 ): Promise<string[]> {
   const url = buildModelsUrl(baseUrl);
   if (!url) throw new Error(T("接口地址为空"));
-  if (!apiKey) throw new Error(T("API Key 为空"));
 
+  // 本地模型（Ollama / LM Studio）没有 key，空 key 时不带 Authorization 头；
+  // 带 `Bearer ` 空串会被部分服务端判成凭据错误。
   const headers: Record<string, string> = { Accept: "application/json" };
-  headers["Authorization"] = `Bearer ${apiKey}`;
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
 
   const res = await transport({ url, method: "GET", headers, body: "", timeout });
   if (res.status < 200 || res.status >= 300) {
@@ -454,7 +547,7 @@ export async function requestAIGenerate(
   const url = buildChatUrl(settings.baseUrl);
   if (!url) throw new Error(T("AI baseUrl 为空或无法解析为 chat 端点"));
 
-  const body = buildRequestBody(opts.messages, settings, opts.jsonMode ?? settings.jsonMode);
+  const body = buildRequestBody(opts.messages, settings, opts.jsonMode ?? settings.jsonMode, opts.tools, opts.toolChoice);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (settings.apiKey) headers["Authorization"] = `Bearer ${settings.apiKey}`;
 
@@ -474,10 +567,13 @@ export async function requestAIGenerate(
     }));
   }
 
-  const { content, reasoning } = extractContentFromBody(res.body);
+  const extracted = extractContentFromBody(res.body);
+  let content = extracted.content;
+  const reasoning = extracted.reasoning;
   let model: string | undefined;
   let usage: AiUsage | undefined;
   let truncated = false;
+  let toolCalls: AiToolCall[] = [];
   try {
     const bodyText = res.body || "";
     const j = bodyText.trim() ? JSON.parse(bodyText) : {};
@@ -490,8 +586,11 @@ export async function requestAIGenerate(
       };
     }
     if (j?.choices?.[0]?.finish_reason === "length") truncated = true;
+    toolCalls = normalizeToolCalls(j?.choices?.[0]?.message?.tool_calls);
+    // 纯工具调用时 message.content 为 null：extractContentFromBody 会退化成整个 JSON 串，必须清掉
+    if (toolCalls.length && typeof j?.choices?.[0]?.message?.content !== "string") content = "";
   } catch (__swallowErr) { logSwallow(__swallowErr, "ai-client.ts · try { const j = JSON.parse(res.body); if (typeof j?.model === \"…", "debug"); }
-  return { content, raw: res.body, model, reasoning, usage, truncated };
+  return { content, raw: res.body, model, reasoning, usage, truncated, toolCalls: toolCalls.length ? toolCalls : undefined };
 }
 
 /**
@@ -513,7 +612,7 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
   const url = buildChatUrl(settings.baseUrl);
   if (!url) return { ok: false, content: "", error: T("AI baseUrl 为空或无法解析为 chat 端点") };
 
-  const body = buildRequestBody(opts.messages, settings, opts.jsonMode ?? settings.jsonMode);
+  const body = buildRequestBody(opts.messages, settings, opts.jsonMode ?? settings.jsonMode, opts.tools, opts.toolChoice);
   body.stream = true; // 覆盖 buildRequestBody 中的 stream:false
   // OpenAI/DeepSeek/硅基流动等需要显式声明才会在 SSE 末帧返回 usage
   body.stream_options = { include_usage: true };
@@ -530,6 +629,35 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
   let model: string | undefined;
   let usage: AiUsage | undefined;
   let truncated = false;
+  /**
+   * 流式 tool_calls：按 index 累积（OpenAI 把一次调用的 name/arguments 拆成多帧，
+   * arguments 是逐字符拼接的 JSON 串，只有到末尾才完整）。
+   */
+  const toolAcc = new Map<number, { id: string; name: string; args: string }>();
+  const readToolCalls = (): AiToolCall[] => {
+    const out: AiToolCall[] = [];
+    const keys = Array.from(toolAcc.keys()).sort((a, b) => a - b);
+    for (const k of keys) {
+      const v = toolAcc.get(k)!;
+      if (!v.name) continue;
+      out.push({ id: v.id || `call_${k}`, type: "function", function: { name: v.name, arguments: v.args } });
+    }
+    return out;
+  };
+  /** 直连成功/中断时的统一返回（工具调用按需附带） */
+  const doneResult = (aborted = false): AiStreamResult => {
+    const tcs = readToolCalls();
+    return {
+      ok: true,
+      content: acc,
+      model,
+      reasoning: reason || undefined,
+      truncated,
+      usage,
+      ...(aborted ? { aborted: true } : {}),
+      ...(tcs.length ? { toolCalls: tcs } : {}),
+    };
+  };
 
   // ⏱ 诊断临时日志（2026-09-08）：进入直连流式时的 signal 状态
   getLogger().info("AI 流式直连开始（诊断）", { operation: "AI对话", data: { mode, signalAborted: opts.signal?.aborted ?? null, hasModel: !!settings.model } });
@@ -550,6 +678,22 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
       if (typeof delta?.reasoning_content === "string") {
         reason += delta.reasoning_content;
         opts.onReasoning?.(delta.reasoning_content);
+      }
+      // tool_calls 增量：同一 index 的 arguments 逐帧拼接
+      if (Array.isArray(delta?.tool_calls)) {
+        for (const tc of delta.tool_calls) {
+          const idx = Number.isFinite(Number(tc?.index)) ? Number(tc.index) : toolAcc.size;
+          let cur = toolAcc.get(idx);
+          if (!cur) {
+            cur = { id: "", name: "", args: "" };
+            toolAcc.set(idx, cur);
+          }
+          if (typeof tc?.id === "string" && tc.id) cur.id = tc.id;
+          const fn = tc?.function;
+          // name 正常只出现在首帧；后续帧若重复整名则忽略，避免拼成 "reader_get_statestate"
+          if (typeof fn?.name === "string" && fn.name && !cur.name) cur.name = fn.name;
+          if (typeof fn?.arguments === "string") cur.args += fn.arguments;
+        }
       }
       if (typeof obj?.model === "string") model = obj.model;
       // finish_reason=length 表示被 max_tokens 截断
@@ -588,14 +732,14 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
     // flush 残留：末帧可能没有结尾换行，直接吞掉会丢 content/usage/finish_reason
     if (buf) processLine(buf);
 
-    if (opts.signal?.aborted) return { ok: true, content: acc, model, reasoning: reason || undefined, aborted: true, truncated, usage };
-    return { ok: true, content: acc, model, reasoning: reason || undefined, truncated, usage };
+    if (opts.signal?.aborted) return doneResult(true);
+    return doneResult();
   } catch (e: any) {
     // 用户主动中断：保留已生成的部分内容
-    if (opts.signal?.aborted) return { ok: true, content: acc, model, reasoning: reason || undefined, aborted: true, truncated, usage };
+    if (opts.signal?.aborted) return doneResult(true);
 
-    // 直连未产出任何 token 即失败（多为 CORS / 网络）：回退内核代理缓冲请求
-    if (!acc) {
+    // 直连未产出任何 token/tool_calls 即失败（多为 CORS / 网络）：回退内核代理缓冲请求
+    if (!acc && !toolAcc.size) {
       const directErr = e?.message || String(e);
       if (mode === "direct") {
         // 直连模式：不回退代理，直接报错（用户明确选择直连）
@@ -611,7 +755,7 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
     }
 
     // 已产出部分 token 后中断：返回已得内容（避免丢字）
-    return { ok: true, content: acc, model, reasoning: reason || undefined, truncated, usage };
+    return doneResult();
   }
 }
 
@@ -626,13 +770,29 @@ async function runBufferMode(opts: AiStreamOptions): Promise<AiStreamResult> {
   if (!url) return { ok: false, content: "", error: T("AI baseUrl 为空或无法解析为 chat 端点") };
   try {
     const gen = await requestAIGenerate(
-      { messages: opts.messages, settings, jsonMode: opts.jsonMode ?? settings.jsonMode, timeout: opts.timeout },
+      {
+        messages: opts.messages,
+        settings,
+        jsonMode: opts.jsonMode ?? settings.jsonMode,
+        timeout: opts.timeout,
+        tools: opts.tools,
+        toolChoice: opts.toolChoice,
+      },
       forwardProxyFetch
     );
     if (opts.onToken) {
       await playBufferTypewriter(gen.content, opts.onToken, opts.signal);
     }
-    return { ok: true, content: gen.content, model: gen.model, reasoning: gen.reasoning, truncated: false, usage: gen.usage, buffered: true };
+    return {
+      ok: true,
+      content: gen.content,
+      model: gen.model,
+      reasoning: gen.reasoning,
+      truncated: false,
+      usage: gen.usage,
+      buffered: true,
+      ...(gen.toolCalls?.length ? { toolCalls: gen.toolCalls } : {}),
+    };
   } catch (e2: any) {
     return { ok: false, content: "", error: e2?.message || String(e2) };
   }

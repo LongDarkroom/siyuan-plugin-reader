@@ -21,8 +21,18 @@ import { Plugin, openTab, showMessage, Dialog } from "siyuan";
 import { t, initI18n, saveLang } from "./i18n/index.ts";
 import { ReaderDockController } from "./reader/reader-dock.ts";
 import { getAnnotationStore, initAnnotationStore, flushAnnotationStore } from "./annotation/store-singleton.ts";
+// 2026-11-05 修复「上次标注颜色/线型」记忆断链：onload 必须注入 plugin 并载入配置，
+// 否则 ReaderView 构造时只能拿到内置默认色，且 setLastAnnotationStyle 的落盘因
+// plugin 为 null 被静默丢弃（树摇后连存储键都不在产物里）。
+import {
+  initAnnotationConfig,
+  loadAnnotationConfig,
+  flushAnnotationConfig,
+} from "./annotation/annotation-config.ts";
 // 2026-11-04 AI 桥（方案 B）：内核 MCP 工具 → 前端活动 ReaderView。
 import { initReaderBridge, disposeReaderBridge } from "./ai/reader-bridge.ts";
+// 2026-11-05 AI 页签：把阅读助手提升为思源原生页签（默认跟随活动阅读器）
+import { AiTabController } from "./ai/ai-tab-controller.ts";
 import { installConsoleFilter } from "./core/console-filter.ts";
 import { logSwallow } from "./core/safe.ts";
 import { getLogger } from "./core/logger.ts";
@@ -63,6 +73,8 @@ const TTS_SETTINGS_KEY = "reword-tts.json";
 export class ReaderPlugin extends Plugin {
   /** 阅读器控制器（书架 + 设置 + 字体 + 页签） */
   private readerDock!: ReaderDockController;
+  /** AI 页签控制器（onload 同步注册；阅读器内点「在新页签打开」经 openAiTab 呼出） */
+  private aiTabs!: AiTabController;
   /** 词典管理（含导入接口） */
   private dictManager!: DictManager;
   /** 翻译宿主（引擎链装配 + 按书缓存 + AI 末端） */
@@ -90,6 +102,8 @@ export class ReaderPlugin extends Plugin {
     const readerIcons = [
       // 主图标 / 顶栏 / 页签：展开的书页（与主插件「合拢的书」区分，这是阅读器）
       `<symbol id="iconREReader" viewBox="0 0 1024 1024"><g fill="none" stroke="currentColor" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"><path d="M192 256c128-64 256-80 384-48v560c-128-32-256-16-384 48z"/><path d="M832 256c-128-64-256-80-384-48v560c128-32 256-16 384 48z"/><path d="M512 208v560"/></g></symbol>`,
+      // 2026-11-05 AI 页签：四角星（助手），与阅读书的页签图标区分
+      `<symbol id="iconREAi" viewBox="0 0 1024 1024"><g fill="none" stroke="currentColor" stroke-width="56" stroke-linecap="round" stroke-linejoin="round"><path d="M448 160l64 192 192 64-192 64-64 192-64-192-192-64 192-64z"/><path d="M768 640l24 64 64 24-64 24-24 64-24-64-64-24 64-24z"/></g></symbol>`,
     ];
     let iconsOk = 0;
     for (const sym of readerIcons) {
@@ -117,6 +131,15 @@ export class ReaderPlugin extends Plugin {
         plugin.shelfMounted = false;
       },
     });
+
+    /* AI 页签：同样必须同步注册（onload 之后的 await 会让 addTab 失效）。
+       ReaderTabController 此刻还没建好，用 getter 懒取。 */
+    try {
+      this.aiTabs = new AiTabController(this, () => this.readerDock?.tabController ?? null);
+      this.aiTabs.register();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] AI 页签注册失败", { error: e });
+    }
 
     /* 阅读页签：ReaderTabController 在其构造函数内自行 addTab（同步） */
 
@@ -170,6 +193,15 @@ export class ReaderPlugin extends Plugin {
       initAnnotationStore(this);
     } catch (e) {
       getLogger().warn("[RE 阅读器] 批注 store 初始化失败", { error: e });
+    }
+
+    /* 标注偏好（上次颜色/线型）：必须在任何 ReaderView 构造前载入。
+     * ReaderView 的 lastStyle/lastColor 初值直接读这里，晚一步就会用默认色覆盖记忆。 */
+    try {
+      initAnnotationConfig(this);
+      await loadAnnotationConfig();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 标注偏好载入失败，使用默认值", { error: e });
     }
 
     /* 朗读设置：本插件独立持久化（2026-10-14）。
@@ -390,6 +422,20 @@ export class ReaderPlugin extends Plugin {
       });
     } catch (e) {
       getLogger().warn("[RE 阅读器] 打开书架浮层失败", { error: e });
+    }
+  }
+
+  /**
+   * 打开 AI 页签（阅读器右侧助手的「在新页签打开」按钮）。
+   *
+   * 默认跟随活动阅读器 —— 用户点哪本书的助手，那本书的阅读窗口就是活动的，
+   * 因此不需要在这里预锁定；要钉住某一本时用页签头的「锁定本书」。
+   */
+  openAiTab(_bookId?: string): void {
+    try {
+      this.aiTabs?.open();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 打开 AI 页签失败", { error: e });
     }
   }
 
@@ -720,6 +766,12 @@ export class ReaderPlugin extends Plugin {
     } catch {
       /* 桥未绑定时忽略 */
     }
+    // 2026-11-05：先关 AI 页签（其轮询会读取活动 ReaderView），再销毁阅读器
+    try {
+      this.aiTabs?.dispose();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 卸载时关闭 AI 页签失败", { error: e });
+    }
     try {
       this.readerDock?.dispose();
     } catch (e) {
@@ -734,6 +786,8 @@ export class ReaderPlugin extends Plugin {
     }
     // 2026-10-13：批注落盘（防抖窗口内可能挂起的批注变更）
     void flushAnnotationStore();
+    // 2026-11-05：上次标注色/线型同样可能卡在 300ms 防抖窗口里
+    try { flushAnnotationConfig(); } catch (e) { logSwallow(e, "index.ts · onunload · flushAnnotationConfig", "debug"); }
     // 2026-10-14：摘除深链接监听（与 onload 里 eventBus.on 配对）
     try {
       this.eventBus.off("open-siyuan-url-plugin", this.onOpenBookUrl as any);

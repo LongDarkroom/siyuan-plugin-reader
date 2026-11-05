@@ -94,6 +94,14 @@ export function createWheelGestureDetector(options: WheelGestureOptions = {}): W
   return {
     feed(sample: WheelSample): WheelDirection | null {
       const now = sample.timeStamp;
+      // ⓪ 时钟回退防御：调用方应喂同一时钟（Date.now()）。万一喂进来的时间戳
+      //    比已记录的还早（换了时钟源 / 系统时间被回调），旧的 firedAt 会永远
+      //    在"未来"，抑制窗口永远命中 ⇒ 滚轮彻底失灵。此时作废旧窗口重新开始。
+      if (now < lastTs || now < firedAt) {
+        acc = 0;
+        lastTs = Number.NEGATIVE_INFINITY;
+        firedAt = Number.NEGATIVE_INFINITY;
+      }
       // ① 抑制窗口：刚翻过页 ⇒ 这一小段时间内的滚轮只吞掉不触发。
       //    这是"一次惯性滑连翻好几页"的主要防线。
       if (now - firedAt < suppressMs) return null;

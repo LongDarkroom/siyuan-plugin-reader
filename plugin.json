@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-reader",
   "author": "LongDarkroom",
   "url": "https://github.com/LongDarkroom/siyuan-plugin-reader",
-  "version": "0.4.0",
+  "version": "0.5.4",
   "minAppVersion": "3.7.0",
   "kernels": [
     "all"
@@ -22,8 +22,8 @@
     "zh-CN": "RE 阅读器"
   },
   "description": {
-    "default": "RE Reader: a standalone EPUB/PDF reader for SiYuan. Shelf, PDF & EPUB rendering, word lookup with offline MDX dictionaries, machine translation, bilingual parallel reading, ink annotations, reading stats and TTS — Readest-style reading experience.",
-    "zh-CN": "RE 阅读器：思源笔记的独立 EPUB/PDF 阅读器。书架管理、PDF 与 EPUB 渲染、离线 MDX 词典划词查词、机器翻译与双语对照、本地墨迹批注、阅读时长统计与朗读（TTS），对标 Readest 阅读体验。批注数据本地独立存储，无需依赖其他插件；与「RE word」主插件配合可获得词库收藏与 AI 精读等增强能力。"
+    "default": "RE Reader: a standalone EPUB/PDF reader for SiYuan. Shelf, PDF & EPUB rendering, word lookup with offline MDX dictionaries, machine translation, bilingual parallel reading, ink annotations, reading stats and TTS — plus an AI reading assistant that reads the current chapter, cites passages and saves answers as notes. Readest-style reading experience.",
+    "zh-CN": "RE 阅读器：思源笔记的独立 EPUB/PDF 阅读器。书架管理、PDF 与 EPUB 渲染、离线 MDX 词典划词查词、机器翻译与双语对照、本地墨迹批注、阅读时长统计与朗读（TTS），并内置 AI 阅读助手：按章节提问、引用回跳、一键存为思源笔记。批注、进度与设置全部本地独立存储。"
   },
   "readme": {
     "default": "README.md",

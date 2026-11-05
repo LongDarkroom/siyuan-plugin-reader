@@ -67,6 +67,8 @@ const ICONS = [
   { key: "translate", file: "languages", label: "翻译" },
   { key: "tts", file: "volume-2", label: "朗读" },
   { key: "send", file: "send", label: "发送" },
+  // 2026-11-05 P0：划词「问 AI」入口（把选段带进右侧阅读助手）
+  { key: "ai", file: "sparkles", label: "问 AI" },
   // edit 态专用
   { key: "trash", file: "trash", label: "删除划线" },
   // 2026-10-08 批注卡片改版新增：导出按钮与折叠触发器的箭头。

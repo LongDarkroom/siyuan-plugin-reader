@@ -27,6 +27,8 @@ import { getLogger } from "../core/logger.ts";
   // PdfSettings.svelte 与 BindDropzone.svelte 已实现但尚未接入本视图，故此处不再 import
   // （保留文件本体，待接线时直接挂载即可）。
   import { resolveReaderMode, isPdfFormat, type ReaderMode, bookTypeFromFormat, matchBookType, type BookType } from "./reader-mode.ts";
+  import { placeTip, TIP_DELAY_MS } from "./tooltip.ts";
+  import { isHostDragActive, toHostPoint } from "./host-drag-bridge.ts";
   import BookToolbar from "./BookToolbar.svelte";
   // 2026-11-04 图片右键菜单（复制/保存），正文与灯箱共用
   import ImageContextMenu from "./ImageContextMenu.svelte";
@@ -98,6 +100,21 @@ import { getLogger } from "../core/logger.ts";
     normalizeSectionIndex,
     validateAnnotationItem,
   } from "../ai/reader-bridge-protocol.ts";
+  // 2026-11-05 P0：AI 阅读助手面板（右停靠）。章节读取与原文定位仍走本组件导出的
+  // getChapterSnapshot / locateQuoteInSection，面板只做对话与渲染。
+  import AiPanel from "../ai/panel/AiPanel.svelte";
+  import { DEFAULT_AI_PANEL_PREFS, type AiChatQuote } from "../ai/panel/ai-panel-logic.ts";
+  import {
+    MIN_RANGE_CHAPTER_CHARS,
+    buildRangeContext,
+    normalizeReadRange,
+    normalizeTocItems,
+    rangeChapterCap,
+    rangeLabel,
+    sectionIndexFromTocSplit,
+  } from "../ai/panel/ai-toc.ts";
+  import type { KnowledgeSource } from "../ai/panel/ai-knowledge.ts";
+  import { composeNoteMarkdown, type NotePlan } from "../ai/panel/ai-note-plan.ts";
   import type { BookshelfStore, BookMeta, BookMark } from "../reader/bookshelf-store";
   // [REword patch 2026-08-29] PDF 缩放：复用 ReadingProgress.zoom 字段
   import type { ZoomState } from "../reader/bookshelf-store";
@@ -232,6 +249,7 @@ import { getLogger } from "../core/logger.ts";
     normalizeAnnotationStyle,
     normalizeAnnotationColor,
     isPureHighlight,
+    inferType,
     annotationCfis,
     type AnnotationStyle,
     type AnnotationType,
@@ -243,7 +261,9 @@ import { getLogger } from "../core/logger.ts";
     // 2026-08-30：上次使用样式（微信读书式一键高亮）——点「标注」直接用，跨会话记忆
     getLastAnnotationColor,
     getLastAnnotationStyle,
+    getLastAnnotationGroup,
     setLastAnnotationStyle,
+    setLastAnnotationGroup,
   } from "../annotation/annotation-config.ts";
   // 2026-08-24 根治：视觉层确定性同步（不信任 foliate 删除 API 的"静默失败"，
   // 改为按 key 遍历 overlay 强制移除 + 全量 reconcile）
@@ -254,6 +274,7 @@ import { getLogger } from "../core/logger.ts";
     syncVisualWithStore,
     nukeAndRedrawOverlays,
     subscribeAnnotationsChanged,
+    NOTE_KEY_PREFIX,
   } from "./annotation-visual";
 
   // 2026-10-10：快捷键提示面板。注册表此前只用于「冲突检测」，没有展示入口，
@@ -406,6 +427,8 @@ import { getLogger } from "../core/logger.ts";
   export let mobileOverlay: boolean = false;
   /** 独立 Tab 模式：标题联动（书名 · 章节） */
   export let onTitleChange: ((title: string) => void) | undefined = undefined;
+  /** 2026-11-05 AI 页签：把右侧助手提升为思源页签（手机端无页签，不提供） */
+  export let onOpenAiTab: ((bookId: string) => void) | undefined = undefined;
   /** 翻译选中文本并直接发送到 AI 精读面板（委托 plugin.translateToAi） */
   export let onTranslateToAi: ((text: string) => void) | undefined = undefined;
   /** 双语段落批量翻译（委托 plugin.translateBatch，按书缓存 + 引擎链兜底）；
@@ -1219,6 +1242,8 @@ import { getLogger } from "../core/logger.ts";
   let sidebarPinned = false; // 停靠模式开
   let sidebarWidth = 280;    // 停靠栏宽（px）
   let sideResizing = false;
+  /** 上次打开的面板（仅停靠模式在 onMount 时恢复；浮层态不自动弹出） */
+  let restoredPanel: DrawerKind | "search" | null = null;
 
   function loadSidebarPrefs() {
     try {
@@ -1227,10 +1252,13 @@ import { getLogger } from "../core/logger.ts";
       const o = JSON.parse(raw);
       if (typeof o.pinned === "boolean") sidebarPinned = o.pinned;
       if (typeof o.width === "number") sidebarWidth = Math.min(480, Math.max(200, Math.round(o.width)));
+      if (o.panel === "toc" || o.panel === "marks" || o.panel === "search") restoredPanel = o.panel;
     } catch { /* 坏数据忽略，用默认 */ }
   }
   function persistSidebar() {
-    try { localStorage.setItem(SIDEBAR_STORE_KEY, JSON.stringify({ pinned: sidebarPinned, width: sidebarWidth })); }
+    // 面板选择一起记：下次停靠时直接回到上次看的面板
+    const panel = activeDrawer ?? (showSearch ? "search" : null);
+    try { localStorage.setItem(SIDEBAR_STORE_KEY, JSON.stringify({ pinned: sidebarPinned, width: sidebarWidth, panel })); }
     catch { /* 隐私模式等场景静默 */ }
   }
 
@@ -1308,8 +1336,8 @@ import { getLogger } from "../core/logger.ts";
     // 2026-10-25 停靠联动：停靠模式下关掉最后一个面板 → 连带退出停靠（不留空栏占正文宽度）
     if (sidebarPinned && !activeDrawer && !showSearch) {
       sidebarPinned = false;
-      persistSidebar();
     }
+    persistSidebar();
   };
 
   /* ============================================================
@@ -1734,10 +1762,27 @@ function applyTopHandleHitHeight() {
   // 只传 { zoom }，此前 saveProgress 是整体替换（meta.progress = progress），缩放一次
   // 就把已存的 cfi/fraction 抹掉（存储实锤出现 progress 只剩 zoom 的记录）→ 恢复丢位。
   let pendingSave: any = null;
+  /**
+   * 开书时 foliate 会先发一次 relocate（恢复定位尚未生效，fraction 常为 0）。
+   * 用一个一次性闸门吞掉它，而不是拿 `fraction > 0` 当「用户已移动」的代理 ——
+   * 后者会把「用户真的翻回第一页（fraction 恰为 0）」也当成初始事件丢掉，
+   * 导致重开书时又跳回上次的旧位置。
+   */
+  let skipNextRelocateSave = false;
+  /**
+   * 崩溃安全日志（P3）：saveData 是异步的，整页重载时可能没写完。
+   * 每次 relocate 只在内存里记最新位置（零 I/O），页面隐藏/关闭时同步写
+   * localStorage；下次开书若它比已落盘的 lastReadAt 更新，就用它恢复。
+   */
+  const PROGRESS_JOURNAL_KEY = "reword-reader-progress-journal";
+  let lastKnownProgress: any = null;
   // 开书后延迟重绑内容文档的定时器（须在 onDestroy 取消，避免组件销毁后仍重绑到已死的 doc）
   let attachTimer1: any = null;
   let attachTimer2: any = null;
   function scheduleProgressSave(p: any) {
+    // 内存里的「最新位置」跟着一起更新（含缩放等局部字段），
+    // 页面隐藏/关闭时同步写日志，不依赖 600ms 防抖是否跑完。
+    lastKnownProgress = { ...(lastKnownProgress || {}), ...p };
     pendingSave = { ...(pendingSave || {}), ...p };
     if (saveTimer) clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
@@ -1754,11 +1799,61 @@ function applyTopHandleHitHeight() {
     if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
     const payload = pendingSave;
     pendingSave = null;
-    // [REword patch 2026-10-13] 兜底：fraction=0 无意义，不落盘避免覆盖历史进度
-    if (bookId && payload && payload.fraction !== 0) {
+    // 初始 relocate 已由 skipNextRelocateSave 挡在 scheduleProgressSave 之前，
+    // 这里不再用 fraction!==0 兜底（那会连「用户翻回第一页」的合法进度一起丢掉）。
+    if (bookId && payload) {
       try { await store.saveProgress(bookId, payload); }
       catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · flushProgressSave", "debug"); }
     }
+  }
+  /** 同步写一份「最近位置」到 localStorage（崩溃/重载兜底，不依赖异步 saveData） */
+  function writeProgressJournalSync() {
+    if (!bookId || !lastKnownProgress) return;
+    try {
+      const raw = localStorage.getItem(PROGRESS_JOURNAL_KEY);
+      const map = raw ? JSON.parse(raw) : {};
+      map[bookId] = {
+        fraction: lastKnownProgress.fraction,
+        cfi: lastKnownProgress.cfi,
+        page: lastKnownProgress.page,
+        zoom: lastKnownProgress.zoom,
+        ts: Date.now(),
+      };
+      // 只留最近 30 本，长期使用不会无限膨胀
+      const kept = Object.entries(map)
+        .sort((a: any, b: any) => (b[1]?.ts || 0) - (a[1]?.ts || 0))
+        .slice(0, 30);
+      localStorage.setItem(PROGRESS_JOURNAL_KEY, JSON.stringify(Object.fromEntries(kept)));
+    } catch { /* 隐私模式 / 配额满：不影响正常存盘 */ }
+  }
+
+  /** 若日志比书架索引里的进度更新，用它覆盖位置字段（visitedHrefs 仍以索引为准） */
+  function withJournalProgress(id: string, stored: any): any {
+    try {
+      const raw = localStorage.getItem(PROGRESS_JOURNAL_KEY);
+      if (!raw) return stored;
+      const j = JSON.parse(raw)?.[id];
+      if (!j || typeof j.ts !== "number") return stored;
+      const lastSaved = store.get(id)?.lastReadAt ?? 0;
+      if (j.ts <= lastSaved) return stored;
+      const merged = { ...(stored || {}) };
+      if (typeof j.fraction === "number") merged.fraction = j.fraction;
+      if (typeof j.cfi === "string" && j.cfi) merged.cfi = j.cfi;
+      if (typeof j.page === "number") merged.page = j.page;
+      if (typeof j.zoom === "number") merged.zoom = j.zoom;
+      return merged;
+    } catch { return stored; }
+  }
+
+  /** 窗口重载/关闭前尽力落盘（Svelte onDestroy 在整页刷新时不会触发） */
+  function flushProgressOnPageHide() {
+    writeProgressJournalSync();
+    void flushProgressSave();
+  }
+
+  /** 切到后台/锁屏：同步记一份，进程被系统回收时也能恢复 */
+  function onProgressVisibilityChange() {
+    if (document.visibilityState === "hidden") writeProgressJournalSync();
   }
 
   /** 读取思源笔记实际 CSS 变量（用于「跟随思源」主题的背景/文字色同步） */
@@ -3194,10 +3289,11 @@ function applyTopHandleHitHeight() {
         // （同一个数组序列化 600ms 内可能提交多次）。
         // ⇒ 只在「集合真的变了」时才带这个字段。
         if (visitedChanged) savePayload.visitedHrefs = serializeVisited();
-        // [REword patch 2026-10-13] 跳过 fraction=0 的初始 relocate，避免覆盖已保存进度
-        // `view.init` 会触发首次 relocate（fraction=0），若此时落盘会抹掉上次保存的 fraction，
-        // 导致下次打开从第 1 页开始。只有用户真正翻页（fraction>0）才保存。
-        if (frac > 0) {
+        // 只跳过开书后的第一次 relocate（view.init 的恢复前事件），
+        // 之后无论 fraction 是否为 0 都保存 —— 用户回到第一页也是有效进度。
+        if (skipNextRelocateSave) {
+          skipNextRelocateSave = false;
+        } else {
           scheduleProgressSave(savePayload);
         }
         attachAllContentDocs();
@@ -3239,6 +3335,8 @@ function applyTopHandleHitHeight() {
       });
 
       markStage("foliate view.open（解析书籍文件）");
+      // 开书首个 relocate 只反映「解析完成」，不是用户位置；吞掉这一次落盘。
+      skipNextRelocateSave = true;
       // R1 收敛：按格式打开统一走 DocumentLoader → 适配器（行为等价于旧 view.open 分支）
       await DocumentLoader.openView(view, { bookId, name, file, title: meta.title });
       // 2026-09-02 中和书内 @font-face 的非法 scheme src；2026-10-06 兼做竖排标点替换。
@@ -3252,7 +3350,7 @@ function applyTopHandleHitHeight() {
       // 走 changelog.PLUGIN_VERSION（内部裸标识符 __REWORD_VERSION__，vite define 才替换得到）
       console.info("[REword] build:", PLUGIN_VERSION || "unknown");
       markStage("view.init（定位+首次渲染）");
-      const saved = store.getProgress(bookId);
+      const saved = withJournalProgress(bookId, store.getProgress(bookId));
       // 2026-10-09 新增：在 view.init **之前**恢复「已读 N/M」的访问集。
       //
       // 🔴 时机是关键 —— 早一行就会丢数据：
@@ -3320,7 +3418,7 @@ function applyTopHandleHitHeight() {
       // applyPdfViewMode/applyPdfScrollDir/applyPdfInvert 已上移至 PDF 视图属性细步
       // saved.zoom 是 per-file 持久化（ReadingProgress.zoom）
       if (isPdfBook()) {
-        const savedZoom = store.getProgress(bookId)?.zoom;
+        const savedZoom = saved?.zoom;
         // [REword patch 2026-08-29] 移动端 PDF 适配 Phase 1
         // iPhone / Android Phone 降级模式：强制 fit-width（小屏 custom 缩放过小不可读）
         const initialZoom: ZoomState = isIphoneMode
@@ -4111,6 +4209,15 @@ function applyTopHandleHitHeight() {
   /** 目录项 → 它指向的 section 索引；解析不出返回 -1 */
   function sectionIndexOfTocItem(item: { href: string }): number {
     const href = String(item?.href ?? "");
+    // AZW3/MOBI/FB2 的 TOC 目标是 kindle:pos:fid:… / filepos:… / 数字索引，
+    // 与 section.id 对不上，必须先让 foliate 自己解析（EPUB 返回路径、PDF 返回 Promise，
+    // 都会被 sectionIndexFromTocSplit 判为 -1，继续走下面的 id 匹配）。
+    try {
+      const byBook = sectionIndexFromTocSplit((view?.book as any)?.splitTOCHref?.(href));
+      if (byBook >= 0) return byBook;
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · sectionIndexOfTocItem · splitTOCHref", "debug");
+    }
     // 形如 "chapter1.xhtml#frag" 或 "text/part1.html"
     const file = href.split("#")[0];
     const list = view?.book?.sections ?? [];
@@ -4163,11 +4270,21 @@ function applyTopHandleHitHeight() {
       if (Array.isArray(o.history)) {
         searchHistory = o.history.filter((x: unknown) => typeof x === "string" && x).slice(0, SEARCH_HISTORY_MAX);
       }
+      // 2026-11-05：范围/大小写/全字也属于「下次打开还想沿用」的搜索偏好
+      if (o.scope === "book" || o.scope === "chapter") searchScope = o.scope;
+      if (typeof o.caseSensitive === "boolean") searchCaseSensitive = o.caseSensitive;
+      if (typeof o.wholeWord === "boolean") searchWholeWord = o.wholeWord;
     } catch { /* 坏数据用默认 */ }
   }
   function persistSearchUi() {
     try {
-      localStorage.setItem(SEARCH_UI_KEY, JSON.stringify({ mode: searchMode, history: searchHistory }));
+      localStorage.setItem(SEARCH_UI_KEY, JSON.stringify({
+        mode: searchMode,
+        history: searchHistory,
+        scope: searchScope,
+        caseSensitive: searchCaseSensitive,
+        wholeWord: searchWholeWord,
+      }));
     } catch { /* 隐私模式静默 */ }
   }
 
@@ -4177,6 +4294,18 @@ function applyTopHandleHitHeight() {
     persistSearchUi();
     // 模式切换即重搜（同大小写/全字 change={startSearch} 的既有交互）
     if (searchQuery.trim() && !(m === "regex" && regexError)) void doSearch();
+  }
+
+  function setSearchScope(scope: typeof searchScope) {
+    if (scope === searchScope) return;
+    searchScope = scope;
+    persistSearchUi();
+  }
+
+  /** 大小写 / 全字：勾选即重搜，同时落盘偏好 */
+  function onSearchOptionChange() {
+    persistSearchUi();
+    startSearch();
   }
 
   function pickSearchHistory(q: string) {
@@ -4451,6 +4580,95 @@ function applyTopHandleHitHeight() {
     if (!showSearch) toggleSearch();
   }
 
+  /* ================= 2026-11-05 P0：AI 阅读助手 ================= */
+
+  /**
+   * 打开助手时收起顶/底浮层栏。
+   * 面板是常驻内容、不挂在顶栏锚点上，不需要「为浮层保持顶栏可见」；
+   * 两条栏又都浮在正文上方，窄屏或高文档下会和面板抢视觉高度。
+   */
+  function retractChromeForAi(): void {
+    if (isTopBarFloating() && (topBarRevealed || topBarPinned)) {
+      topBarPinned = false;
+      topBarBarHover = false;
+      updateTopBarReveal();
+    }
+    if (bottomBarRevealed || bottomBarPinned) {
+      bottomBarPinned = false;
+      bottomBarBarHover = false;
+      updateBottomBarReveal();
+    }
+  }
+
+  function toggleAiPanel() {
+    if (showAiPanel) {
+      showAiPanel = false;
+      return;
+    }
+    showAiPanel = true;
+    showMoreMenu = false;
+    // 停靠栏与浮层抽屉互斥：打开时收起抽屉，避免正文被两侧同时挤压
+    showToc = false;
+    showMarks = false;
+    showSearch = false;
+    showSettings = false;
+    retractChromeForAi();
+    void tick().then(() => aiPanelComp?.focusComposer?.());
+  }
+
+  function onMoreAi() {
+    showMoreMenu = false;
+    if (!showAiPanel) toggleAiPanel();
+  }
+
+  /** 「在新页签打开」：页签已在右侧分屏，停靠栏要一起收起，避免同一会话占两处 */
+  function openAiTab() {
+    if (!onOpenAiTab) return;
+    showAiPanel = false;
+    onOpenAiTab(bookId);
+  }
+
+  /**
+   * 划词「问 AI」：把选段带进右侧面板（面板未开则先打开）。
+   * 章节号取当前章 —— 选段跨章续接的极端场景下定位会失败，面板会给出提示。
+   */
+  function onSelAskAi() {
+    const text = selToolbar.text?.trim();
+    closeSelToolbar();
+    if (!text) return;
+    if (!showAiPanel) {
+      showAiPanel = true;
+      showToc = false;
+      showMarks = false;
+      showSearch = false;
+      showSettings = false;
+      retractChromeForAi();
+      void tick().then(() => aiPanelComp?.focusComposer?.());
+    }
+    const quote: AiChatQuote = {
+      text,
+      sectionIndex: currentSectionIndex,
+      chapterTitle: resolveChapterTitle(currentSectionIndex) || chapterLabel || undefined,
+    };
+    void tick().then(() => aiPanelComp?.addQuote?.(quote));
+  }
+
+  /** 面板「定位原文」：在当前章查找引用并跳转（只读，不产生高亮） */
+  async function onAiLocate(quote: string, sectionIndex?: number) {
+    const sections: any[] = view?.book?.sections ?? [];
+    const idx = normalizeSectionIndex(sectionIndex, sections.length) ?? currentSectionIndex;
+    if (idx < 0) return { ok: false as const, error: "no_chapter" };
+    const loc: any = await locateQuoteInSection(quote, idx);
+    if (!loc?.ok) return { ok: false as const, error: loc?.error || "quote_not_found" };
+    try {
+      await (view as any)?.goTo(loc.cfi);
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · onAiLocate · goTo", "warn");
+      return { ok: false as const, error: "goto_failed" };
+    }
+    return { ok: true as const };
+  }
+
   function clearSearch() {
     try {
       view?.clearSearch?.();
@@ -4474,9 +4692,9 @@ function applyTopHandleHitHeight() {
       // 2026-10-25 停靠联动：停靠模式下搜索是最后一个面板时，关闭 = 连带退出停靠
       if (sidebarPinned && !activeDrawer) {
         sidebarPinned = false;
-        persistSidebar();
       }
     }
+    persistSidebar();
   }
 
   /* ================= 书签 / 摘录汇总（2026-08-29 新增） =================
@@ -4622,7 +4840,8 @@ function applyTopHandleHitHeight() {
   function annotGlyph(it: any): string {
     if (it?.kind === "ink") return "✎";
     if (it?.kind === "rect") return "▭";
-    if (String(it?.type || "") === "annotate") return "💬";
+    // 以 note 实际内容为准（历史数据 type 可能是创建时写死的，加完笔记不会更新）
+    if (it && inferType(it) === "annotate") return "💬";
     return ANNOTATION_STYLES[normalizeAnnotationStyle(it?.style)]?.icon || "▮";
   }
 
@@ -4630,7 +4849,7 @@ function applyTopHandleHitHeight() {
   function annotKindLabel(it: any): string {
     if (it?.kind === "ink") return t("墨迹");
     if (it?.kind === "rect") return t("矩形框选");
-    if (String(it?.type || "") === "annotate") return t("批注");
+    if (it && inferType(it) === "annotate") return t("批注");
     return t(ANNOTATION_STYLES[normalizeAnnotationStyle(it?.style)]?.label || "高亮");
   }
 
@@ -4844,6 +5063,20 @@ function applyTopHandleHitHeight() {
   $: isCompactToolbar = isIphoneMode || isPhoneBreakpoint(viewportBp);
   // ⋯ 溢出菜单（紧凑顶栏专属）
   let showMoreMenu = false;
+
+  /* 2026-11-05 P0：AI 阅读助手（右侧停靠）。
+   * 与左侧抽屉不同，它是**常驻停靠栏**：正文让位（margin-right），不做遮罩；
+   * 手机/大手机断点改为全屏覆盖（宽度已无处可让）。宽度由面板自己拖拽并落盘
+   * （localStorage: reword-reader-ai-prefs），这里只持有布局镜像。 */
+  let showAiPanel = false;
+  let aiPanelWidth = DEFAULT_AI_PANEL_PREFS.width;
+  let aiPanelComp: any = undefined;
+  $: aiOverlay = viewportBp === "phone" || viewportBp === "largePhone";
+  /* 互斥：桌面停靠栏会被右侧浮层（搜索/设置/目录）挡住，打开浮层时先收起助手。
+     手机是覆盖层，浮层本来就在它后面，不需要这条。 */
+  $: if (showAiPanel && !aiOverlay && (showSearch || showSettings || showToc || showMarks)) {
+    showAiPanel = false;
+  }
 
   /**
    * 是否 PDF 书籍。
@@ -5548,7 +5781,7 @@ function applyTopHandleHitHeight() {
     return !!t.closest(
       ".rwd-backdrop, .reader-popover, .reader-dict-popup, .reader-footnote, " +
       ".reader-more-menu, .reader-sel-toolbar, .reader-note-editor, .reader-imgv, " +
-      ".reader-hint-panel, .reader-side-resizer"
+      ".reader-hint-panel, .reader-side-resizer, .reader-ai-dock"
     );
   }
 
@@ -5629,7 +5862,12 @@ function applyTopHandleHitHeight() {
     const dir = getWheelDetector().feed({
       deltaX: e.deltaX,
       deltaY: e.deltaY,
-      timeStamp: e.timeStamp,
+      // ⚠️ 必须用自己的时钟，不能喂 e.timeStamp：该监听同时挂在父文档（stage 留白）
+      // 和多个内容 iframe 的 doc 上，而 Event.timeStamp 是**各 realm 各自 time origin**
+      // 的相对值 —— iframe 里的 100 和父文档里的 5000 不可比。混着喂时，父文档事件翻页后
+      // 把 firedAt 记成大数，随后 iframe 事件（时钟更小）算出的 now - firedAt 为负，
+      // 永远落在 180ms 抑制窗口内 ⇒ 滚轮彻底失灵（且因提前 return，空闲复位也救不回来）。
+      timeStamp: Date.now(),
       deltaMode: e.deltaMode,
     });
     if (!dir) return;
@@ -7173,7 +7411,7 @@ function applyTopHandleHitHeight() {
   // 无历史才回退用户配置的默认样式 —— 这样重启思源后点「标注」仍是上次的紫色高亮。
   let lastStyle: AnnotationStyle = getLastAnnotationStyle();
   let lastColor: string = getLastAnnotationColor();
-  let lastGroup: string = "未分组";
+  let lastGroup: string = getLastAnnotationGroup();
   /**
    * 记住本次实际使用的样式，供下次「标注」一键复用（防抖落盘）。
    * 参数显式传入而非常规读取闭包变量：Svelte 的 `$:` 只跟踪**语句里出现过的**变量，
@@ -7226,6 +7464,90 @@ function applyTopHandleHitHeight() {
     place: "below",
   };
   let noteEditorEl: HTMLElement | null = null;
+
+  /* ============================================================
+   * 自绘 Tooltip（2026-11-05）
+   * ------------------------------------------------------------
+   * 浮层内的按钮用 `data-tip="…"` 声明提示文字；由下面这一层统一绘制。
+   *  · 450ms 延迟（TIP_DELAY_MS），移出 / 按下 / 滚动 / 翻页立即收起
+   *  · 落点见 tooltip.ts 的 placeTip：上方 8px，放不下翻下方，水平夹紧
+   *  · 仅 hover 设备显示；键盘 :focus-visible 也显示
+   *  · 原生 title 已从这些按钮上移除（两套提示会叠在一起）
+   * ============================================================ */
+  let tip = { visible: false, ready: false, text: "", x: 0, y: 0, below: false };
+  let tipEl: HTMLElement | null = null;
+  let tipTimer: ReturnType<typeof setTimeout> | null = null;
+  let tipHost: HTMLElement | null = null;
+  let tipHoverOk = true; // 触屏设备为 false（pointerover 在触屏上也会派发）
+  let tipMq: MediaQueryList | null = null;
+  let tipMqHandler: (() => void) | null = null;
+
+  function cancelTipTimer() {
+    if (tipTimer != null) { clearTimeout(tipTimer); tipTimer = null; }
+  }
+
+  function hideTip() {
+    cancelTipTimer();
+    tipHost = null;
+    if (tip.visible || tip.ready) tip = { ...tip, visible: false, ready: false };
+  }
+
+  function tipHostOf(target: EventTarget | null): HTMLElement | null {
+    const node = target instanceof Element ? target : null;
+    const host = node?.closest?.("[data-tip]") as HTMLElement | null;
+    if (!host) return null;
+    if (!(host.getAttribute("data-tip") || "").trim()) return null;
+    if (host.matches(":disabled, [aria-disabled='true']")) return null;
+    return host;
+  }
+
+  async function showTip(host: HTMLElement) {
+    if (isDestroyed || !host.isConnected || !readerViewEl) return;
+    const text = (host.getAttribute("data-tip") || "").trim();
+    if (!text) return;
+    const r = host.getBoundingClientRect();
+    const origin = toContainerCoords(r.left, r.top);
+    const anchor = { left: origin.x, top: origin.y, right: origin.x + r.width, bottom: origin.y + r.height };
+    const bounds = { left: 4, top: 4, right: readerViewEl.clientWidth - 4, bottom: readerViewEl.clientHeight - 4 };
+    // 先渲染文字（此时不显示），量到真实尺寸后再定位 —— 提示文案长度不一，不能预估。
+    tip = { visible: true, ready: false, text, x: bounds.left, y: bounds.top, below: false };
+    await tick();
+    if (!tip.visible || tipHost !== host) return;
+    const size = { width: tipEl?.offsetWidth || 0, height: tipEl?.offsetHeight || 0 };
+    const pos = placeTip(anchor, size, bounds);
+    tip = { visible: true, ready: true, text, x: pos.left, y: pos.top, below: pos.below };
+  }
+
+  function onTipPointerOver(e: PointerEvent) {
+    if (!tipHoverOk) return;
+    const host = tipHostOf(e.target);
+    if (!host || host === tipHost) return;
+    hideTip();
+    tipHost = host;
+    tipTimer = setTimeout(() => { tipTimer = null; void showTip(host); }, TIP_DELAY_MS);
+  }
+
+  function onTipPointerOut(e: PointerEvent) {
+    if (!tipHost) return;
+    const to = e.relatedTarget as Node | null;
+    if (to && tipHost.contains(to)) return;
+    hideTip();
+  }
+
+  function onTipFocusIn(e: FocusEvent) {
+    const host = tipHostOf(e.target);
+    if (!host) return;
+    // 指针点击也会让按钮聚焦，但那时不需要提示；只认键盘焦点。
+    try { if (!host.matches(":focus-visible")) return; } catch (__swallowErr) { return; }
+    hideTip();
+    tipHost = host;
+    void showTip(host);
+  }
+
+  function onTipFocusOut() {
+    hideTip();
+  }
+
 
   /**
    * 批注卡片宽度（2026-10-08 改版：268 → 400，横向长方形）。
@@ -7415,11 +7737,70 @@ function applyTopHandleHitHeight() {
     arr.push({ type, fn, opts });
   }
 
+  /* ================= 宿主分屏拖拽事件桥（2026-11-05） =================
+   * 根因见 host-drag-bridge.ts 顶部注释。两条互补的修复：
+   *   A. iframe → 主文档转发：拖拽期间书页 iframe 吃掉的 mousemove/mouseup 补发给主文档，
+   *      宿主的 document.onmouseup 才能收尾（分屏线也不会在书页上僵住）。
+   *   B. 主文档兜底自愈：按键早已松开（buttons===0）却还挂着宿主的拖拽 handler，
+   *      说明 mouseup 丢在别处（窗口外等）→ 补一个 mouseup 让宿主自己清理。 */
+
+  /** A：把内容 iframe 里的指针事件按主文档坐标补发。只在宿主真拖拽、且确实按住时转发。 */
+  function relayHostDrag(doc: Document, e: MouseEvent | PointerEvent, type: "mousemove" | "mouseup") {
+    if (!isHostDragActive(document)) return;
+    // 没按住就没有「拖拽跟随」，此时交给 B 自愈收尾，绝不能把裸鼠标坐标喂给宿主的拖拽 handler
+    if (type === "mousemove" && e.buttons === 0) return;
+    const frame = (doc.defaultView as any)?.frameElement as Element | null;
+    const rect = frame?.getBoundingClientRect?.() ?? null;
+    const p = toHostPoint(rect, e.clientX, e.clientY);
+    const me = new MouseEvent(type, {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: p.clientX,
+      clientY: p.clientY,
+      screenX: e.screenX,
+      screenY: e.screenY,
+      button: type === "mouseup" ? 0 : e.button,
+      buttons: type === "mouseup" ? 0 : e.buttons,
+      ctrlKey: e.ctrlKey,
+      altKey: e.altKey,
+      shiftKey: e.shiftKey,
+      metaKey: e.metaKey,
+    });
+    (frame ?? readerViewEl ?? document.body)?.dispatchEvent(me);
+  }
+
+  /** B：主文档 mousemove 兜底。空闲移动却还残留宿主拖拽态 ⇒ 补发 mouseup。 */
+  function healStaleHostDrag(e: MouseEvent) {
+    if (e.buttons !== 0 || !isHostDragActive(document)) return;
+    const target = (e.target instanceof Element ? e.target : document.body) ?? document.body;
+    target.dispatchEvent(new MouseEvent("mouseup", {
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+      view: window,
+      clientX: e.clientX,
+      clientY: e.clientY,
+      screenX: e.screenX,
+      screenY: e.screenY,
+      button: 0,
+      buttons: 0,
+    }));
+  }
+
   function attachContentDoc(doc: Document | null | undefined) {
     if (!doc || attachedDocs.has(doc)) return;
     attachedDocs.add(doc);
     // mouseup 用 capture 阶段，先于 bubble 阶段的正文监听处理
     trackDocListener(doc, "mouseup", onContentMouseUp, true);
+    // 宿主分屏拖拽事件桥 A：书页 iframe 独立文档，事件不会冒泡回主文档
+    trackDocListener(doc, "mousemove", ((e: MouseEvent) => relayHostDrag(doc, e, "mousemove")) as EventListener, true);
+    trackDocListener(doc, "mouseup", ((e: MouseEvent) => relayHostDrag(doc, e, "mouseup")) as EventListener, true);
+    // pointerup 先于 mouseup 派发：先收尾一次，随后真正的 mouseup 因宿主已退出拖拽态而自动跳过
+    trackDocListener(doc, "pointerup", ((e: PointerEvent) => relayHostDrag(doc, e, "mouseup")) as EventListener, true);
+    // pointercancel 时 iframe 里不会再有 mouseup，必须靠它收尾
+    trackDocListener(doc, "pointercancel", ((e: PointerEvent) => relayHostDrag(doc, e, "mouseup")) as EventListener, true);
     // 🔍 2026-10-14 合成点击判别（iframe 口径）：记录最近 pointerdown 时间戳，
     // 供 onContentMouseDown 区分「真用户点击」与「代码派发的合成 mousedown」。
     // 同时置 contentPointerHeld=true：标记「正在按住拖选」，供滚动收起避让（见 hideSelOnScroll）。
@@ -7964,7 +8345,9 @@ function applyTopHandleHitHeight() {
       if (sx > hi) sx = hi;
       if (ex < lo) ex = lo;
       if (ex > hi) ex = hi;
-      if (ex < sx) ex = sx;
+      // ⚠️ 不要加 `if (ex < sx) ex = sx`：换行后末行末端本来就可能落在起点的左边
+      //   （例：从第二行右端的 "over" 选到第三行左端的 "sea."）。强行拉齐会把终点手柄
+      //   钉在起点正下方，看起来「手柄飘出了选中文字」，而选框其实是好的。
     }
     const s = toContainerCoords(sx + fx, first.top + fy);
     const en = toContainerCoords(ex + fx, last.bottom + fy);
@@ -8871,6 +9254,418 @@ function applyTopHandleHitHeight() {
   }
 
   /**
+   * AI 桥：本书目录（P0）。
+   * EPUB 按 section id 解析；PDF 大纲的 href 是 "pdf-page-N"（1 起），
+   * 每个 section 就是一页，故 section = N - 1。
+   */
+  export function getBookToc() {
+    const sections: any[] = view?.book?.sections ?? [];
+    const raw = Array.isArray(tocItems) ? tocItems : [];
+    const pdf = isPdfBook();
+    const mapped: Array<{ section: number; level: number; title: string }> = [];
+    for (const it of raw as any[]) {
+      const title = String(it?.title ?? "").trim();
+      if (!title) continue;
+      let section = -1;
+      if (pdf) {
+        const m = String(it?.href ?? "").match(/^pdf-page-(\d+)$/);
+        const page = m ? parseInt(m[1], 10) : 0;
+        if (page > 0) section = page - 1;
+      } else {
+        section = sectionIndexOfTocItem(it);
+      }
+      if (section < 0 || (sections.length && section >= sections.length)) continue;
+      mapped.push({ section, level: Number(it?.level) || 0, title });
+    }
+    return {
+      ok: true,
+      bookId,
+      format: String(meta?.format || "").toLowerCase(),
+      totalSections: sections.length,
+      currentSection: currentSectionIndex,
+      items: normalizeTocItems(mapped),
+    };
+  }
+
+  /**
+   * AI 桥：读连续几章（P0）。
+   * 预算按章均分；一次最多自动读 rangeChapterCap 章，其余交给工具续读。
+   * 各章复用 getChapterSnapshot，保持与单章相同的段落抽取口径。
+   */
+  export async function getChapterRangeSnapshot(
+    opts: { fromSection?: number; toSection?: number; maxChars?: number } = {},
+  ) {
+    const format = String(meta?.format || "").toLowerCase();
+    if (!isAiTextFormat(format)) return { ok: false, error: "unsupported_format", format };
+    const sections: any[] = view?.book?.sections ?? [];
+    if (!sections.length) return { ok: false, error: "no_chapter" };
+    const from = Number.isFinite(Number(opts.fromSection)) ? Math.floor(Number(opts.fromSection)) : currentSectionIndex;
+    const to = Number.isFinite(Number(opts.toSection)) ? Math.floor(Number(opts.toSection)) : from;
+    const range = normalizeReadRange({ from, to }, sections.length);
+    if (!range) return { ok: false, error: "no_chapter", fromSection: from, toSection: to };
+
+    const maxChars = clampMaxChars(opts.maxChars);
+    const last = Math.min(range.to, range.from + rangeChapterCap(maxChars) - 1);
+    const span = last - range.from + 1;
+    const perChapter = Math.max(MIN_RANGE_CHAPTER_CHARS, Math.floor(maxChars / span));
+    const chapters: any[] = [];
+    for (let i = range.from; i <= last; i++) {
+      const snap = await getChapterSnapshot({ sectionIndex: i, maxChars: perChapter });
+      if (!snap?.ok) continue;
+      chapters.push({
+        section: i,
+        title: snap.chapterTitle,
+        paragraphs: snap.paragraphs,
+        totalParagraphs: snap.totalParagraphs,
+      });
+    }
+    if (!chapters.length) {
+      return { ok: false, error: "chapter_load_failed", fromSection: range.from, toSection: range.to };
+    }
+    const built = buildRangeContext(chapters, maxChars);
+    return {
+      ok: true,
+      scope: "range",
+      bookId,
+      title: meta?.title || title,
+      format,
+      fromSection: range.from,
+      toSection: range.to,
+      readToSection: last,
+      selectedChapters: range.to - range.from + 1,
+      chaptersRead: built.chaptersRead,
+      totalSections: sections.length,
+      chapterTitle: rangeLabel(range),
+      chars: built.chars,
+      paragraphs: built.paragraphs,
+      truncated: built.truncated || last < range.to,
+      text: built.text,
+    };
+  }
+
+  /**
+   * AI 桥：读取「当前可见页」的段落（P4 本页模式）。
+   *
+   * 与 getChapterSnapshot 的差异：
+   *  - 章节快照走 section.createDocument()（语义层，稳定、可续读）；
+   *  - 本页必须看**真实渲染的 DOM 几何**：分页模式下 iframe 被撑成整节宽，
+   *    只有与可见窗口相交的段落才算「本页」。
+   *
+   * PDF 没有语义段落：从当前页 .textLayer 的 span 按 y 归行，再按行距归段。
+   * 读不到文本（纯图页）时返回 empty_result，由面板提示并回退本章。
+   */
+  export async function getPageSnapshot(opts: { maxChars?: number } = {}) {
+    const format = String(meta?.format || "").toLowerCase();
+    const maxChars = clampMaxChars(opts.maxChars);
+    const clip = (paras: Array<{ i: number; text: string }>) => {
+      const out: Array<{ i: number; text: string }> = [];
+      let used = 0;
+      let i = 0;
+      for (; i < paras.length; i++) {
+        // 至少返回一段：单段超预算时也整段给出
+        if (out.length && used + paras[i].text.length > maxChars) break;
+        out.push(paras[i]);
+        used += paras[i].text.length;
+      }
+      return { paragraphs: out, used, truncated: i < paras.length };
+    };
+
+    if (isPdfBook()) {
+      let contents: any[] = [];
+      try { contents = (view as any)?.renderer?.getContents?.() || []; } catch { contents = []; }
+      const docs = contents.filter((c) => c?.doc);
+      if (!docs.length) return { ok: false, error: "no_chapter", scope: "page" };
+      const page = pdfCurrentPage || extractPdfCurrentPage(view, (view as any)?.lastLocation) || 0;
+      const pick = (page > 0 ? docs.find((c) => (Number(c.index) || 0) + 1 === page) : null) || docs[0];
+      const doc: Document = pick.doc;
+      const lines = readPdfTextLayerLines(doc);
+      const paras = lines.map((text, i) => ({ i, text }));
+      if (!paras.length) return { ok: false, error: "empty_result", scope: "page", page, totalPages: pdfTotalPages || undefined };
+      const kept = clip(paras);
+      return {
+        ok: true,
+        scope: "page",
+        bookId,
+        title: meta?.title || title,
+        format,
+        page: page || undefined,
+        totalPages: pdfTotalPages || undefined,
+        chapterTitle: chapterLabel || resolveChapterTitle(currentSectionIndex) || undefined,
+        totalParagraphs: paras.length,
+        paragraphs: kept.paragraphs,
+        returnedChars: kept.used,
+        truncated: kept.truncated,
+        nextFromPara: null,
+      };
+    }
+
+    if (!isAiTextFormat(format)) {
+      return { ok: false, error: "unsupported_format", format, scope: "page" };
+    }
+    let contents: any[] = [];
+    try { contents = (view as any)?.renderer?.getContents?.() || []; } catch { contents = []; }
+    const candidates = contents.filter((c) => c?.doc?.querySelector);
+    if (!candidates.length) return { ok: false, error: "no_chapter", scope: "page" };
+    const preferred = candidates.find((c) => c.index === currentSectionIndex);
+    const ordered = preferred ? [preferred, ...candidates.filter((c) => c !== preferred)] : candidates;
+    for (const c of ordered) {
+      const doc: Document = c.doc;
+      const frame = (doc.defaultView as any)?.frameElement as HTMLElement | null;
+      const vis = getVisibleWindowLocal(frame);
+      if (!vis) continue;
+      const visible = collectPageParagraphs(doc, vis);
+      if (!visible.length) continue;
+      const kept = clip(visible.map((text, i) => ({ i, text })));
+      return {
+        ok: true,
+        scope: "page",
+        bookId,
+        title: meta?.title || title,
+        format,
+        sectionIndex: typeof c.index === "number" ? c.index : currentSectionIndex,
+        totalSections: view?.book?.sections?.length ?? 0,
+        chapterTitle: resolveChapterTitle(typeof c.index === "number" ? c.index : currentSectionIndex),
+        totalParagraphs: visible.length,
+        paragraphs: kept.paragraphs,
+        returnedChars: kept.used,
+        truncated: kept.truncated,
+        nextFromPara: null,
+      };
+    }
+    return { ok: false, error: "empty_result", scope: "page" };
+  }
+
+  /** 只收与可见窗口相交的顶层段落（分页/滚动两种排版共用） */
+  function collectPageParagraphs(doc: Document, vis: { left: number; top: number; right: number; bottom: number }): string[] {
+    let els: Element[] = [];
+    try { els = Array.from(doc.querySelectorAll(AI_PARA_SELECTOR)); } catch { return []; }
+    const set = new Set(els);
+    const out: string[] = [];
+    for (const el of els) {
+      // 与章节快照同口径：嵌套块只保留最外层，避免重复喂同一段
+      let parent = el.parentElement;
+      let nested = false;
+      while (parent && parent !== doc.body) {
+        if (set.has(parent)) { nested = true; break; }
+        parent = parent.parentElement;
+      }
+      if (nested) continue;
+      const text = normalizeQuote(el.textContent || "");
+      if (!text) continue;
+      let rects: DOMRect[] = [];
+      try { rects = Array.from(el.getClientRects()); } catch { continue; }
+      if (!visibleRects(rects, vis).length) continue;
+      out.push(text);
+    }
+    return out;
+  }
+
+  /**
+   * PDF 当前页文本：textLayer 的 span 是「文本项」，按 y 归行后按行距归段。
+   * 不做精确版面重建，只求给 AI 一段连续、可引用（逐字）的原文。
+   */
+  function readPdfTextLayerLines(doc: Document): string[] {
+    let tl: HTMLElement | null = null;
+    try { tl = doc.querySelector(".textLayer") as HTMLElement | null; } catch { tl = null; }
+    if (!tl) return [];
+    let spans: HTMLElement[] = [];
+    try { spans = Array.from(tl.querySelectorAll("span")) as HTMLElement[]; } catch { return []; }
+    type Line = { text: string; top: number; height: number };
+    const lines: Line[] = [];
+    let cur: Line | null = null;
+    for (const s of spans) {
+      const text = normalizeQuote(s.textContent || "");
+      if (!text) continue;
+      let r: DOMRect;
+      try { r = s.getBoundingClientRect(); } catch { continue; }
+      if (!cur || Math.abs(r.top - cur.top) > Math.max(2, Math.min(cur.height, r.height) * 0.6)) {
+        if (cur) lines.push(cur);
+        cur = { text, top: r.top, height: Math.max(1, r.height) };
+      } else {
+        cur.text = normalizeQuote(`${cur.text} ${text}`);
+        cur.height = Math.max(cur.height, r.height);
+      }
+    }
+    if (cur) lines.push(cur);
+    const out: string[] = [];
+    let para = "";
+    let prev: Line | null = null;
+    for (const line of lines) {
+      if (prev && line.top - prev.top > Math.max(prev.height, line.height) * 1.9 && para) {
+        out.push(para);
+        para = "";
+      }
+      para = para ? `${para} ${line.text}` : line.text;
+      prev = line;
+    }
+    if (para) out.push(para);
+    return out;
+  }
+
+  /**
+   * AI 面板的只读工具宿主（进程内直调，比走内核广播少一跳）。
+   * 只暴露读能力；写入仍留在 applyAiAnnotations（P2 的笔记管线再统一管）。
+   */
+  function getAiToolHost() {
+    return {
+      getState: () => getReaderAiState(),
+      getChapter: (opts: { sectionIndex?: number; fromPara?: number; maxChars?: number }) => getChapterSnapshot(opts),
+      getRange: (opts: { fromSection?: number; toSection?: number; maxChars?: number }) => getChapterRangeSnapshot(opts),
+      listToc: () => getBookToc(),
+      locate: (opts: { quote: string; sectionIndex?: number }) => locateAiQuote(opts),
+      listAnnotations: async (opts: { origin?: string }) => listAiAnnotations(opts),
+    };
+  }
+
+  /**
+   * AI 页签（2026-11-05）：把面板所需的宿主能力打包给外部组件。
+   *
+   * 与右侧停靠的 AiPanel 用**同一批函数**，不复制实现；页签只是一个
+   * 换宿主（活动阅读器 → 锁定书）的壳。调用方每次都取最新快照
+   * （书名/章节会变），因此这里返回的是「此刻」的值。
+   */
+  export function getAiPanelHost() {
+    return {
+      bookId,
+      bookTitle: meta?.title || title,
+      bookAuthor: meta?.author || "",
+      chapterLabel,
+      getChapter: getChapterSnapshot,
+      getPage: getPageSnapshot,
+      getRange: getChapterRangeSnapshot,
+      getToc: getBookToc,
+      getReaderToolHost: getAiToolHost,
+      readKnowledge: readAiKnowledge,
+      resolveNoteTarget: resolveAiNoteTarget,
+      writeNotePlan: writeAiNotePlan,
+      onLocate: onAiLocate,
+      getPrimer: () => primerStore?.get?.(bookId) || "",
+    };
+  }
+
+  /* ============================ P2：知识区 + 笔记写入 ============================ */
+
+  /**
+   * 知识区读取缓存：同一文档 60s 内不重复导出。
+   * 导出整篇文档是重活，而用户连续追问时知识区通常没变；
+   * 换书/换文档按 docId 自然失效，不额外做过期清理。
+   */
+  let knowledgeCache: { docId: string; at: number; markdown: string } | null = null;
+  const KNOWLEDGE_CACHE_MS = 60_000;
+
+  /** 供面板注入：读知识区文档的 Markdown（只读，失败返回原因） */
+  async function readAiKnowledge(src: KnowledgeSource): Promise<{ ok: boolean; markdown?: string; error?: string }> {
+    const docId = String(src?.docId || "").trim();
+    if (!docId) return { ok: false, error: t("未选择知识区文档") };
+    const now = Date.now();
+    if (knowledgeCache && knowledgeCache.docId === docId && now - knowledgeCache.at < KNOWLEDGE_CACHE_MS) {
+      return { ok: true, markdown: knowledgeCache.markdown };
+    }
+    const api = await loadDocPickerApi();
+    if (!api?.exportMdContent) {
+      return { ok: false, error: t("思源接口未就绪，无法读取知识区") };
+    }
+    try {
+      const res: any = await api.exportMdContent(docId, false, false, 2, 0, false);
+      const md = String(res?.content ?? res?.data?.content ?? "").trim();
+      if (!md) return { ok: false, error: t("知识区文档没有可读内容") };
+      knowledgeCache = { docId, at: now, markdown: md };
+      return { ok: true, markdown: md };
+    } catch (__e) {
+      logSwallow(__e, "ReaderView.svelte · readAiKnowledge", "warn");
+      return { ok: false, error: __e instanceof Error ? __e.message : String(__e) };
+    }
+  }
+
+  /**
+   * 解析本书的笔记落点（per-book → 全局 → 自动建档兜底）。
+   * 只解析不写入；预览卡先用它告诉用户「会写进哪篇」。
+   *
+   * ⚠️ `create=false`（预览）时**不把 store 传给解析器**，跳过自动建档
+   * 的副作用——用户点了「存为笔记」又放弃，不该凭空多出一篇文档。
+   * 此时若只差自动建档，返回 willCreate 让预览写「将新建《书名》」。
+   */
+  async function resolveAiNoteTarget(opts: { create?: boolean } = {}) {
+    try {
+      const resolved = await resolveExportTargetAsync(
+        bookId,
+        store.get(bookId),
+        settings,
+        opts.create ? store : undefined,
+      );
+      const target = resolved.target;
+      if (!target) {
+        const nbId = String((settings as any)?.autoNotebookId || "").trim();
+        const autoOn = (settings as any)?.autoArchiveEnabled !== false;
+        if (!opts.create && nbId && autoOn) {
+          return {
+            ok: true as const,
+            docId: "",
+            docTitle: String(meta?.title || title).trim(),
+            notebookName: String((settings as any)?.autoNotebookName || "").trim(),
+            autoCreated: false,
+            willCreate: true,
+          };
+        }
+        return {
+          ok: false as const,
+          error: t("请先设置本书的笔记发送目标：书架上右键这本书，或到「设置 → 笔记与摘录」"),
+        };
+      }
+      return {
+        ok: true as const,
+        docId: target.docId,
+        docTitle: target.docTitle || "",
+        notebookName: target.notebookName || "",
+        autoCreated: resolved.autoCreated,
+      };
+    } catch (__e) {
+      logSwallow(__e, "ReaderView.svelte · resolveAiNoteTarget", "warn");
+      return { ok: false as const, error: __e instanceof Error ? __e.message : String(__e) };
+    }
+  }
+
+  /**
+   * 把确认后的笔记方案追加到本书的笔记文档。
+   *
+   * 与摘录导出同一套安全口径：**只追加不覆盖**、写入前探活、失败把原因
+   * 原样回给面板（面板再展示，不在这里 toast，避免与面板提示重复）。
+   */
+  async function writeAiNotePlan(plan: NotePlan) {
+    const resolved = await resolveAiNoteTarget({ create: true });
+    if (!resolved.ok) return resolved;
+    const api = await loadDocPickerApi();
+    if (!api?.appendBlock) {
+      return { ok: false as const, error: t("思源接口未就绪，请稍后重试") };
+    }
+    const alive = await probeDoc(api, resolved.docId);
+    if (alive === false) {
+      return { ok: false as const, error: t("目标文档已被删除，请重新设置发送目标") };
+    }
+    const md = composeNoteMarkdown(plan, {
+      bookTitle: meta?.title || title,
+      author: meta?.author || "",
+      chapterTitle: resolveChapterTitle(currentSectionIndex) || chapterLabel,
+      createdAt: Date.now(),
+      deepLink: buildBookDeepLinkUrl(currentCfi()),
+    });
+    if (!md) return { ok: false as const, error: t("笔记内容为空，未写入") };
+    try {
+      await api.appendBlock(resolved.docId, "markdown", md);
+      return {
+        ok: true as const,
+        docId: resolved.docId,
+        docTitle: resolved.docTitle,
+        notebookName: resolved.notebookName,
+        autoCreated: resolved.autoCreated,
+      };
+    } catch (__e) {
+      logSwallow(__e, "ReaderView.svelte · writeAiNotePlan", "warn");
+      return { ok: false as const, error: __e instanceof Error ? __e.message : String(__e) };
+    }
+  }
+
+  /**
    * 归一化整章正文（空白压成一个空格、去零宽），同时保留
    * 「归一化字符下标 → 原始文本节点/偏移」映射，供 quote → Range 反查。
    */
@@ -9045,7 +9840,8 @@ function applyTopHandleHitHeight() {
           v.item.quote,
           v.item.style as AnnotationStyle,
           v.item.color || lastColor,
-          v.item.note,
+          // 空 note 不覆盖已有笔记（AI 划线落在用户批注范围上时不得清空用户内容）
+          v.item.note || undefined,
           undefined,
           undefined,
           "ai",
@@ -9072,6 +9868,40 @@ function applyTopHandleHitHeight() {
       total: results.length,
       okCount,
       results,
+    };
+  }
+
+  /**
+   * AI 工具：列出一本书的已有批注（只读）。
+   * 返回形状与内核桥 handleListAnnotations 一致，模型不必区分两条通道。
+   */
+  export function listAiAnnotations(opts: { origin?: string } = {}) {
+    if (!annStore) { try { annStore = getAnnotationStore(); } catch { annStore = null; } }
+    let all: any[] = [];
+    try {
+      all = annStore?.getByBook?.(bookId) || [];
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · listAiAnnotations", "warn");
+      return { ok: false, error: "internal" };
+    }
+    const origin = String(opts.origin || "").toLowerCase();
+    const filtered = origin === "ai" || origin === "manual" ? all.filter((a) => a.origin === origin) : all;
+    return {
+      ok: true,
+      bookId,
+      title: meta?.title || title,
+      total: all.length,
+      returned: Math.min(filtered.length, 200),
+      items: filtered.slice(0, 200).map((a: any) => ({
+        id: a.id,
+        quote: a.selectedText || a.sentence || "",
+        note: a.note || "",
+        style: a.style || "highlight",
+        color: a.color || "",
+        origin: a.origin || "manual",
+        cfi: a.cfi || "",
+        createdAt: a.createdAt || "",
+      })),
     };
   }
 
@@ -9210,6 +10040,13 @@ function applyTopHandleHitHeight() {
     contentPointerHeld = false; // 松手：解除「拖选中」避让，此后滚动可正常收起
     // 2026-10-25 角落自动翻页：原生拖选松手即取消角驻留（L 动画收回、dwell 作废）
     cornerMachine.cancel();
+    // 2026-11-05 修复「标注过的文段无法再加批注」：
+    // mousedown 落在高亮上不一定只是点高亮 —— 用户也可能从高亮内部起手拖选新文字。
+    // 若松手时存在非折叠选区，说明这是一次拖选而非单击，必须解除 onContentMouseDown
+    // 设下的抑制，否则 showToolbarFor 会吞掉本次创建工具栏，永远弹不出来。
+    if (suppressNextCreateToolbar && readReaderSelection()) {
+      suppressNextCreateToolbar = false;
+    }
     // 等选区稳定后再读取；foliate 内容 doc 可能在该刻尚未就绪，加有限重试兜底
     scheduleReadSelection();
   }
@@ -9218,6 +10055,7 @@ function applyTopHandleHitHeight() {
    *  用即时 hardClose（不走 140ms 收起动画）：工具栏/手柄在主文档浮层里位置固定，正文在 iframe 内滚动，
    *  动画期间会「钉在原地与文字脱节」，瞬收更干净。避让：拖手柄中、或正按住鼠标拖选（边缘自动滚动）时不收。 */
   function hideSelOnScroll(): void {
+    hideTip(); // 滚动后锚点已失效，提示不能悬在旧位置
     if (selHandleDragging || contentPointerHeld) return;
     if (selToolbar.visible || selHandles.visible) hardCloseSelToolbar();
   }
@@ -9665,6 +10503,7 @@ function applyTopHandleHitHeight() {
    *  滚动后选区矩形已变，浮层仍停在旧坐标 → 视觉「脱钩」错位。收起比错位更可接受，
    *  也契合「滚动=放弃临时浮层」的心理模型。注：此事不含 TOC/设置/搜索等常驻面板。 */
   function onRelocate() {
+    hideTip(); // 换页后按钮可能被卸载/移位，提示必须立即收起
     // 2026-10-14 伪 relocate 防御：思源按 Shift 时（shiftIsPressed + body--shift-pressed +
     // 强制刷新浮窗）会引起书页布局抖动 → foliate 发 relocate → 误走「滚动=收起全部浮层」，
     // 批注卡在输入中被关。判别：Shift 模式期间，或「无真实滚动(>800ms) 且焦点在批注输入框」
@@ -10161,7 +11000,7 @@ function applyTopHandleHitHeight() {
   }
 
   /** R3 类型收口：绘制 overlay 所需的最小入参（真源是 annStore，此处只取画图相关字段） */
-  type AnnDrawInput = { id?: string; cfi?: string; segments?: { index: number; cfi: string }[]; color?: string; style?: unknown; note?: string; deletedAt?: string };
+  type AnnDrawInput = { id?: string; cfi?: string; segments?: { index: number; cfi: string }[]; color?: string; style?: unknown; note?: string; selectedText?: string; deletedAt?: string };
 
   /**
    * 把单条批注绘制进 foliate（异步；用返回 index 回填 cfi→章节缓存）。
@@ -10182,12 +11021,40 @@ function applyTopHandleHitHeight() {
     if (isPdfBook()) return;
     const color = it.color;
     const style = normalizeAnnotationStyle(typeof it.style === "string" ? it.style : undefined) as AnnotationStyle;
-    let cfis = annotationCfis(it);
+    const allCfis = annotationCfis(it);
+    let cfis = allCfis;
     if (onlyCfis) cfis = cfis.filter((c) => onlyCfis.has(c));
     if (!cfis.length) return;
     for (const cfi of cfis) {
       await drawAnnotationCfi(cfi, color, style, it);
     }
+    // 2026-11-05 可点击批注气泡：独立 overlay（key = foliate-note:<首段 cfi>），
+    // 只画在首段；带笔记内容才画，纯高亮/已清空笔记要删掉残存气泡。
+    const noteText = String(it.note || "").trim();
+    const primary = allCfis[0];
+    if (!primary) return;
+    const hasNote = !!noteText && noteText !== String(it.selectedText || "").trim();
+    if (hasNote) {
+      if (cfis.includes(primary)) await drawNoteBadgeCfi(primary, color);
+    } else {
+      await eraseNoteBadgeCfi(primary);
+    }
+  }
+
+  /** 绘制单段批注气泡（独立 overlay；点击由 foliate hitTest → show-annotation 派发） */
+  async function drawNoteBadgeCfi(cfi: string, color: string): Promise<void> {
+    try {
+      await view.addAnnotation({ value: NOTE_KEY_PREFIX + cfi, color, style: "note" });
+    } catch (err) {
+      console.warn("[REword] 批注气泡绘制失败（不影响高亮）:", err);
+    }
+  }
+
+  /** 删除单段批注气泡（仅在没有笔记/删除标注时调用；不碰高亮层） */
+  async function eraseNoteBadgeCfi(cfi: string): Promise<void> {
+    try {
+      await view.deleteAnnotation({ value: NOTE_KEY_PREFIX + cfi, color: "", style: "note" });
+    } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · eraseNoteBadgeCfi", "debug"); }
   }
 
   /** 绘制单段（单 CFI）批注 */
@@ -10297,6 +11164,16 @@ function applyTopHandleHitHeight() {
     dbgHud.drawnCount++;
     dbgHud.lastDraw = `draw style=${style} color=${color} cf=${String(annotation.value || "").slice(0, 20)}`;
 
+    // 2026-11-05 批注气泡分流：foliate-note:<cfi> 是独立 overlay，
+    // 只画可点击气泡（命中区在 noteBadge 内部改写），绝不再叠一层高亮。
+    if (String(annotation.value || "").startsWith(NOTE_KEY_PREFIX)) {
+      draw(Overlayer.noteBadge, {
+        color,
+        frameWidth: doc?.documentElement?.clientWidth || 0,
+      });
+      return;
+    }
+
     if (style === "solid") {
       // 直线段：foliate Overlayer.underline（一条横线下沿）
       // 2026-10-13：调色板切微信读书淡彩系，实线加粗到 2.6 保可见性
@@ -10321,15 +11198,12 @@ function applyTopHandleHitHeight() {
         }
         draw(Overlayer.highlight, { color });
       } else {
-        // 2026-10-14 复刻微信机制：marker 以 0.38 透明度把饱和原色叠成淡彩；
-        // 批注图标：带笔记内容的批注在末行右端画线性气泡，与纯划线区分。
-        // （此处仅按 note 字段判定——foliate annotation 对象不含 selectedText，
-        //   note===选中文本的情况由落库端 isPureHighlight 口径兜底。）
-        const hasNote = String(annotation?.note || "").trim().length > 0;
+        // 2026-10-14 复刻微信机制：marker 以 0.38 透明度把饱和原色叠成淡彩。
+        // 2026-11-05：批注气泡改为独立可点击 overlay（见上方 foliate-note 分支），
+        // 这里不再画内联小图标，避免同一处出现两枚气泡。
         draw(Overlayer.marker, {
           color,
           seed: String(annotation.value || ""),
-          noteIcon: hasNote,
           frameWidth: doc?.documentElement?.clientWidth || 0,
         });
       }
@@ -10359,16 +11233,20 @@ function applyTopHandleHitHeight() {
     suppressNextCreateToolbar = true; // 阻止后续 showToolbarFor 重建
     const { value, rect: evRect } = e.detail;
     if (!value) { console.warn("[REword] onShowAnnotation: 无 value，提前返回", e.detail); return; }
+    // 2026-11-05：批注气泡是独立 overlay（foliate-note:<cfi>）。后续所有数据反查
+    // 都必须用去掉前缀的 CFI，否则 annByValue / annStore 全部查不到 → 误入 ghost 分支。
+    const isNoteBadge = String(value).startsWith(NOTE_KEY_PREFIX);
+    const annValue = isNoteBadge ? String(value).slice(NOTE_KEY_PREFIX.length) : String(value);
     dbg.event("onShowAnnotation", "▶ 入口", { value: value, index: e.detail?.index });
     // 反查标注记录：优先 annByValue（cfi → 记录），未命中时用 annStore 兜底。
     // 2026-08-24 修复：cfi 比较做宽松匹配（去 epubcfi() 包装、互为前缀），
     // 避免 foliate 内部存储的 cfi 与 annStore 存的 cfi 因 wrap/normalize 差异而
     // 精确匹配失败，导致"高亮在但点不出工具栏"的静默失败。
-    let rec = annByValue.get(value);
+    let rec = annByValue.get(annValue);
     const normCfi = (s: string) => String(s || "").replace(/^epubcfi\(/i, "").replace(/\)+$/, "");
     dbg.step("onShowAnnotation", "annByValue 快路径命中?", { hit: !!rec, id: rec?.id, cfi: rec?.cfi });
     if (!rec && annStore && bookId) {
-      const target = normCfi(value);
+      const target = normCfi(annValue);
       const byBook = annStore.getByBook(bookId);
       const hit =
         byBook.find((it: any) => normCfi(it.cfi) === target) ||
@@ -10379,12 +11257,12 @@ function applyTopHandleHitHeight() {
       if (hit) {
         rec = { id: hit.id, cfi: hit.cfi ?? "", color: hit.color ?? "" };
         // 同步回 annByValue，后续点击走快路径
-        annByValue.set(value, rec);
+        annByValue.set(annValue, rec);
       }
     }
     // ★★ 关键诊断：rec 确定后立即记录路径与内容（用于排查 id=undefined 根因）
     const recPath = (function() {
-      const fast = annByValue.get(value);
+      const fast = annByValue.get(annValue);
       if (fast && fast === rec) return "FAST";
       if (rec) return "SLOW(getByBook)";
       return "GHOST";
@@ -10399,12 +11277,12 @@ function applyTopHandleHitHeight() {
       const cx = (readerViewEl?.clientWidth ?? window.innerWidth) / 2;
       // 2026-08-25 修复：ghost 分支也必须带上 cfi，否则 applyEditStyle/Color 拿不到定位键 → 样式改不了。
       // foliate 以 CFI 标识标注，无需数据库 id 即可重绘。
-      selToolbar = { visible: true, x: cx, y: 80, text: "", mode: "edit", editingId: null, place: "above", ghostCfi: value, annCfi: value, narrow: selToolbarNarrow(getContentBounds()), annId: null, annStyle: null, annColor: null };
-      selInfo = { index: -1, cfi: value, range: null };
+      selToolbar = { visible: true, x: cx, y: 80, text: "", mode: "edit", editingId: null, place: "above", ghostCfi: annValue, annCfi: annValue, narrow: selToolbarNarrow(getContentBounds()), annId: null, annStyle: null, annColor: null };
+      selInfo = { index: -1, cfi: annValue, range: null };
       // 2026-08-24 根治：残留高亮只有视觉、无数据记录，缓存 cfi 供 onClearGhostHighlight 使用
       activeAnnId = null;
-      activeAnnCfi = value;
-      console.log("[REword] onShowAnnotation ghost 分支: ghostCfi=", value, ", editingId=", selToolbar.editingId);
+      activeAnnCfi = annValue;
+      console.log("[REword] onShowAnnotation ghost 分支: ghostCfi=", annValue, ", editingId=", selToolbar.editingId);
       return;
     }
     // 2026-08-26 根因修复：annByValue 缓存可能存入 id=undefined 的脏记录（历史代码路径
@@ -10414,7 +11292,7 @@ function applyTopHandleHitHeight() {
       console.warn("[REword] onShowAnnotation: rec.id 为空！尝试用 CFI 反查 store 补全...", { cfi: rec.cfi, value });
       const byBook = annStore.getByBook(bookId);
       const normCfi = (s: string) => String(s || "").replace(/^epubcfi\(/i, "").replace(/\)+$/, "");
-      const target = normCfi(rec.cfi || value);
+      const target = normCfi(rec.cfi || annValue);
       const hit =
         byBook.find((it: any) => normCfi(it.cfi) === target) ||
         byBook.find((it: any) => {
@@ -10424,7 +11302,7 @@ function applyTopHandleHitHeight() {
       if (hit?.id) {
         console.log("[REword] onShowAnnotation: id 补全成功", { oldId: rec.id, newId: hit.id, cfi: target });
         rec = { id: hit.id, cfi: rec.cfi || hit.cfi || "", color: rec.color || hit.color || "" };
-        annByValue.set(value, rec);  // 修复缓存，后续走快路径不再命中脏数据
+        annByValue.set(annValue, rec);  // 修复缓存，后续走快路径不再命中脏数据
       } else {
         console.warn("[REword] onShowAnnotation: id 补全失败！store 中也找不到该 CFI 的记录，降级为 ghost", { target, byBookCount: byBook.length });
       }
@@ -10489,6 +11367,19 @@ function applyTopHandleHitHeight() {
         classify: stored ? classifyAnnotation(stored) : "?",
       });
     }
+    // 2026-11-05：点的是「批注气泡」→ 语义明确（这条有笔记），直接开批注卡；
+    // 若数据已退化为纯高亮（清空笔记但气泡残留），则改开就地编辑器而不是空卡片。
+    if (isNoteBadge) {
+      if (stored && !pure) {
+        showPreviewViewer(rec, rect);
+      } else if (stored) {
+        openNoteEditorForRecord(rec, rect);
+        void eraseNoteBadgeCfi(annValue); // 纯高亮不应再有气泡（自愈）
+      } else {
+        void eraseNoteBadgeCfi(annValue); // 数据已删：清掉孤儿气泡
+      }
+      return;
+    }
     if (stored && pure) {
       openHighlightEditToolbar(rec, rect);
       console.log("[REword] onShowAnnotation 分支(纯高亮→selToolbar edit): rec.id=", rec.id, ", rec.cfi=", rec.cfi);
@@ -10504,7 +11395,9 @@ function applyTopHandleHitHeight() {
     selectedText: string,
     style: AnnotationStyle,
     color: string,
-    note: string,
+    // undefined = 不改动已有记录的 note（「标注」只负责划线，不能把用户写的批注清空）。
+    // 旧实现传 ""，命中同位置旧记录时 upsert 会把它当成「用户清空笔记」覆盖掉。
+    note: string | undefined,
     group?: string,
     type?: AnnotationType,
     // 2026-11-04 AI 桥：AI 写入标 origin="ai"（数据层早已有该字段与 ai 元信息槽），
@@ -10528,11 +11421,13 @@ function applyTopHandleHitHeight() {
       segments: segs,
       sentence: selectedText,       // 书籍场景：上下文即选中文本
       selectedText,
-      note,
+      // note 省略时保留旧值（upsert 的 undefined 语义），避免「只划线」清掉已有批注
+      note: note === undefined ? undefined : note,
       origin,
       color,
       style,
-      type: type || (note && note.trim() ? "annotate" : "highlight"), // 缺省按有无 note 推断
+      // 缺省按有无 note 推断；note 省略（只划线）时不写 type，交给 store 沿用旧记录的形态
+      type: type || (note === undefined ? undefined : (note.trim() ? "annotate" : "highlight")),
       group: group || "未分组",
       scope: style === "highlight" ? "word" : "sentence",
       // 2026-09-03 双保险：记录媒体类型 + PDF 页码兜底（无 CFI 时跳转用）
@@ -10597,7 +11492,8 @@ function applyTopHandleHitHeight() {
     const cfi = selInfo?.cfi;
     const text = selToolbar.text?.trim();
     if (!cfi || !text) { toast(t("请先选中文本")); return; }
-    await saveHighlight(cfi, text, lastStyle, lastColor, "");
+    // note 传 undefined：同位置若已有带笔记的批注，只改样式/颜色，不碰已有笔记
+    await saveHighlight(cfi, text, lastStyle, lastColor, undefined);
     // saveHighlight 内部已把记录登记进 annByValue（草稿 id 也有效），故这里能直接取回 rec。
     // 取不到（存储不可用 / 无 bookId，saveHighlight 内已 toast）时退回关闭，不留一个死工具栏。
     const rec = annByValue.get(cfi);
@@ -10605,7 +11501,41 @@ function applyTopHandleHitHeight() {
     else closeSelToolbar();
   }
 
-  // edit 态「批注」按钮：打开该标注的查看气泡（时间 + 原文 + 批注 + 标签 + 即时改色/样式 + 复制/编辑/删除）。
+  /**
+   * 打开「已有标注的批注编辑器」（create 态形态 + 绑定 id = 就地更新）。
+   * Readest 语义：点高亮 → 「批注」→ 直接进笔记编辑，而不是先给一张只读预览再点编辑。
+   * 纯高亮（note 为空或等于选中文本）的 note 预填为空 —— 历史数据会把选中词回填进
+   * note，直接显示会让人以为「已经有批注了」。
+   */
+  function openNoteEditorForRecord(rec: { id: string; cfi: string; color: string }, rect?: SelRect | null) {
+    cancelPendingClose();
+    if (!annStore) { try { annStore = getAnnotationStore(); } catch { annStore = null; } }
+    const stored = annStore?.get(rec.id);
+    if (!stored) { closeSelToolbar(); return; }
+    const style = (stored.style as AnnotationStyle) || "highlight";
+    const color = stored.color || rec.color;
+    const cfi = stored.cfi || rec.cfi;
+    lastStyle = style; lastColor = color;
+    const pos = rect
+      ? positionPopupNear(rect, NOTE_CARD_W, 190)
+      : { x: (readerViewEl?.clientWidth ?? window.innerWidth) / 2, y: 80, place: "below" as ToolbarPlace };
+    const pure = isPureHighlight(stored);
+    const annStyle = ANNOTATION_STYLES[style] || { label: t("直线") };
+    noteEditor = {
+      visible: true, x: pos.x, y: pos.y, mode: "create",
+      id: stored.id, cfi,
+      text: stored.selectedText ?? stored.note ?? "",
+      note: pure ? "" : (stored.note ?? ""),
+      style, color,
+      group: stored.group ?? "未分组",
+      time: fmtTime(stored.updatedAt || stored.createdAt),
+      labels: resolveLabels(stored.labels),
+      styleLabel: t(annStyle.label),
+      place: pos.place,
+    };
+  }
+
+  // edit 态「批注」按钮：直接在已有标注上写/改笔记（Readest 式，不再中转只读预览卡）。
   function onEditAnnotate() {
     if (selToolbar.mode !== "edit" || !selToolbar.annId) return;
     // 2026-11-03：先把 annId 取到局部 —— 下面 selToolbar 被整体重赋值，
@@ -10616,7 +11546,7 @@ function applyTopHandleHitHeight() {
     // 2026-08-25 机制级修复：关闭工具栏 + 抑制 selectionchange 重建
     selToolbar = { ...selToolbar, visible: false };
     suppressNextCreateToolbar = true;
-    showViewerForRec({ id: annId, cfi: annCfi, color: annColor }, lastSelRect);
+    openNoteEditorForRecord({ id: annId, cfi: annCfi, color: annColor }, lastSelRect);
   }
 
   // 「批注」按钮（create 模式）：打开统一批注浮层（mode='create'），文本预览 + 样式/颜色 + note 输入 + 取消/保存。
@@ -10633,6 +11563,14 @@ function applyTopHandleHitHeight() {
     const text = selToolbar.text?.trim();
     const cfi = selInfo?.cfi;
     if (!text || !cfi) { toast(t("请先选中文本")); return }
+    // 竞合：选区正好落在一条已有标注上（同范围再选一次）→ 直接就地编辑那条记录，
+    // 不再新建第二条。完全包含/部分交叉仍按新标注处理（Readest 同样只认精确范围）。
+    if (!annStore) { try { annStore = getAnnotationStore(); } catch { annStore = null; } }
+    const existing = bookId ? annStore?.getByCfi(bookId, cfi, true) : null;
+    if (existing) {
+      openNoteEditorForRecord({ id: existing.id, cfi: existing.cfi || cfi, color: existing.color || lastColor }, lastSelRect);
+      return;
+    }
     // 定位：统一用 positionPopupNear（锚定选区末端 + 四向避让 + 边界夹紧）。
     // 优先用已保存的选区矩形（lastSelRect 已是选区末端 clientRect，跟手）；
     // 极端情况无 rect 时兜底用工具栏当前位置，保证弹窗一定出现。
@@ -10767,6 +11705,7 @@ function applyTopHandleHitHeight() {
     const { cfi, text, style, color, note, group, id } = noteEditor;
     if (!cfi || !text) { toast(t("请先选中文本")); return; }
     lastStyle = style; lastColor = color; lastGroup = group; // 同步偏好，供「高亮」复用
+    setLastAnnotationGroup(group); // 分组也跨会话记住（与颜色/线型同一份配置）
     const noteVal = note?.trim() || "";
     if (id) {
       // 更新已有标注：upsert(id) 就地更新 note/样式/颜色/类型
@@ -10809,7 +11748,8 @@ function applyTopHandleHitHeight() {
       //
       // `onProtectTab` 的 prop 与实现**保留在 reader-tab.ts**，将来若确有需要可重新接上。
     } else {
-      await saveHighlight(cfi, text, style, color, noteVal, group, "annotate");
+      // 空笔记落成纯高亮（不虚标为「批注」）；type 与 note 实际内容保持一致
+      await saveHighlight(cfi, text, style, color, noteVal, group, noteVal ? "annotate" : "highlight");
       noteEditor = { ...noteEditor, visible: false, mode: "create", id: null };
       closeSelToolbar();
       toast(t("已保存批注"));
@@ -11676,6 +12616,8 @@ function applyTopHandleHitHeight() {
     } catch (e) {
       console.warn("[REword] foliate deleteAnnotation 抛错:", e);
     }
+    // 2026-11-05：批注气泡是独立 key，必须一并删除（步骤 2 的前缀匹配也能兜底）
+    await eraseNoteBadgeCfi(cfi);
     // 2) 兜底：按 key 遍历所有已渲染 overlay（foliate 原生）强制移除（宽松 CFI 匹配）
     const removed = eraseOverlayKey(view, cfi);
     const still = hasOverlayKey(view, cfi);
@@ -12101,6 +13043,23 @@ function applyTopHandleHitHeight() {
     refreshBookmarks();
   }
   onMount(() => {
+    // 自绘 tooltip：只在真正有 hover 能力的设备启用；
+    // 触屏上 pointerover 也会派发，不拦住就会「点一下就冒提示」。
+    tipMq = window.matchMedia?.("(hover: hover)") ?? null;
+    tipHoverOk = tipMq ? tipMq.matches : !isTouchDevice();
+    tipMqHandler = () => {
+      tipHoverOk = tipMq ? tipMq.matches : !isTouchDevice();
+      if (!tipHoverOk) hideTip();
+    };
+    tipMq?.addEventListener?.("change", tipMqHandler);
+    // 浮层自身或宿主容器滚动时，锚点位置失效 ⇒ 立即收起（iframe 内的滚动由 onRelocate 兜底）。
+    document.addEventListener("scroll", hideTip, true);
+    // 宿主分屏拖拽兜底（B）：捕获阶段先于思源挂在 document 上的拖拽 mousemove。
+    document.addEventListener("mousemove", healStaleHostDrag, true);
+    // 整页重载/关窗时 Svelte onDestroy 不会跑，靠 pagehide 把防抖中的进度尽量写盘。
+    window.addEventListener("pagehide", flushProgressOnPageHide);
+    // 切后台/锁屏时进程可能被系统回收，同步记一份进度日志。
+    document.addEventListener("visibilitychange", onProgressVisibilityChange);
     unsubSettings = settingsStore.subscribe((s) => {
       // 2026-10-06：组件销毁后 DOM 已卸载，此处任何 DOM 读取都可能抛 undefined 错，
       // 而订阅回调是**同步**被 store.set 触发的 —— 抛出的异常会冒泡进 Svelte 的
@@ -12207,6 +13166,12 @@ function applyTopHandleHitHeight() {
     isIphoneMode = isSmallMobile();
     // 2026-10-25 P0-1：常驻侧边栏偏好（停靠开关 + 宽度）
     loadSidebarPrefs();
+    // 2026-11-05：停靠模式下恢复上次面板（浮层态不自动弹，避免打断阅读）
+    if (sidebarPinned && restoredPanel) {
+      if (restoredPanel === "search") toggleSearch();
+      else void toggleDrawer(restoredPanel);
+      restoredPanel = null;
+    }
     // 2026-10-25 搜索增强：模式 + 历史（localStorage）
     loadSearchUiPrefs();
     if (typeof window !== "undefined") {
@@ -12277,6 +13242,12 @@ function applyTopHandleHitHeight() {
 
   onDestroy(() => {
     isDestroyed = true; // 2026-10-06：阻断销毁后的 settings 订阅回调
+    cancelTipTimer();
+    if (tipMq && tipMqHandler) tipMq.removeEventListener?.("change", tipMqHandler);
+    document.removeEventListener("scroll", hideTip, true);
+    document.removeEventListener("mousemove", healStaleHostDrag, true);
+    window.removeEventListener("pagehide", flushProgressOnPageHide);
+    document.removeEventListener("visibilitychange", onProgressVisibilityChange);
     if (unsubSettings) unsubSettings();
     if (unsubAnnChanged) unsubAnnChanged();
     // 2026-09-01：注销 annStore 订阅(避免组件销毁后回调仍被触发)
@@ -12437,12 +13408,19 @@ function applyTopHandleHitHeight() {
   bind:this={readerViewEl}
   on:mousemove={onReaderMouseMove}
   on:mouseleave={onReaderLeave}
+  on:pointerover={onTipPointerOver}
+  on:pointerout={onTipPointerOut}
+  on:focusin={onTipFocusIn}
+  on:focusout={onTipFocusOut}
+  on:pointerdown={hideTip}
+  on:wheel={hideTip}
   data-view-transition-root=""
   class:re-phone={viewportBp === "phone"}
   class:re-large-phone={viewportBp === "largePhone"}
   class:re-tablet={viewportBp === "tablet"}
   class:sidebar-docked={anyDockPanel()}
-  style="--re-sidebar-w:{sidebarWidth}px"
+  class:ai-docked={showAiPanel && !aiOverlay}
+  style="--re-sidebar-w:{sidebarWidth}px;--re-ai-w:{aiPanelWidth}px"
 >
   <!-- 2026-10-08 顶栏浮层化：脱离文档流、浮在正文上方。
        · class:reader-toolbar-floating —— 悬浮模式（topBarFloating，默认开）
@@ -12526,7 +13504,14 @@ function applyTopHandleHitHeight() {
             onToggleBilingual={toggleBilingual}
           />
         {/if}
-        <!-- 图书与 PDF 共用：设置 + 搜索 -->
+        <!-- 图书与 PDF 共用：阅读助手 + 设置 + 搜索 -->
+        <button
+          class="reader-btn reader-ai-btn"
+          title={t("阅读助手（AI，读当前章节）")}
+          aria-label={t("阅读助手")}
+          class:reader-btn-active={showAiPanel}
+          on:click={toggleAiPanel}
+        >✦</button>
         <button
           class="reader-btn reader-settings-btn"
           title={t("设置")}
@@ -12752,12 +13737,12 @@ function applyTopHandleHitHeight() {
 
       <div class="reader-search-options">
         <div class="reader-search-scope">
-          <button class="reader-seg reader-seg-sm" class:reader-seg-active={searchScope === "book"} on:click={() => (searchScope = "book")}>{t("全书")}</button>
-          <button class="reader-seg reader-seg-sm" class:reader-seg-active={searchScope === "chapter"} on:click={() => (searchScope = "chapter")}>{t("当前章")}</button>
+          <button class="reader-seg reader-seg-sm" class:reader-seg-active={searchScope === "book"} on:click={() => setSearchScope("book")}>{t("全书")}</button>
+          <button class="reader-seg reader-seg-sm" class:reader-seg-active={searchScope === "chapter"} on:click={() => setSearchScope("chapter")}>{t("当前章")}</button>
         </div>
-        <label class="reader-search-opt"><input type="checkbox" bind:checked={searchCaseSensitive} on:change={startSearch} />{t("大小写")}</label>
+        <label class="reader-search-opt"><input type="checkbox" bind:checked={searchCaseSensitive} on:change={onSearchOptionChange} />{t("大小写")}</label>
         <!-- 正则档全字无意义（词边界由 \b 自管）→ 置灰防误解 -->
-        <label class="reader-search-opt" class:reader-search-opt-disabled={searchMode === "regex"}><input type="checkbox" bind:checked={searchWholeWord} disabled={searchMode === "regex"} on:change={startSearch} />{t("全字")}</label>
+        <label class="reader-search-opt" class:reader-search-opt-disabled={searchMode === "regex"}><input type="checkbox" bind:checked={searchWholeWord} disabled={searchMode === "regex"} on:change={onSearchOptionChange} />{t("全字")}</label>
       </div>
 
       <!-- 2026-10-25 搜索增强：模式行（普通/正则/附近词，foliate matcher 原生三模式透传） -->
@@ -12843,6 +13828,10 @@ function applyTopHandleHitHeight() {
           <span>{t("双语翻译设置")}</span>
         </button>
       {/if}
+      <button class="reader-more-item" role="menuitem" on:click={onMoreAi}>
+        <span>✦ {t("阅读助手")}</span>
+        <span class="reader-more-item-state">{showAiPanel ? t("开") : t("关")}</span>
+      </button>
       <button class="reader-more-item" role="menuitem" on:click={onMoreSettings}>
         <span>⚙ {t("设置")}</span>
       </button>
@@ -13185,52 +14174,52 @@ function applyTopHandleHitHeight() {
         {#if selToolbar.mode === "edit"}
           {#if selToolbar.ghostCfi}
             <!-- 2026-08-24 死锁解除：数据已无活跃记录但视觉残留时，只给「清除残留高亮」入口 -->
-            <button class="reader-sel-item reader-sel-item-danger" title={t("清除残留高亮")} on:click={onClearGhostHighlight}>
+            <button class="reader-sel-item reader-sel-item-danger" data-tip={t("清除残留高亮")} on:click={onClearGhostHighlight}>
               <span class="reader-sel-ico">{@html SEL_ICONS.trash}</span>
               <span class="reader-sel-txt">{t("清除残留高亮")}</span>
             </button>
           {:else}
           <!-- 2026-10-11 槽位对齐素材①：复制在首、「删除划线」在次（替代 create 态的「标注」槽位）。 -->
-          <button class="reader-sel-item" title={t("复制")} on:click={onSelCopy}>
+          <button class="reader-sel-item" data-tip={t("复制")} on:click={onSelCopy}>
             <span class="reader-sel-ico">{@html SEL_ICONS.copy}</span>
             <span class="reader-sel-txt">{t("复制")}</span>
           </button>
-          <button class="reader-sel-item reader-sel-item-danger" title={t("删除划线")} on:click={onAnnDeleteById}>
+          <button class="reader-sel-item reader-sel-item-danger" data-tip={t("删除划线")} on:click={onAnnDeleteById}>
             <span class="reader-sel-ico">{@html SEL_ICONS.trash}</span>
             <span class="reader-sel-txt">{t("删除")}</span>
           </button>
           {#if pdfAnnotEnabled("annotate")}
-          <button class="reader-sel-item" title={t("批注：升级为带笔记标注")} on:click={onEditAnnotate}>
+          <button class="reader-sel-item" data-tip={t("批注：升级为带笔记标注")} on:click={onEditAnnotate}>
             <span class="reader-sel-ico">{@html SEL_ICONS.annotate}</span>
             <span class="reader-sel-txt">{t("批注")}</span>
           </button>
           {/if}
-          <button class="reader-sel-item" title={t("词典")} on:click={onSelDict}>
+          <button class="reader-sel-item" data-tip={t("词典")} on:click={onSelDict}>
             <span class="reader-sel-ico">{@html SEL_ICONS.dict}</span>
             <span class="reader-sel-txt">{t("词典")}</span>
           </button>
           <!-- 2026-10-08「划词后搜索」开关：默认关，加一项按钮会让横向工具栏变挤 -->
           {#if settings.selSearchEnabled}
-          <button class="reader-sel-item" title={t("搜索：查找这个词在书中的其他用法")} on:click={onSelSearch}>
+          <button class="reader-sel-item" data-tip={t("搜索：查找这个词在书中的其他用法")} on:click={onSelSearch}>
             <span class="reader-sel-ico">{@html SEL_ICONS.search}</span>
             <span class="reader-sel-txt">{t("搜索")}</span>
           </button>
           {/if}
-          <button class="reader-sel-item" title={t("翻译")} on:click={onSelTranslate}>
+          <button class="reader-sel-item" data-tip={t("翻译")} on:click={onSelTranslate}>
             <span class="reader-sel-ico">{@html SEL_ICONS.translate}</span>
             <span class="reader-sel-txt">{t("翻译")}</span>
           </button>
-          <button class="reader-sel-item" title={t("朗读")} on:click={onSelSpeak}>
+          <button class="reader-sel-item" data-tip={t("朗读")} on:click={onSelSpeak}>
             <span class="reader-sel-ico">{@html SEL_ICONS.tts}</span>
             <span class="reader-sel-txt">{t("朗读")}</span>
           </button>
-          <button class="reader-sel-item" title={t("发送")} on:click={onSelSend}>
+          <button class="reader-sel-item" data-tip={t("发送")} on:click={onSelSend}>
             <span class="reader-sel-ico">{@html SEL_ICONS.send}</span>
             <span class="reader-sel-txt">{t("发送")}</span>
           </button>
           {/if}
         {:else}
-          <button class="reader-sel-item" title={t("复制")} on:click={onSelCopy}>
+          <button class="reader-sel-item" data-tip={t("复制")} on:click={onSelCopy}>
             <span class="reader-sel-ico">{@html SEL_ICONS.copy}</span>
             <span class="reader-sel-txt">{t("复制")}</span>
           </button>
@@ -13240,7 +14229,7 @@ function applyTopHandleHitHeight() {
           {#if pdfAnnotEnabled("highlight")}
           <button
             class="reader-sel-item reader-sel-item-accent"
-            title={t("标注：使用上次样式（{style} + {color}）", { style: lastStyleLabel, color: lastColorName })}
+            data-tip={t("标注：使用上次样式（{style} + {color}）", { style: lastStyleLabel, color: lastColorName })}
             on:click={onQuickAnnotate}>
             <span class="reader-sel-ico">{@html SEL_ICONS.highlight}</span>
             <span class="reader-sel-txt">{t("标注")}</span>
@@ -13250,34 +14239,39 @@ function applyTopHandleHitHeight() {
           {#if pdfAnnotEnabled("annotate")}
           <button
             class="reader-sel-item reader-sel-item-accent"
-            title={t("批注：打开批注编辑气泡（样式+颜色+笔记）")}
+            data-tip={t("批注：打开批注编辑气泡（样式+颜色+笔记）")}
             on:click={openNoteEditor}>
             <span class="reader-sel-ico">{@html SEL_ICONS.annotate}</span>
             <span class="reader-sel-txt">{t("批注")}</span>
           </button>
           {/if}
-          <button class="reader-sel-item" title={t("词典")} on:click={onSelDict}>
+          <button class="reader-sel-item" data-tip={t("词典")} on:click={onSelDict}>
             <span class="reader-sel-ico">{@html SEL_ICONS.dict}</span>
             <span class="reader-sel-txt">{t("词典")}</span>
           </button>
           <!-- 2026-10-08「划词后搜索」开关：默认关，加一项按钮会让横向工具栏变挤 -->
           {#if settings.selSearchEnabled}
-          <button class="reader-sel-item" title={t("搜索：查找这个词在书中的其他用法")} on:click={onSelSearch}>
+          <button class="reader-sel-item" data-tip={t("搜索：查找这个词在书中的其他用法")} on:click={onSelSearch}>
             <span class="reader-sel-ico">{@html SEL_ICONS.search}</span>
             <span class="reader-sel-txt">{t("搜索")}</span>
           </button>
           {/if}
-          <button class="reader-sel-item" title={t("翻译")} on:click={onSelTranslate}>
+          <button class="reader-sel-item" data-tip={t("翻译")} on:click={onSelTranslate}>
             <span class="reader-sel-ico">{@html SEL_ICONS.translate}</span>
             <span class="reader-sel-txt">{t("翻译")}</span>
           </button>
-          <button class="reader-sel-item" title={t("朗读")} on:click={onSelSpeak}>
+          <button class="reader-sel-item" data-tip={t("朗读")} on:click={onSelSpeak}>
             <span class="reader-sel-ico">{@html SEL_ICONS.tts}</span>
             <span class="reader-sel-txt">{t("朗读")}</span>
           </button>
-          <button class="reader-sel-item" title={t("发送")} on:click={onSelSend}>
+          <button class="reader-sel-item" data-tip={t("发送")} on:click={onSelSend}>
             <span class="reader-sel-ico">{@html SEL_ICONS.send}</span>
             <span class="reader-sel-txt">{t("发送")}</span>
+          </button>
+          <!-- 2026-11-05 P0：把选段带进右侧阅读助手（当轮提问的 <quote>） -->
+          <button class="reader-sel-item" data-tip={t("问 AI：把选段带进阅读助手")} on:click={onSelAskAi}>
+            <span class="reader-sel-ico">{@html SEL_ICONS.ai}</span>
+            <span class="reader-sel-txt">{t("问 AI")}</span>
           </button>
         {/if}
       </div>
@@ -13292,7 +14286,8 @@ function applyTopHandleHitHeight() {
               <button
                 class="reader-sel-style-btn"
                 class:active={selToolbar.annStyle === s}
-                title={t(ANNOTATION_STYLES[s].label)}
+                data-tip={t(ANNOTATION_STYLES[s].label)}
+                aria-label={t(ANNOTATION_STYLES[s].label)}
                 on:click={() => applyEditStyle(s)}>
                 <!-- P2（2026-10-12）：字形 = 微信读书的「A + 装饰线」。装饰线由 .reader-style-glyph.style-*
                      的 text-decoration / 背景带承担（CSS 早已备好，此前多塞了旧字形 ▮/━/﹏）。
@@ -13308,7 +14303,8 @@ function applyTopHandleHitHeight() {
                 class="reader-sel-color-dot"
                 class:active={(selToolbar.annColor || lastColor) === c.value}
                 style="background:{c.value}"
-                title={t(c.name)}
+                data-tip={t(c.name)}
+                aria-label={t(c.name)}
                 on:click={() => applyEditColor(c.value)}>
                 {#if (selToolbar.annColor || lastColor) === c.value}
                   <span class="reader-sel-color-check">{@html SEL_ICONS.confirm}</span>
@@ -13391,7 +14387,8 @@ function applyTopHandleHitHeight() {
           <button
             class="reader-note-fold"
             class:open={noteFold.style}
-            title={t("修改标注样式")}
+            data-tip={t("修改标注样式")}
+            aria-label={t("修改标注样式")}
             on:click={() => toggleNoteFold("style")}
           >
             <span class="reader-style-glyph style-{noteEditor.style}" style="--sc:{noteEditor.color}">A</span>
@@ -13404,7 +14401,8 @@ function applyTopHandleHitHeight() {
                 <button
                   class="reader-note-opt"
                   class:on={s === noteEditor.style}
-                  title={ANNOTATION_STYLES[s].label + '：' + ANNOTATION_STYLES[s].hint}
+                  data-tip={ANNOTATION_STYLES[s].label + '：' + ANNOTATION_STYLES[s].hint}
+                  aria-label={ANNOTATION_STYLES[s].label}
                   on:click={() => onPickPanelStyle(s)}
                 >
                   <span class="reader-style-glyph style-{s}" style="--sc:{noteEditor.color}">A</span>
@@ -13419,7 +14417,8 @@ function applyTopHandleHitHeight() {
           <button
             class="reader-note-fold"
             class:open={noteFold.color}
-            title={t("修改颜色")}
+            data-tip={t("修改颜色")}
+            aria-label={t("修改颜色")}
             on:click={() => toggleNoteFold("color")}
           >
             <span class="reader-note-swatch" style="background:{noteEditor.color}"></span>
@@ -13431,7 +14430,8 @@ function applyTopHandleHitHeight() {
                 <button
                   class="reader-note-opt"
                   class:on={c.value === noteEditor.color}
-                  title={t(c.name)}
+                  data-tip={t(c.name)}
+                  aria-label={t(c.name)}
                   on:click={() => onPickPanelColor(c.value)}
                 >
                   <span class="reader-note-opt-dot" style="background:{c.value}"></span>
@@ -13449,10 +14449,10 @@ function applyTopHandleHitHeight() {
              虽能命中，但**按钮自身的 padding/border 与 svg 的尺寸没有约束关系**，
              实测表现为图标变成一块黑色方块（截图里可见）。
              包一层后由 .reader-note-ico 明确控制 display/size，颜色继承 color。 -->
-        <button class="reader-note-icon" title={t("复制")} on:click={onViewerCopy}>
+        <button class="reader-note-icon" data-tip={t("复制")} aria-label={t("复制")} on:click={onViewerCopy}>
           <span class="reader-note-ico">{@html SEL_ICONS.copy}</span>
         </button>
-        <button class="reader-note-icon" title={t("导出")} on:click={onViewerExport}>
+        <button class="reader-note-icon" data-tip={t("导出")} aria-label={t("导出")} on:click={onViewerExport}>
           <span class="reader-note-ico">{@html SEL_ICONS.download}</span>
         </button>
 
@@ -13467,16 +14467,16 @@ function applyTopHandleHitHeight() {
              （那两个按钮最早写，图标组是后来改版加的）—— 并过来后
              `justify-content: space-between` 那行整块删掉，「间隔过大」自然消失。 -->
         {#if !isNoteViewer}
-          <button class="reader-note-icon" title={t("取消")} on:click={onNoteCancel}>
+          <button class="reader-note-icon" data-tip={t("取消")} aria-label={t("取消")} on:click={onNoteCancel}>
             <span class="reader-note-ico">{@html SEL_ICONS.cancel}</span>
           </button>
-          <button class="reader-note-icon primary" title={t("保存")} on:click={onNoteSave}>
+          <button class="reader-note-icon primary" data-tip={t("保存")} aria-label={t("保存")} on:click={onNoteSave}>
             <span class="reader-note-ico">{@html SEL_ICONS.confirm}</span>
           </button>
         {/if}
 
         {#if noteEditor.id}
-          <button class="reader-note-icon danger" title={t("删除")} on:click={onViewerDelete}>
+          <button class="reader-note-icon danger" data-tip={t("删除")} aria-label={t("删除")} on:click={onViewerDelete}>
             <span class="reader-note-ico">{@html SEL_ICONS.trash}</span>
           </button>
         {/if}
@@ -13537,16 +14537,30 @@ function applyTopHandleHitHeight() {
       <div class="reader-dict-head">
         <span>{t("词典")}</span>
         <div class="reader-dict-head-actions">
-          <button class="reader-dict-send" on:click={sendToSidebar} title={t("在 REword 侧边栏查词（自动填入，无需手动输入）")}>{t("侧边栏")}</button>
-          <button class="reader-dict-close" on:click={closeDictPopup} title={t("关闭")}>✕</button>
+          <button class="reader-dict-send" on:click={sendToSidebar} data-tip={t("在 REword 侧边栏查词（自动填入，无需手动输入）")}>{t("侧边栏")}</button>
+          <button class="reader-dict-close" on:click={closeDictPopup} data-tip={t("关闭")} aria-label={t("关闭")}>✕</button>
         </div>
       </div>
       <div class="reader-dict-body" on:click={onDictBodyClick}>{@html dictPopup.html}</div>
     </div>
   {/if}
 
+  <!-- 自绘 Tooltip（2026-11-05）：浮层内唯一的提示层，由 [data-tip] 委托驱动。
+       pointer-events:none —— 提示绝不能挡住鼠标（否则自身触发 pointerout 闪烁）。
+       放在浮动层最后，z-index 由 --rz-tip 保证压在所有浮层内容之上。 -->
+  {#if tip.visible}
+    <div
+      class="reader-tip"
+      class:ready={tip.ready}
+      bind:this={tipEl}
+      role="tooltip"
+      style="left:{tip.x}px;top:{tip.y}px"
+    >{tip.text}</div>
+  {/if}
+
   <!-- 批注编辑 / 查看浮层已废弃（2026-08-24 重构后点击高亮改弹底部工具栏，annEditor 无调用方），整段移除 -->
       <!-- annEditor 卡片内容已移除（无调用方） -->
+
 
   {#if toastMsg}
     <div class="reader-toast" class:reader-toast--error={toastKind === "error"}>
@@ -13557,6 +14571,44 @@ function applyTopHandleHitHeight() {
     </div>
   {/if}
   </div><!-- /.reader-floating-layer -->
+
+  <!-- 2026-11-05 P0：AI 阅读助手（右侧停靠 / 手机全屏）。
+       刻意放在 .reader-floating-layer **外面**：那层标了 aria-hidden="true"，
+       只装瞬时浮层；对话面板是可长期停留、可键盘操作的实体内容。
+       宽度由面板内部拖拽并落盘（bind:width → 本组件只做布局镜像）。 -->
+  {#if showAiPanel}
+    <div
+      class="reader-ai-dock"
+      class:reader-ai-dock--overlay={aiOverlay}
+      style={aiOverlay ? "" : `width:${aiPanelWidth}px`}
+    >
+      <AiPanel
+        bind:this={aiPanelComp}
+        bind:width={aiPanelWidth}
+        open={showAiPanel}
+        bookId={bookId}
+        bookTitle={meta?.title || title}
+        bookAuthor={meta?.author || ""}
+        chapterLabel={chapterLabel}
+        resizable={!aiOverlay}
+        overlay={aiOverlay}
+        getAiSettings={getAiSettings}
+        saveAiSettings={onSaveAiSettings}
+        getChapter={getChapterSnapshot}
+        getPage={getPageSnapshot}
+        getRange={getChapterRangeSnapshot}
+        getToc={getBookToc}
+        getReaderToolHost={getAiToolHost}
+        readKnowledge={readAiKnowledge}
+        resolveNoteTarget={resolveAiNoteTarget}
+        writeNotePlan={writeAiNotePlan}
+        getPrimer={() => primerStore?.get?.(bookId) || ""}
+        onLocate={onAiLocate}
+        onOpenTab={aiOverlay ? undefined : openAiTab}
+        onClose={() => (showAiPanel = false)}
+      />
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -13570,6 +14622,27 @@ function applyTopHandleHitHeight() {
        所有靠顶浮层（backdrop / 抽屉 / 搜索 / 设置 / ⋯ / 把手）统一消费此变量，
        宽屏档在文件末尾覆写为 59px —— 改顶栏尺寸只需动这一处，避免六处锚点各自漂移。 */
     --reword-chrome-top: 54px;
+    /* 2026-11-05 浮层语义令牌（划词工具栏 / 批注卡共用）：
+       白天跟随思源主题（surface 94% + 毛玻璃、深字），夜间切恒深色（白字）。
+       ⇒ 两张卡片同色，不再「工具栏黑、批注卡白」。
+       每项先写一条「不依赖 color-mix」的兜底，再写增强值——
+       宿主不支持 color-mix 时整条声明失效，浏览器回落到上一条。 */
+    --rwd-pop-bg: var(--b3-theme-surface, var(--b3-theme-background, #fff));
+    --rwd-pop-bg: color-mix(in srgb, var(--b3-theme-surface, var(--b3-theme-background, #fff)) 94%, transparent);
+    /* 前景必须取 on-background（正文色），不能取 on-surface ——
+       思源的 on-surface 默认是 #5b5b5b 的中灰（给次要文字用的），
+       拿它当主前景会让整条工具栏的图标/标签发灰、对比度不足。 */
+    --rwd-pop-fg: var(--b3-theme-on-background, var(--b3-theme-on-surface, #1f2329));
+    --rwd-pop-dim: var(--b3-theme-on-surface, #6b6e73);
+    --rwd-pop-dim: color-mix(in srgb, var(--rwd-pop-fg) 70%, transparent);
+    --rwd-pop-hover: rgba(0, 0, 0, 0.07);
+    --rwd-pop-hover: color-mix(in srgb, var(--rwd-pop-fg) 10%, transparent);
+    --rwd-pop-active: rgba(0, 0, 0, 0.11);
+    --rwd-pop-active: color-mix(in srgb, var(--rwd-pop-fg) 16%, transparent);
+    --rwd-pop-border: var(--b3-border-color, rgba(0, 0, 0, 0.1));
+    --rwd-pop-border: color-mix(in srgb, var(--rwd-pop-fg) 14%, transparent);
+    --rwd-pop-danger: #c0353f;
+    --rwd-pop-shadow: 0 6px 20px rgba(0, 0, 0, 0.14), 0 1px 3px rgba(0, 0, 0, 0.06);
     display: flex;
     flex-direction: column;
     /* 2026-08-24 修复（方案 B）：改为相对 flex 子项撑满 holder，
@@ -13595,6 +14668,18 @@ function applyTopHandleHitHeight() {
         "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "WenQuanYi Micro Hei",
         "Source Han Sans CN", "Noto Sans CJK SC", "Noto Sans", sans-serif),
       "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", "Symbola", sans-serif;
+  }
+  /* 夜间：浮层统一切恒深色（即旧工具栏的深色五件套 + 边框/阴影加深）。
+     ⚠️ 深色主题由思源在 body 上挂 .b3-theme-dark，阅读器自身不做主题判定。 */
+  :global(.b3-theme-dark) .reader-view {
+    --rwd-pop-bg: rgba(28, 29, 31, 0.94);
+    --rwd-pop-fg: #ffffff;
+    --rwd-pop-dim: rgba(255, 255, 255, 0.62);
+    --rwd-pop-hover: rgba(255, 255, 255, 0.12);
+    --rwd-pop-active: rgba(255, 255, 255, 0.2);
+    --rwd-pop-border: rgba(255, 255, 255, 0.10);
+    --rwd-pop-danger: #e5646e;
+    --rwd-pop-shadow: 0 6px 20px rgba(0, 0, 0, 0.34), 0 1px 3px rgba(0, 0, 0, 0.24);
   }
   .reader-toolbar {
     display: grid;
@@ -13979,6 +15064,32 @@ function applyTopHandleHitHeight() {
     pointer-events: auto;
   }
 
+  /* 自绘 Tooltip（2026-11-05）：浮层内唯一的提示层。
+     ⚠️ 必须挂在 `.reader-floating-layer >` 下覆盖上面那条 `> * { pointer-events:auto }`
+     （同特异性时后者在后、会赢）—— 提示一旦可命中，自身会触发 pointerout 导致闪烁。 */
+  .reader-floating-layer > .reader-tip {
+    position: absolute;
+    z-index: var(--rz-tip);
+    pointer-events: none;
+    box-sizing: border-box;
+    max-width: 260px;
+    padding: 5px 9px;
+    border-radius: 6px;
+    background: var(--rwd-pop-bg);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    backdrop-filter: blur(20px) saturate(1.3);
+    border: 1px solid var(--rwd-pop-border);
+    color: var(--rwd-pop-fg);
+    box-shadow: var(--rwd-pop-shadow);
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: normal;
+    word-break: break-word;
+    opacity: 0;
+    transition: opacity 0.12s ease;
+  }
+  .reader-floating-layer > .reader-tip.ready { opacity: 1; }
+
   /* 2026-10-14 P1：选区两端「定位标识」手柄（对齐微信读书：小圆点 + 细竖 caret，竖条高度=行高）。
      圆点落在选区首行左上 / 末行右下；竖条沿行方向探入正文，拖拽实时改选区（见 onSelHandlePointerDown）。
      margin 负半尺寸让 left/top 命中圆点中心；竖条高度用 --sh（由 updateSelHandles 按行高注入），随字号缩放。 */
@@ -14038,8 +15149,8 @@ function applyTopHandleHitHeight() {
 
   /* 划词工具栏（微信读书式恒深色）：定位到锚点，主栏在上、样式行在**下方**。
      2026-10-11 微信读书化：
-       · 恒深色（用户拍板 D1）：两套主题下都是深色 —— 这是微信读书的品牌识别，
-         也是「浮在任意版面上都保证白字对比度」的工程选择。全部收敛到 --rwd-sel-* 局部变量。
+       · 2026-11-05 配色统一：不再恒深色。底色/前景/描边/阴影全部消费 .reader-view 上的
+         --rwd-pop-* 语义令牌（白天=主题浅色玻璃、夜间=恒深色），与批注卡同一套。
        · DOM 顺序 [主栏, 样式行]；place=above（默认）经 column-reverse 把样式行翻到主栏
          **上方**（2026-10-13 P0-2 转场钉住主栏，见 .place-above 规则处说明），
          place=below/left/right 为原生 column（样式行在下方）。align-items: stretch 让两行等宽，药丸两端对齐。
@@ -14064,12 +15175,6 @@ function applyTopHandleHitHeight() {
     -ms-user-select: none;
     user-select: none;
     -webkit-touch-callout: none;
-    /* 恒深色令牌：主栏 / 药丸 / 三角共用（改动只改这一处） */
-    --rwd-sel-bg: rgba(28, 29, 31, 0.94);
-    --rwd-sel-fg: #ffffff;
-    --rwd-sel-dim: rgba(255, 255, 255, 0.62);
-    --rwd-sel-hover: rgba(255, 255, 255, 0.12);
-    --rwd-sel-active: rgba(255, 255, 255, 0.2);
   }
   .reader-sel-toolbar > * { pointer-events: auto; }
   /* 顶部空间不足翻到选区下方时：锚点改取选区下沿，工具栏向下延伸（而非向上覆盖选区） */
@@ -14098,14 +15203,14 @@ function applyTopHandleHitHeight() {
     width: 0; height: 0;
     border-left: 7px solid transparent;
     border-right: 7px solid transparent;
-    border-top: 7px solid var(--rwd-sel-bg);
+    border-top: 7px solid var(--rwd-pop-bg);
     bottom: -8px;
     pointer-events: none;
   }
   .reader-sel-toolbar.place-below::after {
     top: -7px; bottom: auto;
     border-top: none;
-    border-bottom: 7px solid var(--rwd-sel-bg);
+    border-bottom: 7px solid var(--rwd-pop-bg);
   }
   /* 左置：小三角在右边缘、朝右指向选区 */
   .reader-sel-toolbar.place-left::after {
@@ -14113,7 +15218,7 @@ function applyTopHandleHitHeight() {
     transform: translateY(-50%);
     border-top: 7px solid transparent;
     border-bottom: 7px solid transparent;
-    border-left: 7px solid var(--rwd-sel-bg);
+    border-left: 7px solid var(--rwd-pop-bg);
     border-right: none;
   }
   /* 右置：小三角在左边缘、朝左指向选区 */
@@ -14122,7 +15227,7 @@ function applyTopHandleHitHeight() {
     transform: translateY(-50%);
     border-top: 7px solid transparent;
     border-bottom: 7px solid transparent;
-    border-right: 7px solid var(--rwd-sel-bg);
+    border-right: 7px solid var(--rwd-pop-bg);
     border-left: none;
   }
 
@@ -14135,7 +15240,7 @@ function applyTopHandleHitHeight() {
          两态标签统一为 2 字（标注 / 删除），按钮天然等宽 36px、共 7×36=252 + 6×2 最小 gap
          + 12 padding = 276，300 给同样留 24px 自由 → 视觉间隙都 ≈6px，且「标注 ⇄ 删除」
          切换时零位移（无需 slot2：两态都是 7×36）。8 项（搜索开启）自然宽 314 > 300，无副作用。
-       · 圆角 10px、无毛玻璃（恒深色不透明底，避免透出下方选中文字）
+       · 圆角 10px、与批注卡同一套 --rwd-pop-* 语义令牌（白天浅色玻璃 / 夜间恒深色）
        · space-between：按钮等距撑开，两端贴 padding 边 */
   .reader-sel-main {
     display: flex;
@@ -14147,11 +15252,13 @@ function applyTopHandleHitHeight() {
     min-width: 300px;                 /* 两态 7×36 等宽 + 零位移，见上方规格注释 */
     padding: 0 6px;
     box-sizing: border-box;
-    background: var(--rwd-sel-bg);
-    border: 1px solid rgba(255, 255, 255, 0.10);
+    background: var(--rwd-pop-bg);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    backdrop-filter: blur(20px) saturate(1.3);
+    border: 1px solid var(--rwd-pop-border);
     border-radius: 10px;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
-    color: var(--rwd-sel-fg);
+    box-shadow: var(--rwd-pop-shadow);
+    color: var(--rwd-pop-fg);
     transform-origin: center bottom;
     animation: readerToolbarIn 0.16s cubic-bezier(0.22, 1, 0.36, 1) both;
     position: relative;
@@ -14169,7 +15276,7 @@ function applyTopHandleHitHeight() {
   .reader-sel-item {
     border: none;
     background: transparent;
-    color: inherit;                /* 跟随容器 --rwd-sel-fg */
+    color: inherit;                /* 跟随容器 --rwd-pop-fg */
     /* 微信读书式：竖向「图标 + 标签」，min-width 36 保证标签不挤。
        两态标签统一为 2 字（标注 / 删除），所有按钮等宽 36px，无需 slot2 预留。 */
     min-width: 36px;
@@ -14188,7 +15295,7 @@ function applyTopHandleHitHeight() {
   }
   .reader-sel-item:hover {
     /* 深底上用固定白 alpha，不用主题 --b3-list-hover（浅色主题的值会变得几乎不可见） */
-    background: var(--rwd-sel-hover);
+    background: var(--rwd-pop-hover);
   }
   .reader-sel-item:active { transform: scale(0.94); }
   /* ⚠️ 必须用 CSS 强制 fill/stroke，不能只靠 SVG 属性。
@@ -14229,12 +15336,12 @@ function applyTopHandleHitHeight() {
     display: inline-flex;
     line-height: 0;
   }
-  /* 按钮下方的 10px 标签（微信读书式）。用暗一档的白（--rwd-sel-dim），
+  /* 按钮下方的 10px 标签（微信读书式）。用暗一档的 --rwd-pop-dim，
      图标保持纯白 —— 层级靠明度差，不靠字号（字号在 10px 已到底）。 */
   .reader-sel-txt {
     font-size: 10px;
     line-height: 1;
-    color: var(--rwd-sel-dim);
+    color: var(--rwd-pop-dim);
     white-space: nowrap;
   }
   /* 主操作（标注/批注）：底色与其他按钮一致（微信读书八项同色），只在 hover 时给反馈。
@@ -14245,11 +15352,11 @@ function applyTopHandleHitHeight() {
     background: transparent;
   }
   .reader-sel-item-accent:hover {
-    background: var(--rwd-sel-hover);
+    background: var(--rwd-pop-hover);
   }
   .reader-sel-item-danger .reader-sel-ico :global(svg),
-  .reader-sel-item-danger .reader-sel-txt { color: #e5646e; }
-  .reader-sel-item-danger:hover { background: rgba(229, 100, 110, 0.16); }
+  .reader-sel-item-danger .reader-sel-txt { color: var(--rwd-pop-danger); }
+  .reader-sel-item-danger:hover { background: rgba(192, 53, 63, 0.16); background: color-mix(in srgb, var(--rwd-pop-danger) 16%, transparent); }
   /* 标注 / 删除 等宽（2026-10-23）：
      旧版用 .reader-sel-item-slot2 给「删除划线」(4 字) 预留 56px，保证编辑态不把格子撑宽；
      现编辑态标签缩为「删除」(2 字)，两态都是 36px，等宽由结构保证，slot2 已废弃删除。 */
@@ -14269,7 +15376,7 @@ function applyTopHandleHitHeight() {
     border-radius: 50%;
     background: var(--spc, var(--b3-theme-primary, #378add));
     /* 描一圈容器底色，角标压在图标上时仍能看清 */
-    box-shadow: 0 0 0 1.5px var(--rwd-sel-bg);
+    box-shadow: 0 0 0 1.5px var(--rwd-pop-bg);
     pointer-events: none;
   }
   /**
@@ -14356,10 +15463,12 @@ function applyTopHandleHitHeight() {
     align-items: center;
     padding: 6px 8px;
     box-sizing: border-box;
-    background: var(--rwd-sel-bg);
-    border: 1px solid rgba(255, 255, 255, 0.10);
+    background: var(--rwd-pop-bg);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    backdrop-filter: blur(20px) saturate(1.3);
+    border: 1px solid var(--rwd-pop-border);
     border-radius: 10px;
-    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.28);
+    box-shadow: var(--rwd-pop-shadow);
   }
   .reader-sel-pill-styles { gap: 2px; }
   .reader-sel-pill-colors { gap: 8px; }
@@ -14378,8 +15487,8 @@ function applyTopHandleHitHeight() {
     line-height: 1;
     transition: background 0.12s ease;
   }
-  .reader-sel-style-btn:hover { background: var(--rwd-sel-hover); }
-  .reader-sel-style-btn.active { background: var(--rwd-sel-active); }
+  .reader-sel-style-btn:hover { background: var(--rwd-pop-hover); }
+  .reader-sel-style-btn.active { background: var(--rwd-pop-active); }
   .reader-sel-color-dot {
     position: relative;
     width: 24px;
@@ -14394,8 +15503,9 @@ function applyTopHandleHitHeight() {
     transition: transform 0.12s ease, box-shadow 0.12s ease;
   }
   .reader-sel-color-dot:hover { transform: scale(1.12); }
-  /* 当前色：白色 ✓ 徽章 + 白色描边环（对齐素材①；深底上比"光环"更好认） */
-  .reader-sel-color-dot.active { box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.92); }
+  /* 当前色：✓ 徽章 + 前景色描边环（夜里白、白天深，跟随 --rwd-pop-fg） */
+  .reader-sel-color-dot.active { box-shadow: 0 0 0 2px var(--rwd-pop-fg); }
+  .reader-sel-color-dot.active { box-shadow: 0 0 0 2px color-mix(in srgb, var(--rwd-pop-fg) 92%, transparent); }
   .reader-sel-color-check {
     display: inline-flex;
     line-height: 0;
@@ -14492,29 +15602,17 @@ function applyTopHandleHitHeight() {
     display: flex;
     flex-direction: column;
     gap: 9px;
-    /* 🔴 深色关键改动（2026-10-08）：旧版用 --reword-glass-bg，
-       玻璃拟态在深色主题下压到近黑、噪点全靠 backdrop-filter 的模糊噪声撑着。
-       改为「surface 底 94% 混合透明」——深色下 surface ≈ #2b2f38，
-       卡片抬到约 rgba(43,47,56,.94)，不再是黑洞。 */
-    background: color-mix(in srgb, var(--b3-theme-surface, var(--b3-theme-background, #fff)) 94%, transparent);
+    /* 2026-11-05 配色统一：与划词工具栏共用 --rwd-pop-* 语义令牌。
+       白天 = 主题 surface 94% + 毛玻璃、深色字；夜间 = 恒深色 + 白字。
+       （color-mix 失效时的兜底已下沉到 .reader-view 的令牌定义处。） */
+    background: var(--rwd-pop-bg);
     -webkit-backdrop-filter: blur(20px) saturate(1.3);
     backdrop-filter: blur(20px) saturate(1.3);
-    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
+    border: 1px solid var(--rwd-pop-border);
     border-radius: 14px;
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.10), 0 1px 3px rgba(0, 0, 0, 0.06);
-    color: var(--b3-theme-on-background, #222);
+    box-shadow: var(--rwd-pop-shadow);
+    color: var(--rwd-pop-fg);
     pointer-events: auto;
-  }
-  /* ⚠️ color-mix 兜底（同顶栏/底栏的既有教训）：宿主不支持该函数时
-     **整条 background 声明失效**，卡片变全透明、正文叠在书页上不可读。 */
-  @supports not (color: color-mix(in srgb, red, blue)) {
-    .reader-note-editor {
-      background: var(--b3-theme-surface, var(--b3-theme-background, #fff));
-    }
-  }
-  /* 深色主题下阴影需加重，否则卡片与深色背景糊在一起看不出层次 */
-  :global(.b3-theme-dark) .reader-note-editor {
-    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.34), 0 1px 3px rgba(0, 0, 0, 0.24);
   }
   /* 2026-08-25 底部空间不足时翻转到选区上方：transform 翻转 Y 轴 + 间距改到底部 */
   .reader-note-editor.place-above {
@@ -14535,10 +15633,8 @@ function applyTopHandleHitHeight() {
     transform: translate(0, -50%);
     margin-top: 0;
   }
-  /* 小三角指向选中文本。
-     ⚠️ 2026-10-08：颜色从 --reword-glass-bg 改为 --note-card-bg ——
-     卡片底色换成了「surface 94% 混合透明」，小三角若还用旧变量会出现
-     「三角颜色与卡片底色不一致」的错位。 */
+  /* 小三角指向选中文本，颜色与卡片底同源（--rwd-pop-bg），
+     否则白天/夜间两套底色下都会出现「三角与卡片不同色」的错位。 */
   .reader-note-editor::after {
     content: "";
     position: absolute;
@@ -14551,25 +15647,25 @@ function applyTopHandleHitHeight() {
     left: 50%;
     bottom: -13px;
     transform: translateX(-50%);
-    border-top-color: var(--b3-theme-surface, var(--b3-theme-background, #fff));
+    border-top-color: var(--rwd-pop-bg);
   }
   .reader-note-editor.place-below::after {
     left: 50%;
     top: -13px;
     transform: translateX(-50%);
-    border-bottom-color: var(--b3-theme-surface, var(--b3-theme-background, #fff));
+    border-bottom-color: var(--rwd-pop-bg);
   }
   .reader-note-editor.place-left::after {
     right: -13px;
     top: 50%;
     transform: translateY(-50%);
-    border-left-color: var(--b3-theme-surface, var(--b3-theme-background, #fff));
+    border-left-color: var(--rwd-pop-bg);
   }
   .reader-note-editor.place-right::after {
     left: -13px;
     top: 50%;
     transform: translateY(-50%);
-    border-right-color: var(--b3-theme-surface, var(--b3-theme-background, #fff));
+    border-right-color: var(--rwd-pop-bg);
   }
   /* ================================================================
    * 2026-10-08 · 批注卡片内部（四行横排 + 折叠悬浮）
@@ -14950,11 +16046,14 @@ function applyTopHandleHitHeight() {
     max-width: 88vw;
     max-height: 62vh;
     overflow: auto;
-    background: var(--b3-theme-background, #fff);
-    color: var(--b3-theme-on-background, #333);
-    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12));
+    /* 2026-11-05：与划词工具栏/批注卡共用浮层令牌（白天浅玻璃、夜间深玻璃） */
+    background: var(--rwd-pop-bg);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    backdrop-filter: blur(20px) saturate(1.3);
+    color: var(--rwd-pop-fg);
+    border: 1px solid var(--rwd-pop-border);
     border-radius: 10px;
-    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--rwd-pop-shadow);
     transform: translateX(-50%);
   }
   .reader-dict-head {
@@ -14964,10 +16063,12 @@ function applyTopHandleHitHeight() {
     padding: 8px 12px;
     font-size: 13px;
     font-weight: 600;
-    border-bottom: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
+    border-bottom: 1px solid var(--rwd-pop-border);
     position: sticky;
     top: 0;
-    background: var(--b3-theme-background, #fff);
+    background: var(--rwd-pop-bg);
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    backdrop-filter: blur(20px) saturate(1.3);
   }
   .reader-dict-head-actions {
     display: flex;
@@ -15551,6 +16652,51 @@ function applyTopHandleHitHeight() {
   }
   .reader-view.sidebar-docked .reader-bottom-bar {
     left: calc(var(--re-sidebar-w, 280px) + 6px);
+  }
+
+  /* ================================================================
+   * 2026-11-05 P0：AI 阅读助手右停靠
+   * ================================================================
+   * 与左侧「固定目录」同一套几何范式：absolute 停靠 + 正文 margin 让位；
+   * 顶/底浮层条同步收右边界（否则会压在面板上）。
+   * 手机/大手机断点由 .reader-ai-dock--overlay 全屏覆盖，此时不做让位。 */
+  .reader-ai-dock {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    /* 只在 stage 之上、划词工具条(3)/手柄(4)之下：选区贴近正文右缘时，
+       工具栏宁可压在面板上，也不能被面板整块盖住点不到。 */
+    z-index: var(--rz-floating);
+    display: flex;
+    min-width: 0;
+    max-width: 100%;
+    background: var(--b3-theme-background, #fff);
+    box-shadow: -6px 0 20px rgba(0, 0, 0, 0.06);
+  }
+  .reader-ai-dock--overlay {
+    width: 100%;
+    z-index: 40;
+    box-shadow: none;
+  }
+  .reader-view.ai-docked .reader-stage {
+    margin-right: var(--re-ai-w, 420px);
+  }
+  .reader-view.ai-docked .reader-toolbar-floating {
+    right: calc(var(--re-ai-w, 420px) + 8px);
+  }
+  .reader-view.ai-docked .reader-bottom-bar {
+    right: calc(var(--re-ai-w, 420px) + 8px);
+  }
+  /* 两个圆点把手跟着正文区中线走，而不是整宽中线 */
+  .reader-view.ai-docked .reader-top-handle,
+  .reader-view.ai-docked .reader-bottom-handle {
+    left: calc((100% - var(--re-ai-w, 420px)) / 2);
+  }
+  /* 左目录 + 右助手同时打开：中线 = 两侧让位后的剩余区域中点 */
+  .reader-view.ai-docked.sidebar-docked .reader-top-handle,
+  .reader-view.ai-docked.sidebar-docked .reader-bottom-handle {
+    left: calc(50% + (var(--re-sidebar-w, 280px) - var(--re-ai-w, 420px)) / 2);
   }
   /* 拖宽把手（停靠栏右缘） */
   .reader-side-resizer {

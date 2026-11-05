@@ -67,6 +67,8 @@ export interface AnnotationConfig {
    * 每次真正落库的高亮/批注都会覆写，跨会话、跨 Tab 生效（模块级单例）。 */
   lastStyle?: AnnotationStyle;
   lastColor?: string;
+  /** 上次使用的分组（新建批注时预填；空 = 未分组） */
+  lastGroup?: string;
   /* ---- [labels-off] 2026-10-02 标签系统静默开关 ----
    * true = 标签系统完整可用；false/缺省 = 静默关闭（UI 入口全部隐藏、写入路径短路）。
    * 数据不删不改：WordRecord.labels / AnnotationItem.labels / 两个 labels.json 原样保留，
@@ -86,6 +88,7 @@ const DEFAULTS: AnnotationConfig = {
 let current: AnnotationConfig = { ...DEFAULTS };
 let plugin: any = null;
 let loaded = false;
+let dirty = false;
 
 /** 由插件 onload 调用，注入 plugin 引用 */
 export function initAnnotationConfig(p: any): void {
@@ -111,6 +114,10 @@ export async function loadAnnotationConfig(): Promise<AnnotationConfig> {
         lastColor: typeof data.lastColor === "string" && /^#[0-9a-fA-F]{3,8}$/.test(data.lastColor.trim())
           ? mapLegacyColor(data.lastColor)
           : undefined,
+        // 分组名来自用户历史文件：只接受非空字符串，限长避免脏数据撑大配置
+        lastGroup: typeof data.lastGroup === "string" && data.lastGroup.trim()
+          ? data.lastGroup.trim().slice(0, 60)
+          : undefined,
         // 2026-10-14：用户持久化的 defaultColor 可能是旧淡彩值 → 迁移为新饱和色
         defaultColor: mapLegacyColor(data.defaultColor ?? DEFAULTS.defaultColor),
       };
@@ -121,7 +128,18 @@ export async function loadAnnotationConfig(): Promise<AnnotationConfig> {
 }
 
 function persist(): void {
-  plugin?.saveData(STORAGE_KEY, current).catch(() => {});
+  if (!plugin || !dirty) return;
+  dirty = false;
+  const snapshot: AnnotationConfig = {
+    ...current,
+    palette: [...current.palette],
+    tagPresets: [...current.tagPresets],
+  };
+  Promise.resolve(plugin.saveData(STORAGE_KEY, snapshot)).catch((e) => {
+    // 写失败保留 dirty：下一次变更或 onunload 的 flush 还能重试
+    dirty = true;
+    logSwallow(e, "annotation-config.ts · persist", "debug");
+  });
 }
 
 /** 读取当前完整配置（副本） */
@@ -137,6 +155,7 @@ export function setAnnotationConfig(patch: Partial<AnnotationConfig>): Annotatio
     palette: patch.palette && patch.palette.length ? [...patch.palette] : current.palette,
     tagPresets: patch.tagPresets && patch.tagPresets.length ? [...patch.tagPresets] : current.tagPresets,
   };
+  dirty = true;
   persist();
   return getAnnotationConfig();
 }
@@ -182,8 +201,23 @@ export function getLastAnnotationColor(): string {
   return current.lastColor || getDefaultAnnotationColor();
 }
 
+/** 上次使用的分组（无历史 → 未分组） */
+export function getLastAnnotationGroup(): string {
+  return current.lastGroup || "未分组";
+}
+
 const LAST_STYLE_SAVE_MS = 300;
 let lastStyleSaveTimer: any = null;
+
+/** 300ms 防抖落盘：连续点颜色/选分组只在停手时写一次 */
+function schedulePersist(): void {
+  dirty = true;
+  if (lastStyleSaveTimer) clearTimeout(lastStyleSaveTimer);
+  lastStyleSaveTimer = setTimeout(() => {
+    lastStyleSaveTimer = null;
+    persist();
+  }, LAST_STYLE_SAVE_MS);
+}
 
 /**
  * 记录本次实际使用的样式（供下次「标注」一键复用），防抖落盘。
@@ -195,9 +229,25 @@ export function setLastAnnotationStyle(style: AnnotationStyle, color: string): v
   const c = String(color ?? "").trim();
   if (!/^#[0-9a-fA-F]{3,8}$/.test(c)) return;
   current = { ...current, lastStyle: s, lastColor: c };
-  if (lastStyleSaveTimer) clearTimeout(lastStyleSaveTimer);
-  lastStyleSaveTimer = setTimeout(() => {
+  schedulePersist();
+}
+
+/** 记录本次实际使用的分组（存进同一份配置，跨会话/跨 Tab 生效） */
+export function setLastAnnotationGroup(group: string): void {
+  const g = String(group ?? "").trim();
+  if (!g) return;
+  current = { ...current, lastGroup: g.slice(0, 60) };
+  schedulePersist();
+}
+
+/**
+ * 立即落盘挂起的标注偏好（上次样式/颜色/分组）。
+ * 插件 onunload 调用：防抖窗口（300ms）内的最后一次改动不会因为重载而丢。
+ */
+export function flushAnnotationConfig(): void {
+  if (lastStyleSaveTimer) {
+    clearTimeout(lastStyleSaveTimer);
     lastStyleSaveTimer = null;
-    persist();
-  }, LAST_STYLE_SAVE_MS);
+  }
+  persist();
 }

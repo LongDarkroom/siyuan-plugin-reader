@@ -59,6 +59,57 @@ const noteIconGlyph = (rects, color, frameWidth) => {
     return g
 }
 
+// REword patch (2026-11-05): 可点击批注气泡（Readest 式）。
+// 与 noteIconGlyph 的区别：这是**独立 overlay 条目**（key = foliate-note:<cfi>），
+// 尺寸更大、带实心底色，并且把 rects 改写成气泡自身的命中区，
+// 因此 hitTest 能命中 → view 派发 show-annotation → 直接打开批注卡。
+// 尾行右端放不下时改首行左端（与 noteIconGlyph 同策略）。
+const noteBadgeGlyph = (rects, color, frameWidth, size) => {
+    if (!rects || !rects.length) return null
+    const last = rects[rects.length - 1]
+    const first = rects[0]
+    const h = last.bottom - last.top
+    if (!(h > 0)) return null
+    const s = size
+    const gap = 3
+    const cy = (last.top + last.bottom) / 2
+    let x = last.right + gap
+    if (frameWidth > 0 && x + s + 4 > frameWidth) x = Math.max(first.left - gap - s, 2)
+    const y = cy - s / 2
+    // 命中区：整枚气泡 + 4px 外扩（再叠加 hitTest 自带 5px 容差）
+    rects.splice(1)
+    rects[0] = { left: x - 4, top: y - 4, right: x + s + 4, bottom: y + s + 4, width: s + 8, height: s + 8 }
+    const g = createSVGElement('g')
+    const circle = createSVGElement('circle')
+    circle.setAttribute('cx', String(x + s / 2))
+    circle.setAttribute('cy', String(y + s / 2))
+    circle.setAttribute('r', String(s / 2))
+    circle.setAttribute('fill', color)
+    circle.setAttribute('stroke', 'rgba(0, 0, 0, 0.18)')
+    circle.setAttribute('stroke-width', '1')
+    g.append(circle)
+    // 白色对话气泡线稿（与工具栏 SEL_ICONS.annotate 同族观感）
+    const gw = s * 0.56, gh = s * 0.4
+    const gx = x + (s - gw) / 2
+    const gy = y + (s - gh) / 2 - s * 0.05
+    const body = createSVGElement('rect')
+    body.setAttribute('x', String(gx))
+    body.setAttribute('y', String(gy))
+    body.setAttribute('width', String(gw))
+    body.setAttribute('height', String(gh))
+    body.setAttribute('rx', String(gw * 0.24))
+    body.setAttribute('fill', '#fff')
+    g.append(body)
+    const tail = createSVGElement('path')
+    tail.setAttribute('d',
+        `M ${gx + gw * 0.26} ${gy + gh}` +
+        ` L ${gx + gw * 0.2} ${gy + gh + gh * 0.38}` +
+        ` L ${gx + gw * 0.56} ${gy + gh} Z`)
+    tail.setAttribute('fill', '#fff')
+    g.append(tail)
+    return g
+}
+
 export class Overlayer {
     #svg = createSVGElement('svg')
     #map = new Map()
@@ -525,6 +576,17 @@ export class Overlayer {
             el.setAttribute('rx', radius)
             g.append(el)
         }
+        return g
+    }
+    /**
+     * 可点击批注气泡。rects 会被改写成气泡命中区，供 Overlayer.hitTest 精确命中。
+     * options: color=标注色，frameWidth=内容区宽，size=直径（默认 15）
+     */
+    static noteBadge(rects, options = {}) {
+        const { color = 'red', frameWidth = 0, size = 15 } = options
+        const g = createSVGElement('g')
+        const badge = noteBadgeGlyph(rects, color, frameWidth, size)
+        if (badge) g.append(badge)
         return g
     }
     static bubble(rects, options = {}) {

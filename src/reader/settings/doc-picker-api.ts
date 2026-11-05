@@ -41,6 +41,15 @@ export interface DocPickerApi {
   getDoc(id: string): Promise<unknown>;
   /** 新建文档（按书名自动建档用） */
   createDocWithMd?(notebook: string, path: string, markdown: string): Promise<string>;
+  /** 导出文档 Markdown（AI 面板「知识区」读取用，参数顺序与 api.ts 一致） */
+  exportMdContent?(
+    id: string,
+    yfm?: boolean,
+    fillCSSVar?: boolean,
+    refMode?: number,
+    embedMode?: number,
+    adjustHeadingLevel?: boolean,
+  ): Promise<unknown>;
   /** 列出所有笔记本（自动建档位置选择 / 校验用，2026-10-10 新增） */
   listNotebooks?(): Promise<{ id: string; name: string }[]>;
   /** 追加块（导出摘录用） */
@@ -99,6 +108,7 @@ export async function loadDocPickerApi(): Promise<DocPickerApi | null> {
            */
           appendBlock: (parentId: string, dataType: string, data: string) =>
             m.appendBlock(dataType, data, parentId),
+          exportMdContent: m.exportMdContent,
           setBlockAttrs: m.setBlockAttrs,
           sql: m.sql,
           listNotebooks: m.listNotebooks,

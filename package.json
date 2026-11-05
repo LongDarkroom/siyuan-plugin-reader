@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-reader",
-  "version": "0.4.0",
+  "version": "0.5.4",
   "description": "RE Reader - standalone EPUB/PDF reader for SiYuan (split from siyuan-plugin-reword)",
   "scripts": {
     "dev": "vite build --watch",

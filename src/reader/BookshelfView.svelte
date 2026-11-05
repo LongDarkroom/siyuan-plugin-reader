@@ -301,6 +301,19 @@
       if (typeof p.sideWidth === "number" && isFinite(p.sideWidth)) {
         sideWidth = clampSideWidth(p.sideWidth);
       }
+      // 2026-11-05：筛选条件也记忆。只恢复枚举/布尔，脏值一律忽略；
+      // 恢复后侧栏「筛选中」胶囊会列出条件，用户随时可单项清除。
+      if (p.filterStatus === "unread" || p.filterStatus === "reading" || p.filterStatus === "finished") {
+        filterStatus = p.filterStatus;
+      }
+      if (typeof p.filterFormat === "string" && p.filterFormat) filterFormat = p.filterFormat;
+      if (typeof p.filterTag === "string") filterTag = p.filterTag;
+      if (typeof p.filterGroup === "string" && p.filterGroup) filterGroup = p.filterGroup;
+      if (typeof p.favoriteOnly === "boolean") favoriteOnly = p.favoriteOnly;
+      if (["red", "orange", "yellow", "green", "blue", "purple", "gray"].includes(p.filterColor)) {
+        filterColor = p.filterColor;
+      }
+      if (typeof p.filterSeries === "string") filterSeries = p.filterSeries;
     } catch {
       // 坏数据忽略，用默认值
     }
@@ -308,7 +321,20 @@
 
   function saveUiPrefs() {
     try {
-      localStorage.setItem(UI_KEY, JSON.stringify({ viewMode, sortKey, sortDir, sidebarOpen, sideWidth }));
+      localStorage.setItem(UI_KEY, JSON.stringify({
+        viewMode,
+        sortKey,
+        sortDir,
+        sidebarOpen,
+        sideWidth,
+        filterStatus,
+        filterFormat,
+        filterTag,
+        filterGroup,
+        favoriteOnly,
+        filterColor,
+        filterSeries,
+      }));
     } catch {
       // 存储不可用（隐私模式等）不影响功能
     }
@@ -393,6 +419,7 @@
     // [2026-08-29] P2:颜色 / 丛书筛选也清
     filterColor = "";
     filterSeries = "";
+    saveUiPrefs();
   }
 
   interface FilterChip {
@@ -457,33 +484,40 @@
     favoriteOnly = scope === "favorite";
     filterStatus = "all";
     filterTag = "";
+    saveUiPrefs();
   }
 
   function pickStatus(s: BookStatus) {
     filterStatus = filterStatus === s ? "all" : s;
+    saveUiPrefs();
   }
 
   function pickGroup(id: string) {
     filterGroup = filterGroup === id ? "all" : id;
     favoriteOnly = false;
+    saveUiPrefs();
   }
 
   /** [2026-08-29] P2:颜色筛选(互斥切换) */
   function pickColor(c: BookColor) {
     filterColor = filterColor === c ? "" : c;
+    saveUiPrefs();
   }
 
   /** [2026-08-29] P2:丛书筛选(互斥切换) */
   function pickSeries(s: string) {
     filterSeries = filterSeries === s ? "" : s;
+    saveUiPrefs();
   }
 
   function pickTag(t: string) {
     filterTag = filterTag === t ? "" : t;
+    saveUiPrefs();
   }
 
   function pickFormat(f: string) {
     filterFormat = filterFormat === f ? "all" : f;
+    saveUiPrefs();
   }
 
   // 批量导入状态
