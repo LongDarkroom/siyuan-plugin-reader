@@ -16,6 +16,23 @@
  *   （缩放组 / 页码组 / 双语态）则只保留在本文件，不再留死代码在 ReaderView。
  * ========================================================================== */
 
+/* ---------- 线性图标基线（全局） ----------
+ * 子组件（PdfToolbar / BookToolbar）的内部元素命中不到 ReaderView 的 scoped
+ * `.reader-ic`，这里补一份全局声明。取值必须与 ReaderView 内那份保持一致：
+ * 24 网格 / 1.75 描边 / 圆头圆角，颜色一律吃 currentColor。
+ */
+.reader-ic {
+  width: 18px;
+  height: 18px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  pointer-events: none;
+}
+
 /* ---------- 通用按钮 ---------- */
 .reader-btn {
   background: none;
@@ -47,6 +64,22 @@
   color: #2f9e44;
 }
 
+/*
+ * 文字型栏内按钮（2026-11-06 统一图标改造配套）。
+ * 图标键是 34×34 方框；文字键若沿用 `.reader-btn` 的 6px 8px 内边距，
+ * 高度只有 ~31px，并排时上方差 3px —— 一眼就能看出「这颗没对齐」。
+ * 这里把文字键也收到同一高度，横向给足 12px 呼吸。
+ */
+.reader-chrome-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px;
+  box-sizing: border-box;
+  border-radius: 9px;
+}
+
 /* ---------- PDF 界面：缩放工具栏 ---------- */
 .reader-zoom-group {
   display: inline-flex;
@@ -56,11 +89,26 @@
   border-left: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
   margin-left: 4px;
 }
+/* 2026-11-06 统一图标：缩放键与页码键都收进 30/24 方框（16/15 图标），
+ * 和栏内主键 34 / 次要键 30 同一套方框语言，不再用 − + ↔ ⊡ 字符。 */
 .reader-zoom-btn {
-  min-width: 28px;
-  padding: 4px 8px;
-  font-size: 14px;
-  font-weight: 500;
+  width: 30px;
+  height: 30px;
+  min-width: 30px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  color: var(--b3-theme-on-surface, #555);
+}
+.reader-zoom-btn .reader-ic {
+  width: 16px;
+  height: 16px;
+}
+.reader-zoom-btn:hover {
+  background: color-mix(in srgb, var(--b3-theme-primary, #378add) 10%, transparent);
+  color: var(--b3-theme-primary, #378add);
 }
 .reader-zoom-label {
   min-width: 64px;
@@ -80,18 +128,25 @@
   margin-left: 4px;
   padding: 0 2px;
   border-left: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
-  height: 22px;
+  height: 30px;
 }
 .reader-page-btn {
-  min-width: 22px;
-  height: 22px;
-  padding: 0 4px;
-  font-size: 12px;
+  width: 24px;
+  height: 24px;
+  min-width: 24px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   color: var(--b3-theme-on-surface-light, #888);
-  border-radius: 4px;
+  border-radius: 6px;
+}
+.reader-page-btn .reader-ic {
+  width: 15px;
+  height: 15px;
 }
 .reader-page-btn:hover:not(:disabled) {
-  background: var(--b3-theme-primary-light, rgba(55, 138, 221, 0.14));
+  background: color-mix(in srgb, var(--b3-theme-primary, #378add) 12%, transparent);
   color: var(--b3-theme-primary, #378add);
 }
 .reader-page-btn:disabled {
@@ -109,9 +164,9 @@
 }
 .reader-page-input {
   width: 32px;
-  height: 18px;
+  height: 20px;
   padding: 0 2px;
-  font-size: 11px;
+  font-size: 11.5px;
   text-align: center;
   background: var(--b3-theme-background, #fff);
   border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.15));
@@ -244,10 +299,13 @@
   height: 0;
 }
 .reader-switch-track {
-  width: 36px;
-  height: 20px;
-  border-radius: 10px;
+  width: 42px;
+  height: 25px;
+  /* 无全局重置：不写 border-box 时 42×25 会被 2px 内边距撑成 46×29。 */
+  box-sizing: border-box;
+  border-radius: 999px;
   background: var(--b3-theme-background-light, rgba(0, 0, 0, 0.12));
+  box-shadow: inset 0 0 0 0.5px rgba(22, 26, 34, 0.05);
   transition: background 200ms ease-out;
   position: relative;
 }
@@ -256,18 +314,21 @@
   position: absolute;
   top: 2px;
   left: 2px;
-  width: 16px;
-  height: 16px;
+  width: 21px;
+  height: 21px;
   border-radius: 50%;
   background: #fff;
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-  transition: transform 200ms ease-out;
+  /* 双层投影：近处定边界、远处造悬浮（与设置面板分段胶囊同参数） */
+  box-shadow:
+    0 1px 2px rgba(0, 0, 0, 0.18),
+    0 2px 6px rgba(0, 0, 0, 0.14);
+  transition: transform 0.2s cubic-bezier(0.32, 0.72, 0, 1);
 }
 .reader-switch input:checked + .reader-switch-track {
   background: var(--b3-theme-primary, #378add);
 }
 .reader-switch input:checked + .reader-switch-track::after {
-  transform: translateX(16px);
+  transform: translateX(17px);
 }
 
 /* ---------- iPhone / Android 底部 sheet 模式下的放大规则 ---------- */
@@ -289,8 +350,24 @@
   .reader-mini-btn { min-height: 32px; min-width: 32px; }
 }
 
-/* 2026-11-04 方案 C：宽屏 + 鼠标再放一档，与 ReaderView 内的上下栏同步。
-   子组件（BookToolbar / PdfToolbar）的按钮走这份全局样式，不能只改父组件。 */
+/* 2026-11-06 方案 A：宽屏档与 ReaderView 的 44px 轻质单栏同步。
+   子组件（BookToolbar / PdfToolbar）的按钮走这份全局样式，不能只改父组件。
+   双语从「纯文字键」收成 24px 单胶囊（图标 14 + 11.5px 文字），
+   取代旧的「进度 + 分隔线 + 双语文字 + 图标」四件套。 */
 @media (min-width: 900px) and (pointer: fine) {
-  .reader-btn { font-size: 16px; padding: 7px 9px; }
+  .reader-btn { font-size: 13px; padding: 0 6px; }
+  .reader-chrome-text {
+    height: 24px;
+    gap: 4px;
+    padding: 0 8px 0 7px;
+    border-radius: 7px;
+    font-size: 11.5px;
+    /* 关闭态也带一层极淡底：与右侧图标键区分出「胶囊」形态，
+       开启态/悬停仍由各自规则覆盖。 */
+    background: var(--b3-theme-background-light, rgba(0, 0, 0, 0.05));
+  }
+  .reader-chrome-text .reader-ic {
+    width: 14px;
+    height: 14px;
+  }
 }

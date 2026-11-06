@@ -186,18 +186,6 @@ export interface ReaderLayoutSettings {
   showProgress: boolean;
   /** 进度样式（默认 fraction） */
   progressStyle: ReaderProgressStyle;
-  /**
-   * 顶栏悬浮（默认 true，2026-10-08）。
-   *
-   * true = 顶栏脱离文档流（`position: absolute`），浮在正文上方：
-   *   · 收起态只剩顶部中央一个小圆点，点一下浮起，再点收回（纯点击，无 hover 触发）；
-   *   · 收起/展开**不改变正文几何**（纯 transform/opacity）—— 正文不重排、不跳页。
-   * false = 恢复 2026-10-08 之前的行为：顶栏常驻文档流顶部（占 36px），中心点击切换显隐。
-   *
-   * 显隐**不落盘**：这是本次会话的临时状态（与底栏的 bottomBarPinned 同理），
-   * 每次打开书默认收起。
-   */
-  topBarFloating: boolean;
   /** 参考页数 0-2000（默认 0，0=不显示） */
   referencePageCount: number;
   /** 显示当前时间（默认 false） */
@@ -389,6 +377,23 @@ export interface ReaderSettings {
    * 等于把滚轮变成死键 —— 所以默认开，阈值可调（见 wheel-gesture.ts）。
    */
   wheelPageTurn?: boolean;
+  /**
+   * 点按左右两侧翻页（触屏默认 true，2026-11-06 新增）。
+   *
+   * 关：左右点按不再翻页（中心开合另由 centerTapChrome 控制）。
+   * 开：左 1/3 回退、右 1/3 前进，中间 1/3 按 centerTapChrome 处理。
+   * 与上下栏开合不冲突 —— 栏或浮层打开时，任意点按先收起。
+   */
+  tapZoneTurn?: boolean;
+  /**
+   * 点正文中间开合上下栏（2026-11-06 新增，默认 false）。
+   *
+   * 主入口是顶栏收起时顶部中央的小圆点；这是第二模式 ——
+   * 「点正文」会和划词、链接、PDF 标注抢手势，所以默认关闭。
+   * 开启后：桌面点正文可见页中心 1/3、触屏点中心 1/3 都能同时开合两栏。
+   * 与 tapZoneTurn 的左右 1/3 翻页不冲突，中心 1/3 归开合。
+   */
+  centerTapChrome?: boolean;
   /**
    * 划词工具栏是否显示「搜索」按钮（2026-10-08 新增）。
    *
@@ -663,6 +668,10 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
   selToolbarEnabled: true,
   // 2026-10-24：滚轮翻页默认开（分页模式）。连续滚动模式自动不生效（原生滚动优先）。
   wheelPageTurn: true,
+  // 2026-11-06：触屏左右点按翻页默认开（既有行为），关掉后只保留中心开合上下栏。
+  tapZoneTurn: true,
+  // 2026-11-06：中心点击是第二模式，默认关 —— 主入口是顶部中央的小圆点。
+  centerTapChrome: false,
   selSearchEnabled: false,
   exportTarget: "clipboard",
   exportDocId: "",
@@ -767,9 +776,6 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
     showFooter: true,
     showProgress: true,
     progressStyle: "fraction",
-    // 2026-10-08 新增：顶栏浮层化。默认开—— 用户明确要求「上面这个栏也做成悬浮的，
-    // 在上面做一个圆点，点击就展开」，且收起时文字更靠近上边框、更有阅读感。
-    topBarFloating: true,
     referencePageCount: 0,
     showCurrentTime: false,
     use24Hour: false,

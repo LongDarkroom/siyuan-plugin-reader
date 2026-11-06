@@ -75,8 +75,18 @@ export interface RowDef {
   label: string;
   /** 控件类型 */
   ctrl: Ctrl;
-  /** 副标题 / 说明（Readest 那种小字说明） */
+  /**
+   * 行内短说明（单行，≤16 字）。
+   *
+   * 2026-11-06 文案瘦身：只保留「不看说明就会用错」的一句；
+   * 选项名已表达清楚的解释一律删掉，避免每行都挂灰字。
+   */
   hint?: string;
+  /**
+   * 长说明（2026-11-06）：默认不占位，渲染成标签旁的 ⓘ，
+   * 悬停 / 点击才浮出。用于发音人下载路径、手势边界这类必须讲全的引导。
+   */
+  info?: string;
   /** 数值范围（slider / stepper） */
   min?: number;
   max?: number;
@@ -238,7 +248,11 @@ export interface TabDef {
   key: string;
   /** Tab 显示名 */
   label: string;
-  /** SVG path（24×24 viewBox，stroke 风格，对齐 Readest 图标） */
+  /**
+   * SVG 内部标记（24×24 viewBox，1.75 描边、圆头，与上下栏 icons.ts 同口径）。
+   * 存「内部标记」而不是单个 path：对比度图标需要填充块，布局图标需要 rect，
+   * 只给 path 一个字段会逼着每个图标都画成路径，得不偿失。
+   */
   icon: string;
   /** 是否为 PDF 模式下隐藏的 Tab（文本/段落/朗读类对固定版式无效） */
   hideInPdf?: boolean;
@@ -291,26 +305,34 @@ export function setByPath(obj: any, path: string, value: any): any {
  */
 const FONT_FAMILY_ON = (s: any): boolean => s?.fontMode === "custom" || s?.fontMode === "classified";
 
-/** 字体图标（Aa） */
-const ICON_FONT = "M4 7V5h16v2M12 5v14M9 19h6";
-/** 布局图标（▦ 分栏） */
+/* 2026-11-06：图标从「裸 path 字符串」改为「SVG 内部标记」。
+   原因是主题图标需要一个实心半圆（对比度示意），布局图标需要两个 rect——
+   只允许 path 会逼着把矩形也手写成路径，可读性差且容易画歪。
+   渲染端（SettingsDialog）统一包一层 24 网格的 <svg> + 1.75 描边。 */
+
+/** 字体图标（Aa 的 A 字骨架） */
+const ICON_FONT = '<path d="M6 19L12 5l6 14"/><path d="M8.5 14h7"/>';
+/** 布局图标（双栏） */
 const ICON_LAYOUT =
-  "M4 4h7v16H4zM13 4h7v16h-7M4 10h7M13 10h7";
+  '<rect x="4" y="4" width="7" height="16" rx="1.5"/><rect x="13" y="4" width="7" height="16" rx="1.5"/>';
 /**
- * 行为图标（☞ 指针）——2026-10-08 新增行为 Tab。
- * 沿用 Readest 行为 Tab 的语义（手形/手势），但描边风格与其他图标统一。
+ * 行为图标（手形/手势）——2026-10-08 新增行为 Tab。
+ * 沿用 Readest 行为 Tab 的语义，描边风格与其他图标统一。
  */
-const ICON_BEHAVIOR = "M9 11V5.5a1.5 1.5 0 013 0V11m0-1.5a1.5 1.5 0 013 0V12m0-1a1.5 1.5 0 013 0v3.5a6 6 0 01-6 6h-1.6a5 5 0 01-3.7-1.7L6 15.5a1.6 1.6 0 012.4-2L9 14";
-/** 主题图标（调色板） */
+const ICON_BEHAVIOR =
+  '<path d="M9 11V5.5a1.5 1.5 0 013 0V11m0-1.5a1.5 1.5 0 013 0V12m0-1a1.5 1.5 0 013 0v3.5a6 6 0 01-6 6h-1.6a5 5 0 01-3.7-1.7L6 15.5a1.6 1.6 0 012.4-2L9 14"/>';
+/** 主题图标（对比度圆：左半实心）——比调色板更贴「明暗主题」的语义 */
 const ICON_THEME =
-  "M12 3a9 9 0 100 18h1.5a2 2 0 001.5-2 2 2 0 012-2H19a2 2 0 002-2 9 9 0 00-9-8zM7.5 11.5h.01M10.5 7.5h.01M15 8.5h.01";
-/** 语言图标（文A） */
-const ICON_LANG = "M4 19l5-14 5 14M6.5 14h7M14 19l3.5-9 3.5 9M15.6 16h3.8";
-/** 朗读图标（喇叭） */
-const ICON_TTS = "M4 10v4h4l5 4V6L8 10zM17 9a4 4 0 010 6";
+  '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 010 16z" fill="currentColor" stroke="none"/>';
+/** 语言图标（两个 A） */
+const ICON_LANG =
+  '<path d="M4 19l5-14 5 14M6.5 14h7M14 19l3.5-9 3.5 9M15.6 16h3.8"/>';
+/** 朗读图标（喇叭 + 两道声波） */
+const ICON_TTS =
+  '<path d="M4.5 10v4h3l4.5 3.5v-11L7.5 10z"/><path d="M16.5 9a4.2 4.2 0 010 6"/><path d="M19 6.5a7.6 7.6 0 010 11"/>';
 /** 双语翻译图标（左「文」右「A」的译义示意） */
 const ICON_TRANSLATE =
-  "M3 6h8M7 4v2c0 3.5-1.8 6.5-5 8m3-5c1 2 3 3.5 5 4M13 20l3.5-8 3.5 8M14.5 17.5h4";
+  '<path d="M3.5 6h7.5M7.2 4v2c0 3.4-1.7 6.3-4.7 7.8"/><path d="M4.8 9.2c1 1.9 2.9 3.4 5.2 4.2"/><path d="M13 20l3.6-8.5L20.2 20M14.4 17.2h4.4"/>';
 
 export const TABS: TabDef[] = [
   /* ==================== Tab 1 · 字体 ==================== */
@@ -329,7 +351,7 @@ export const TABS: TabDef[] = [
             path: "overridePublisherFont",
             label: t("覆盖书籍字体"),
             ctrl: "switch",
-            hint: t("压平书籍自带字体，改用下方设定；关闭则尊重原书排版"),
+            hint: t("覆盖原书字体，改用下方设定"),
           },
         ],
       },
@@ -349,7 +371,7 @@ export const TABS: TabDef[] = [
               { value: "sync", label: t("跟随思源") },
               { value: "custom", label: t("自定义") },
             ],
-            hint: t("跟随思源 = 与思源笔记的正文大小保持一致"),
+            hint: t("与思源正文字号一致"),
             // 值域是 "sync" / "custom"，而设置字段是布尔 → 需要转换，
             // 走 transform 而非让 RowControl 直接写。
             transform: "fontSizeSync",
@@ -365,7 +387,6 @@ export const TABS: TabDef[] = [
             step: 1,
             unit: "px",
             showIf: (s) => s.fontSizeSync === true,
-            hint: t("读自思源笔记当前的正文大小；切到「自定义」后可自行调整"),
             // 跟随态不该能改：改动走「自定义」态的滑块。
             // 用 readonly 而非 showIf —— showIf 会让这一行消失，
             // 用户就看不到「当前跟随到的是多少」了（又变成信息缺失）。
@@ -395,7 +416,7 @@ export const TABS: TabDef[] = [
             max: 20,
             step: 1,
             unit: "px",
-            hint: t("图片说明、脚注等小字的下限，不会比正文的 82% 更小"),
+            hint: t("图注 / 脚注的小字下限"),
           },
           { path: "text.fontWeight", label: t("字重"), ctrl: "stepper", min: 100, max: 900, step: 100 },
         ],
@@ -421,7 +442,6 @@ export const TABS: TabDef[] = [
               { value: "follow-siyuan", label: t("跟随思源") },
               { value: "custom", label: t("自定义") },
             ],
-            hint: t("自定义 = 分别指定衬线 / 无衬线 / 等宽 / 中文字体"),
           },
           // 字体导入/删除管理（对标 Readest 的 Manage Fonts 二级页）。
           // 依赖 reader-fonts.ts 已已有的 FontStore，本行只负责打开入口。
@@ -430,7 +450,7 @@ export const TABS: TabDef[] = [
             label: t("管理字体"),
             ctrl: "action",
             action: "fontManager",
-            hint: t("导入 ttf / otf / woff / woff2，或删除已导入的字体"),
+            hint: t("导入或删除字体文件"),
             showIf: (s) => FONT_FAMILY_ON(s),
           },
         ],
@@ -450,7 +470,6 @@ export const TABS: TabDef[] = [
               { value: "sans-serif", label: t("无衬线") },
             ],
             showIf: (s) => FONT_FAMILY_ON(s),
-            hint: t("正文默认走衬线还是无衬线；书里标了 serif/sans-serif 的段落各走各的链"),
           },
           {
             path: "serifFont",
@@ -460,7 +479,7 @@ export const TABS: TabDef[] = [
             showIf: (s) => FONT_FAMILY_ON(s),
             // 2026-11-01 拉丁/中文分工：这两槽是**西文**槽（英文正文走这里），
             // 汉字由「中文字体」槽接手（浏览器按字符逐个回退）。
-            hint: t("英文正文的衬线字体（西文）；汉字走「中文字体」"),
+            hint: t("西文衬线；汉字走中文字体"),
           },
           {
             path: "sansSerifFont",
@@ -468,7 +487,7 @@ export const TABS: TabDef[] = [
             ctrl: "select",
             optionsFrom: sansSerifFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
-            hint: t("英文正文的无衬线字体（西文）；汉字走「中文字体」"),
+            hint: t("西文无衬线；汉字走中文字体"),
           },
           {
             path: "monospaceFont",
@@ -476,7 +495,7 @@ export const TABS: TabDef[] = [
             ctrl: "select",
             optionsFrom: monospaceFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
-            hint: t("代码块与行内代码使用；西文等宽字体多无汉字字形，中文会自动回落到中文字体"),
+            hint: t("代码块使用；汉字自动回落"),
           },
           {
             path: "defaultCJKFont",
@@ -489,7 +508,7 @@ export const TABS: TabDef[] = [
             // 2026-10-14 方案 A：CJK 也改为动态 store，但首项保留翻译标签。
             optionsFrom: cjkFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
-            hint: t("插在每条字体链的西文段之后（汉字自动回退到此）；留空则用跨平台中文兜底栈"),
+            hint: t("汉字回退到此；留空用系统栈"),
           },
         ],
       },
@@ -508,7 +527,7 @@ export const TABS: TabDef[] = [
             // 改为 switch，值域回到 boolean，与运行时口径一致。
             ctrl: "switch",
             showIf: (s) => !!s.verticalWriting,
-            hint: t("竖排时用中文标点替换原书的西文标点"),
+            hint: t("西文标点转为中文标点"),
           },
         ],
       },
@@ -530,7 +549,7 @@ export const TABS: TabDef[] = [
             path: "__preset",
             label: t("阅读预设"),
             ctrl: "presetCards",
-            hint: t("一键套用页宽、边距、行距与段距；之后仍可用下方滑块微调（改动后显示为自定义）"),
+            hint: t("一键套用；之后仍可微调"),
             // 选中档由当前设置反查：不再依赖一个永远不存在的 settings 字段
             valueFrom: (s) => detectLayoutPreset(s ?? {}),
             options: LAYOUT_PRESET_KEYS.map((k) => {
@@ -555,7 +574,7 @@ export const TABS: TabDef[] = [
             path: "overrideBookLayout",
             label: t("覆盖版式布局"),
             ctrl: "switch",
-            hint: t("压平书籍自带的段距/行距/对齐，改用下方设定；关闭则尊重原书排版"),
+            hint: t("覆盖原书段距 / 行距 / 对齐"),
           },
         ],
       },
@@ -570,7 +589,7 @@ export const TABS: TabDef[] = [
               { value: "pct", label: t("随窗口") },
               { value: "fixed", label: t("固定书页") },
             ],
-            hint: t("随窗口 = 内容宽度按百分比伸缩；固定书页 = 每列宽度固定，实际栏数由窗口宽度决定"),
+            hint: t("随窗口伸缩，或按固定页宽分栏"),
           },
           // 每列宽度（2026-10-08 语义修正 + 补入口）。
           //
@@ -593,7 +612,7 @@ export const TABS: TabDef[] = [
             step: 20,
             unit: "px",
             showIf: (s) => s.layout?.widthMode === "fixed",
-            hint: t("每一页文字的宽度；实际几栏由窗口宽度自动决定（越窄 → 栏数越多）"),
+            hint: t("一列文字的宽度；栏数随窗口"),
           },
           // 栏数上限（2026-10-08 新增）：foliate 的 #top 默认样式硬编码
           // `--_max-column-count: 2`，此前我们没覆盖 ⇒ 无论多窄都最多 2 栏。
@@ -606,7 +625,7 @@ export const TABS: TabDef[] = [
             step: 1,
             unit: t("栏"),
             showIf: (s) => s.layout?.widthMode === "fixed",
-            hint: t("一屏最多并排几页。窗口不够宽时实际栏数会自动减少"),
+            hint: t("窗口不够宽时自动减少"),
           },
           // ⚠️ 2026-10-08 只在「随窗口」模式下显示。
           //
@@ -636,7 +655,7 @@ export const TABS: TabDef[] = [
         title: t("段落"),
         rows: [
           { path: "paragraph.paragraphSpacing", label: t("段间距"), ctrl: "stepper", min: 0, max: 3, step: 0.1,
-            hint: t("以字号为单位的倍数：0.8 倍约 14px，1.3 倍约 22px") },
+            hint: t("以字号为单位的倍数") },
           { path: "lineHeight", label: t("行间距"), ctrl: "stepper", min: 1, max: 2.6, step: 0.1 },
           // 从旧「文本设置」移来（Readest 把它放在布局里）
           //
@@ -645,12 +664,10 @@ export const TABS: TabDef[] = [
           // 的字母粘连。Readest 的区间同样是 0 起的正值。
           // 2026-11-04：单位 px → em。px 不随字号缩放（17px 下 1px≈0.059em，
           // 22px 下只剩 0.045em），同一档设置在换字号后观感会漂。
-          { path: "text.letterSpacing", label: t("字间距"), ctrl: "stepper", min: 0, max: 0.3, step: 0.01, unit: "em",
-            hint: t("随字号缩放；1em = 一个汉字宽") },
+          { path: "text.letterSpacing", label: t("字间距"), ctrl: "stepper", min: 0, max: 0.3, step: 0.01, unit: "em" },
           // 词间距（Readest 有，我们此前完全没有）：
           // 只作用在词与词之间，是调西文/中英混排疏密的正确旋钮。
-          { path: "text.wordSpacing", label: t("词间距"), ctrl: "stepper", min: 0, max: 0.6, step: 0.01, unit: "em",
-            hint: t("只调整单词之间的间隔，不影响单词内部的字距；随字号缩放") },
+          { path: "text.wordSpacing", label: t("词间距"), ctrl: "stepper", min: 0, max: 0.6, step: 0.01, unit: "em" },
           { path: "paragraph.textIndent", label: t("首行缩进"), ctrl: "stepper", min: 0, max: 4, step: 0.1, unit: "em" },
           // N2/N3 补齐：Readest 有，我们完全没有
           // 2026-10-07 接通：此前两端对齐是**完全死设置**（执行层硬编码 justify）。
@@ -658,7 +675,7 @@ export const TABS: TabDef[] = [
           // 2026-10-07 接通：此前 hyphens:auto 是无条件施加的，本开关完全无效，
           // 且「覆盖版式布局」总开关也管不住它（实测输出仍在，只是丢了 !important）。
           { path: "hyphenate", label: t("断字"), ctrl: "switch",
-            hint: t("西文长单词跨行时用连字符断词；中文书无需开启") },
+            hint: t("西文换行加连字符") },
         ],
       },
       {
@@ -692,7 +709,7 @@ export const TABS: TabDef[] = [
               { value: "2", label: t("两栏") },
               { value: "3", label: t("三栏") },
             ],
-            hint: t("把正文在栏内再纵向分栏（报纸式）；与上方「最大栏数」是两回事"),
+            hint: t("报纸式纵向分栏；不同于最大栏数"),
           },
           {
             path: "layout.columnGapPx",
@@ -703,7 +720,6 @@ export const TABS: TabDef[] = [
             step: 2,
             unit: "px",
             showIf: (s) => Number(s.layout?.columnCount ?? 1) > 1,
-            hint: t("仅在多栏时生效"),
           },
           {
             path: "layout.followSiyuanMargin",
@@ -711,7 +727,7 @@ export const TABS: TabDef[] = [
             ctrl: "switch",
             // 2026-10-07 修副作用前先说明：开启后会读宿主文档的左右内边距。
             // 旧实现把它**写回 settings**，关掉开关也不还原 ⇒ 已改为运行时缓存。
-            hint: t("左右边距跟随思源文档的正文宽度；关闭则用上方页面宽度"),
+            hint: t("左右边距跟随思源正文宽度"),
           },
         ],
       },
@@ -723,10 +739,10 @@ export const TABS: TabDef[] = [
           // ⚠️ 此项此前是**完全死设置**：宿主把值拆成 showHeader/showFooter 写进 settings，
           //   但这两个字段执行层零命中、阅读器也没有页眉页脚组件
           //   ⇒ 开关能点能存，什么都不发生。
-          // 现接到底栏（章节名在左、剩余章节在右），底栏本来就是浮层，不改任何排版几何。
-          // 拆成两个开关是因为两者语义独立：只要章节名 / 只要剩余量。
-          { path: "layout.showHeader", label: t("底栏显示章节名"), ctrl: "switch" },
-          { path: "layout.showFooter", label: t("底栏显示剩余章节"), ctrl: "switch" },
+          // 2026-11-06 方案 A：章节名只在顶栏显示（底栏那份已撤掉），
+          // showHeader 改为门控顶栏；showFooter 仍门控进度条 title 里的剩余章节。
+          { path: "layout.showHeader", label: t("顶栏显示章节名"), ctrl: "switch" },
+          { path: "layout.showFooter", label: t("显示剩余章节"), ctrl: "switch" },
         ],
       },
     ],
@@ -752,7 +768,7 @@ export const TABS: TabDef[] = [
             // 2026-10-08 hint 补充：选了 night/dark/gold 这三档深色配色时，
             // 实际呈现恒为深色（执行层 isDark || legacyDark），
             // 此时切「亮」不会有任何视觉变化 —— hint 必须说明，否则用户以为开关坏了。
-            hint: t("只改深浅，不影响配色。选了「夜间/暗色/墨金」配色时恒为深色"),
+            hint: t("深色配色下恒为深色"),
             options: [
               { value: "auto", label: t("跟随") },
               { value: "light", label: t("亮") },
@@ -806,9 +822,9 @@ export const TABS: TabDef[] = [
         rows: [
           // N4/N5 补齐：Readest 有，我们完全没有。夜间阅读的实际痛点。
           { path: "invertImagesInDark", label: t("深色主题下图片反色"), ctrl: "switch",
-            hint: t("仅深色下生效；照片会呈负片感，彩色插图色偏") },
+            hint: t("照片会呈负片感") },
           { path: "overrideBookColor", label: t("覆盖书籍颜色"), ctrl: "switch",
-            hint: t("把书籍写在段落/标题上的颜色拉回主题色，避免深色下深底深字；关闭则尊重原书配色") },
+            hint: t("拉回主题色，避免深底深字") },
         ],
       },
     ],
@@ -838,21 +854,29 @@ export const TABS: TabDef[] = [
     icon: ICON_BEHAVIOR,
     groups: [
       {
-        // 2026-10-08 新增。放在行为 Tab 的第一组 —— 它与其余四组同属
-        // 「界面行为」而非「排版」：字体/布局/主题三个 Tab 都不对，
-        // 页眉页脚那组（上一轮从主题 Tab 移到布局）也是同一条判据的先例。
-        title: t("顶栏"),
+        // 2026-11-06：上下栏改为「上下栏同一个 chrome 状态、纯浮层」的微信读书式交互后，
+        // 「顶栏悬浮」开关整组退役。主入口恢复为顶栏收起时的小圆点；
+        // 这里只放两个可选的手势增强项。
+        title: t("阅读手势"),
         rows: [
           {
-            path: "layout.topBarFloating",
-            label: t("顶栏悬浮"),
+            path: "centerTapChrome",
+            label: t("点正文中间开合上下栏"),
             ctrl: "switch",
-            hint: t("开启后顶栏浮在正文上方：收起时只剩顶部一个小圆点，点一下展开，再点收回。收起时正文更靠近上边框；展开时正文不重排、不跳页。关闭则恢复顶栏常驻顶部"),
+            hint: t("点正文中心开合；顶栏圆点仍可用"),
+            info: t("关闭时用顶栏收起后顶部中央的小圆点开合。开启后，桌面点正文中心、触屏点页面中心 1/3 也能开合；点其他位置仍会收起"),
+          },
+          {
+            path: "tapZoneTurn",
+            label: t("点按左右两侧翻页"),
+            ctrl: "switch",
+            hint: t("触屏左右 1/3 回退 / 前进"),
+            info: t("触屏上点左侧 1/3 回退、右侧 1/3 前进。关闭后左右点按不再翻页，只保留开合手势与圆点"),
           },
         ],
       },
       {
-        title: t("滚动"),
+        title: t("阅读与翻页"),
         rows: [
           {
             path: "flow",
@@ -862,7 +886,6 @@ export const TABS: TabDef[] = [
               { value: "paginated", label: t("分页") },
               { value: "scrolled", label: t("连续滚动") },
             ],
-            hint: t("分页 = 一页一页翻；连续滚动 = 像网页一样上下滚动"),
           },
           {
             // 仅滚动模式生效：focusMode 的实现里写死了
@@ -871,7 +894,7 @@ export const TABS: TabDef[] = [
             label: t("专注模式"),
             ctrl: "switch",
             showIf: (s) => s.flow === "scrolled",
-            hint: t("滚动时高亮视口中心段落、其余淡出，帮助回到阅读位置"),
+            hint: t("高亮视口中心段落"),
           },
           {
             // 2026-10-24 新增：滚轮翻页。
@@ -882,7 +905,7 @@ export const TABS: TabDef[] = [
             label: t("滚轮翻页"),
             ctrl: "switch",
             showIf: (s) => s.flow === "paginated",
-            hint: t("分页模式下滚动鼠标滚轮翻页（滚到底再滚一次才翻，避免一次滑动连翻好几页）"),
+            hint: t("滚到底再滚一次才翻页"),
           },
         ],
       },
@@ -923,7 +946,7 @@ export const TABS: TabDef[] = [
             path: "selToolbarEnabled",
             label: t("启用划词工具栏"),
             ctrl: "switch",
-            hint: t("选中文字后弹出工具栏（复制 / 批注 / 词典 / 翻译 / 朗读 / 发送）"),
+            hint: t("选中文字后弹出工具栏"),
           },
           {
             // 补上 Readest 有、我们唯一真正缺的划词工具项。
@@ -933,7 +956,7 @@ export const TABS: TabDef[] = [
             path: "selSearchEnabled",
             label: t("划词后搜索"),
             ctrl: "switch",
-            hint: t("工具栏里加一个「搜索」按钮，用选中文字搜索全书"),
+            hint: t("工具栏加一个「搜索」按钮"),
           },
         ],
       },
@@ -948,7 +971,6 @@ export const TABS: TabDef[] = [
               { value: "clipboard", label: t("剪贴板") },
               { value: "doc", label: t("文档") },
             ],
-            hint: t("摘录面板的「导出」按钮写到哪去"),
           },
           // ---- 2026-10-10 列表化收敛：四行散设置收敛为一行「笔记发送目标」入口 ----
           // 点「管理」进入总览页（TargetManagerPage）：默认目标 / 自动建档 / 书目列表全在里面。
@@ -960,7 +982,7 @@ export const TABS: TabDef[] = [
             action: "targetManager",
             actionLabel: t("管理"),
             showIf: (s) => s.exportTarget === "doc",
-            hint: t("为每本书单独设置发送文档，或设一个默认目标；未设置的书记可在导出时自动建档"),
+            hint: t("按书设置去向，或设默认目标"),
           },
           // ---- 2026-10-10：模板定制入口（划词发送模板/位置 + 摘录导出模板） ----
           {
@@ -968,7 +990,7 @@ export const TABS: TabDef[] = [
             label: t("模板定制"),
             ctrl: "action",
             action: "templates",
-            hint: t("划词「发送」与摘录「导出」的内容模板与去向"),
+            hint: t("划词与摘录的模板"),
           },
         ],
       },
@@ -994,11 +1016,11 @@ export const TABS: TabDef[] = [
           //   私密书稿要彻底断网（关总闸），但也常想「留个 🌐 查生僻词时手动切」。
           { path: "onlineDictEnabled", label: t("在线词典"), ctrl: "switch",
             apply: "render", scope: "global",
-            hint: t("允许划词时联网查询海词（corp.dict.cn）。关闭后不发起任何网络请求") },
+            hint: t("联网查海词；关闭则完全离线") },
           { path: "dictDefaultSource", label: t("默认数据源"), ctrl: "segmented",
             apply: "render", scope: "global",
             showIf: (s) => s.onlineDictEnabled !== false,
-            hint: t("打开查词弹窗时先查哪个；弹窗内可用🌐 按钮随时切换"),
+            hint: t("弹窗内可用 🌐 随时切换"),
             options: [
               { value: "offline", label: t("离线词典") },
               { value: "online", label: t("海词") },
@@ -1019,7 +1041,7 @@ export const TABS: TabDef[] = [
             action: "dictManager",
             apply: "dict",
             scope: "global",
-            hint: t("导入 / 启用 / 停用离线词典，可搭配同名 .mdd 资源包"),
+            hint: t("导入、启用离线词典"),
           },
         ],
       },
@@ -1043,7 +1065,7 @@ export const TABS: TabDef[] = [
         title: t("对照阅读"),
         rows: [
           { path: "bilingual", label: t("启用翻译"), ctrl: "switch",
-            hint: t("在原文下方插入译文，逐段对照；边读边按需翻译并本地缓存"), apply: "render", scope: "book" },
+            hint: t("原文下插入译文，边读边译"), apply: "render", scope: "book" },
           // 引擎凭据入口（现仅腾讯）。二级页给开关 + SecretId/SecretKey + 连通性测试。
           {
             path: "__translateEngine",
@@ -1052,7 +1074,7 @@ export const TABS: TabDef[] = [
             action: "translateEngine",
             apply: "translate",
             scope: "global",
-            hint: t("填写腾讯云翻译 SecretId/SecretKey 并测试连通性；未配置则开启翻译无译文"),
+            hint: t("未配置则开启翻译无译文"),
           },
           // 术语表入口（二级页 GlossaryPage）：译后硬性替换，改术语自动失效重译。
           {
@@ -1065,7 +1087,7 @@ export const TABS: TabDef[] = [
             action: "glossary",
             apply: "render",
             scope: "global",
-            hint: t("为专有名词指定统一译法；译文里残留的原文术语会被替换（改术语会让旧译文重译）"),
+            hint: t("统一专有名词译法"),
           },
           // 翻译缓存管理入口（二级页 CachePage）：列出已缓存的书、可按书清空。
           {
@@ -1078,11 +1100,11 @@ export const TABS: TabDef[] = [
             action: "cache",
             apply: "render",
             scope: "global",
-            hint: t("查看各书已缓存段数、按书清空译文缓存"),
+            hint: t("按书查看或清空缓存"),
           },
           // ---- 以下 3 项为 2026-10-07 对标 Readest 补齐（此前完全没有）----
           { path: "bilingualShowSource", label: t("显示原文"), ctrl: "switch",
-            hint: t("关闭后对照阅读只看译文，视野更专注"), apply: "render", scope: "book",
+            apply: "render", scope: "book",
             showIf: (s) => !!s.bilingual },
           { path: "bilingualTarget", label: t("翻译到"), ctrl: "select",
             // 2026-10-06：原先此行既无 options 也无 optionsFrom → 下拉渲染成空，
@@ -1095,9 +1117,9 @@ export const TABS: TabDef[] = [
           { path: "translationFontSize", label: t("译文字号"), ctrl: "slider",
             min: 0.4, max: 1.2, step: 0.02, unit: "%", showIf: (s) => !!s.bilingual },
           { path: "bilingualSkipCached", label: t("跳过已缓存"), ctrl: "switch",
-            hint: t("已缓存段落不再请求，避免重复消耗额度"), showIf: (s) => !!s.bilingual },
+            showIf: (s) => !!s.bilingual },
           { path: "bilingualRetry", label: t("失败自动重试"), ctrl: "switch",
-            hint: t("失败段落按退避重试；关闭则等下一轮翻页自然重试"), showIf: (s) => !!s.bilingual },
+            showIf: (s) => !!s.bilingual },
         ],
       },
     ],
@@ -1137,7 +1159,8 @@ export const TABS: TabDef[] = [
           // M3 合并：原「中文发音人」+「中文嗓音」两项语义重复 → 合并
           // 2026-10-07：选项改为运行时枚举系统音色（原先静态给不出 → 下拉永远空白）
           { path: "tts.preferVoiceURIZh", label: t("中文发音人"), ctrl: "select", needs: "tts",
-            hint: t("列表已按「离线·增强/优质」优先排序；想要离线高质量中文，先去 系统设置→辅助功能→朗读内容→自定义语音 下载 Tingting 等增强/优质版，下载后此处会标「离线·增强」"),
+            hint: t("优先离线增强音；下载见问号"),
+            info: t("列表已按「离线·增强/优质」优先排序；想要离线高质量中文，先去 系统设置→辅助功能→朗读内容→自定义语音 下载 Tingting 等增强/优质版，下载后此处会标「离线·增强」"),
             asyncOptions: async () => {
               // ⚠️ 必须动态 import：reader-tts.ts 顶层会 import foliate vendor
               //   （text-walker.js 用到浏览器全局 NodeFilter），静态 import 会把
@@ -1147,7 +1170,8 @@ export const TABS: TabDef[] = [
             },
             showIf: (_s, x) => x?.tts?.engine === "system" },
           { path: "tts.preferVoiceURIEn", label: t("英文发音人"), ctrl: "select", needs: "tts",
-            hint: t("列表已按「离线·增强/优质」优先排序；想要离线高质量英文，先去 系统设置→辅助功能→朗读内容→自定义语音 下载增强/优质版，下载后此处会标「离线·增强」"),
+            hint: t("优先离线增强音；下载见问号"),
+            info: t("列表已按「离线·增强/优质」优先排序；想要离线高质量英文，先去 系统设置→辅助功能→朗读内容→自定义语音 下载增强/优质版，下载后此处会标「离线·增强」"),
             asyncOptions: async () => {
               const m = await import("../reader-tts.ts");
               return m.systemVoiceOptions(await m.listSystemVoices("en"));
@@ -1162,14 +1186,13 @@ export const TABS: TabDef[] = [
               { value: "uk", label: t("英音") },
             ] },
           { path: "tts.iflytekVoice", label: t("讯飞发音人"), ctrl: "entry", needs: "tts",
-            hint: t("如 xiaoyan；留空默认小燕"),
+            hint: t("留空默认小燕"),
             showIf: (_s, x) => x?.tts?.engine === "iflytek" },
           // 韵律三项由 stepper 改 slider：0.5~3 逐格点 ± 太慢，拖动直观。
           // 值语义不变（rate/pitch 仍是倍率、volume 仍是 0~1，RowControl 已按
           // path==="tts.volume" 把显示 ×100 加 %）。
           { path: "tts.rate", label: t("语速"), ctrl: "slider", needs: "tts", min: 0.5, max: 3, step: 0.1, unit: "×" },
-          { path: "tts.pitch", label: t("音高"), ctrl: "slider", needs: "tts", min: 0.5, max: 2, step: 0.1, unit: "×",
-            hint: t("过高会失真，过低显沉闷") },
+          { path: "tts.pitch", label: t("音高"), ctrl: "slider", needs: "tts", min: 0.5, max: 2, step: 0.1, unit: "×" },
           { path: "tts.volume", label: t("音量"), ctrl: "slider", needs: "tts", min: 0, max: 1, step: 0.05, unit: "%" },
         ],
       },
@@ -1177,8 +1200,7 @@ export const TABS: TabDef[] = [
       {
         title: t("跟读"),
         rows: [
-          { path: "tts.enableHighlight", label: t("句高亮"), ctrl: "switch", needs: "tts",
-            hint: t("朗读时高亮当前句/词，便于跟读") },
+          { path: "tts.enableHighlight", label: t("句高亮"), ctrl: "switch", needs: "tts" },
           { path: "tts.granularity", label: t("高亮粒度"), ctrl: "select", needs: "tts",
             showIf: (_s, x) => x?.tts?.enableHighlight !== false,
             options: [
@@ -1207,7 +1229,7 @@ export const TABS: TabDef[] = [
           //   三个下拉两个是假档位。保留 autoPage 单一真源即可。scope 字段留默认 "book"
           //   （恒满足），行为等价于「autoPage 开 = 全书连读」。
           { path: "tts.autoPage", label: t("自动翻页"), ctrl: "switch", needs: "tts",
-            hint: t("读完当前页自动翻到下一页，直到全书读完") },
+            hint: t("读完自动翻下一页") },
           { path: "tts.interval", label: t("句间停顿"), ctrl: "slider", needs: "tts", min: 0, max: 2000, step: 50, unit: "ms" },
         ],
       },
@@ -1222,7 +1244,6 @@ export const TABS: TabDef[] = [
           // 比连点 ± 快。值语义不变（仍是分钟数，0=关）。不含「本章结束」——
           // 引擎只认分钟数，放一个假档位就是「设了不生效」。
           { path: "tts.sleepTimerMin", label: t("睡眠定时"), ctrl: "chips", needs: "tts",
-            hint: t("到点后自动停止朗读"),
             options: [
               { value: 0, label: t("关闭") },
               { value: 15, label: "15" + t("分钟") },
@@ -1351,7 +1372,9 @@ export function searchSettings(
     const row = item.row;
     const candidates: { field: SearchHit["matchedOn"]; text: string }[] = [
       { field: "label", text: row.label },
-      { field: "hint", text: row.hint ?? "" },
+      // info 也要能搜到（2026-11-06 文案瘦身）：长引导从 hint 挪进 ⓘ 后，
+      // 只搜 hint 会让「Tingting」「离线·增强」这类关键词失联
+      { field: "hint", text: [row.hint ?? "", row.info ?? ""].join(" ") },
       { field: "path", text: row.path },
       // 选项当前值：搜「youdao」能命中「中文发音人」这类下拉
       { field: "value", text: displayValueOf(settings, row.path) },

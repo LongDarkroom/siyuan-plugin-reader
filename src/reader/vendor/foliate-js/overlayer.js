@@ -61,9 +61,10 @@ const noteIconGlyph = (rects, color, frameWidth) => {
 
 // REword patch (2026-11-05): 可点击批注气泡（Readest 式）。
 // 与 noteIconGlyph 的区别：这是**独立 overlay 条目**（key = foliate-note:<cfi>），
-// 尺寸更大、带实心底色，并且把 rects 改写成气泡自身的命中区，
+// 带实心底色，并且把 rects 改写成气泡自身的命中区，
 // 因此 hitTest 能命中 → view 派发 show-annotation → 直接打开批注卡。
-// 尾行右端放不下时改首行左端（与 noteIconGlyph 同策略）。
+// 2026-11-06：改为「行上角标」——横向词间距只有 ~4px，贴着高亮末尾画必然压住
+// 右侧单词；抬到末行行上留白（9px）后与字形零接触。尾行右端放不下时改首行左端。
 const noteBadgeGlyph = (rects, color, frameWidth, size) => {
     if (!rects || !rects.length) return null
     const last = rects[rects.length - 1]
@@ -71,14 +72,13 @@ const noteBadgeGlyph = (rects, color, frameWidth, size) => {
     const h = last.bottom - last.top
     if (!(h > 0)) return null
     const s = size
-    const gap = 3
-    const cy = (last.top + last.bottom) / 2
+    const gap = 2
     let x = last.right + gap
     if (frameWidth > 0 && x + s + 4 > frameWidth) x = Math.max(first.left - gap - s, 2)
-    const y = cy - s / 2
-    // 命中区：整枚气泡 + 4px 外扩（再叠加 hitTest 自带 5px 容差）
+    const y = last.top - s - 1
+    // 命中区：整枚气泡 + 外扩。hitTest 自带 5px 容差会向下探进正文，故下方只扩 1px
     rects.splice(1)
-    rects[0] = { left: x - 4, top: y - 4, right: x + s + 4, bottom: y + s + 4, width: s + 8, height: s + 8 }
+    rects[0] = { left: x - 4, top: y - 4, right: x + s + 4, bottom: y + s + 1, width: s + 8, height: s + 5 }
     const g = createSVGElement('g')
     const circle = createSVGElement('circle')
     circle.setAttribute('cx', String(x + s / 2))
@@ -580,10 +580,10 @@ export class Overlayer {
     }
     /**
      * 可点击批注气泡。rects 会被改写成气泡命中区，供 Overlayer.hitTest 精确命中。
-     * options: color=标注色，frameWidth=内容区宽，size=直径（默认 15）
+     * options: color=标注色，frameWidth=内容区宽，size=直径（默认 9）
      */
     static noteBadge(rects, options = {}) {
-        const { color = 'red', frameWidth = 0, size = 15 } = options
+        const { color = 'red', frameWidth = 0, size = 9 } = options
         const g = createSVGElement('g')
         const badge = noteBadgeGlyph(rects, color, frameWidth, size)
         if (badge) g.append(badge)

@@ -68,7 +68,7 @@
      铁律：全部 ≤ 60 —— 阅读器内任何层都不得高于思源原生 UI（顶栏菜单等）。
        stage(0) 正文 < backdrop(1) 点空白收起遮罩 < floating(2)/popover(2)
        < sel-toolbar(3) 划词工具栏 < sel-handle(4) 选区手柄
-       < toolbar/handle(5/7) 顶栏·底栏及其圆点把手
+       < toolbar(5) 顶栏·底栏（2026-11-06 起无圆点把手，两栏同层）
        < imgv(60) 图片灯箱（唯一全屏模态，对齐 .reword-pt-overlay 先例）
      书架 portal 面板(.edit-mask z-50) / 右键菜单(z-10000) / index.less 遗留
      AI 弹窗(z-100000) 属历史体系，统一收敛另列专项（见 docs/mobile-adaptation-plan.md）。 */
@@ -79,7 +79,6 @@
   --rz-sel-toolbar: 3;
   --rz-sel-handle: 4;
   --rz-toolbar: 5;
-  --rz-handle: 7;
   /* 浮层内 tooltip：必须压过批注卡(4)/词典(3)，但仍在 floating 层内部，
      不会越过思源原生 UI；imgv 是全屏模态，保持在其下。 */
   --rz-tip: 30;

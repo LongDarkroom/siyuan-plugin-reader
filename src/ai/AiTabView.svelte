@@ -22,6 +22,7 @@
     type AiTabPin,
     type AiTabTarget,
   } from "./ai-tab-follow.ts";
+  import type { AiChatQuote } from "./panel/ai-panel-logic.ts";
 
   interface PinState {
     locked: boolean;
@@ -44,6 +45,7 @@
   let lastComp: any = null;
   let lastSig = "";
   let timer: ReturnType<typeof setInterval> | null = null;
+  let panelComp: any = null;
 
   function storage(): Storage | null {
     try {
@@ -129,6 +131,18 @@
     syncPinState();
   }
 
+  /**
+   * 把选段直接投进页签内的面板。
+   * 只有页签正绑定同一本书、且面板已挂载时才成功；锁定在别的书或宿主
+   * 未就绪一律返回 false，由调用方回落到阅读器右侧停靠栏。
+   */
+  export function deliverQuote(bookId: string, quote: AiChatQuote): boolean {
+    const id = String(bookId || "");
+    if (!id || !host || host.bookId !== id || !panelComp) return false;
+    panelComp.addQuote?.(quote);
+    return true;
+  }
+
   /** 页签头按钮：跟随态 → 锁定当前书；锁定态 → 恢复跟随 */
   export function togglePin(): void {
     if (pinned.bookId) {
@@ -182,6 +196,7 @@
 <div class="re-ai-tab">
   {#if host}
     <AiPanel
+      bind:this={panelComp}
       bookId={host.bookId}
       bookTitle={host.bookTitle}
       bookAuthor={host.bookAuthor}

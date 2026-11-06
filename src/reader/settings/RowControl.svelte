@@ -9,6 +9,12 @@
   import { get } from "svelte/store";
   import { t } from "../../i18n/index.ts";
   import { getByPath, setByPath, type RowDef } from "./settings-schema.ts";
+  import {
+    showSettingsTip,
+    hideSettingsTip,
+    toggleSettingsTip,
+    resetSettingsTip,
+  } from "./settings-tip.ts";
 
   /**
    * 控件选项的统一形状（2026-10-07）。
@@ -178,6 +184,8 @@
   onDestroy(() => {
     unsubStore?.();
     unsubStore = null;
+    // ⓘ 浮层是 body 单例，行卸载（切 Tab / 关面板）时必须收掉
+    resetSettingsTip();
   });
 
   /** 依赖变化（如 TTS 引擎切换导致可用音色不同）时重新拉取 */
@@ -339,7 +347,24 @@
     class:rw-row-readonly={ro}
   >
     <div class="rw-label">
-      <span class="rw-label-text">{row.label}</span>
+      <span class="rw-label-text">{row.label}{#if row.info}<button
+          type="button"
+          class="rw-info"
+          aria-label={t("说明")}
+          aria-expanded="false"
+          on:mouseenter={(e) => showSettingsTip(e.currentTarget, row.info ?? "")}
+          on:mouseleave={(e) => hideSettingsTip(e.currentTarget)}
+          on:focus={(e) => showSettingsTip(e.currentTarget, row.info ?? "")}
+          on:blur={(e) => hideSettingsTip(e.currentTarget)}
+          on:click|stopPropagation={(e) => toggleSettingsTip(e.currentTarget, row.info ?? "")}
+        ><svg viewBox="0 0 24 24" aria-hidden="true"
+            ><path d="M9.6 9.4a2.5 2.5 0 014.2 2c0 1.1-.9 1.5-1.6 2.1-.3.3-.5.6-.5 1.1" /><circle
+              cx="12"
+              cy="17"
+              r="0.95"
+              fill="currentColor"
+              stroke="none"
+            /></svg></button>{/if}</span>
       {#if row.hint}
         <span class="rw-hint">{row.hint}</span>
       {/if}

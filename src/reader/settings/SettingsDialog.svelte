@@ -15,6 +15,8 @@
   import { t } from "../../i18n/index.ts";
   import { getLogger } from "../../core/logger.ts";
   import { TABS, type TabDef, getByPath, setByPath, searchSettings, type SearchHit } from "./settings-schema.ts";
+  // 2026-11-06 与上下栏共用同一套线性图标（24 网格 / 1.75 描边 / 圆头）
+  import { ICONS } from "../icons.ts";
   import RowControl from "./RowControl.svelte";
   import DictManagerPage from "./DictManagerPage.svelte";
   import TranslateEnginePage from "./TranslateEnginePage.svelte";
@@ -417,101 +419,108 @@
       aria-modal="true"
       aria-label={t("阅读设置")}
     >
-      <!-- ===== 顶部：Tab 条（二级页时替换为返回条） ===== -->
-      {#if subPage}
-        <!-- 二级页头部：返回 + 标题（Readest 的「‹ 返回」形态） -->
-        <header class="rwd-subhead">
-          <button type="button" class="rwd-back" on:click={() => (subPage = null)}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-              <path d="M15 5l-7 7 7 7" />
-            </svg>
-            <span>{t("返回")}</span>
-          </button>
-          <h3 class="rwd-subhead-title">
-            {subPage === "translate"
-              ? t("翻译引擎配置")
-              : subPage === "glossary"
-                ? t("术语表")
-                : subPage === "cache"
-                  ? t("翻译缓存")
-                  : subPage === "fonts"
-                ? t("管理字体")
-                : subPage === "targetManager"
-                  ? t("笔记发送目标")
-                  : subPage === "docTree"
-                    ? (pendingTreeMode === "book"
-                        ? t("选择本书的发送目标")
-                        : t("选择默认目标"))
-                    : subPage === "templates"
-                      ? t("模板定制")
-                      : t("词典管理")}
-          </h3>
-          <button type="button" class="rwd-close" aria-label={t("关闭")} on:click={close}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                 stroke-linecap="round" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" />
-            </svg>
-          </button>
-        </header>
-      {:else}
-        <nav class="rwd-tabs" role="tablist">
-          {#each visibleTabs as tab (tab.key)}
-            <button
-              type="button"
-              role="tab"
-              class="rwd-tab"
-              class:on={tab.key === activeTab?.key}
-              aria-selected={tab.key === activeTab?.key}
-              on:click={() => switchTab(tab.key, tab.label)}
-            >
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"
-                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d={tab.icon} />
-              </svg>
-              <span class="rwd-tab-label">{tab.label}</span>
-            </button>
-          {/each}
-          <button type="button" class="rwd-close" aria-label={t("关闭")} on:click={close}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                 stroke-linecap="round" aria-hidden="true">
-              <path d="M6 6l12 12M18 6L6 18" />
-            </svg>
-          </button>
-        </nav>
+      <!-- ===== 左导航（2026-11-06 方案 A） =====
+           标题 / 搜索 / 7 个 Tab / 「改动即时保存」全收进这一列。
+           二级页时整列不渲染：子页有自己的「返回 + 标题」头部，
+           左列留着会让用户以为点 Tab 还能跳走（实际会被返回条盖住语义）。 -->
+      {#if !subPage}
+        <aside class="rwd-rail">
+          <div class="rwd-rail-head">
+            <h2 class="rwd-rail-title">{t("阅读设置")}</h2>
+          </div>
 
-        <!-- ===== 搜索条（2026-10-07 第 3 批，对标 Readest 顶部搜索） ===== -->
-        <div class="rwd-searchbar">
-          <svg class="rwd-search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-               stroke-width="1.8" stroke-linecap="round" aria-hidden="true">
-            <circle cx="11" cy="11" r="7" />
-            <path d="M20 20l-3.5-3.5" />
-          </svg>
-          <!-- svelte-ignore a11y-autofocus -->
-          <input
-            class="rwd-search"
-            bind:this={searchEl}
-            type="search"
-            value={query}
-            placeholder={t("搜索设置项…")}
-            aria-label={t("搜索设置项")}
-            on:input={(e) => (query = e.currentTarget.value)}
-          />
-          {#if searching}
-            <span class="rwd-search-count">{t("{n} 项").replace("{n}", String(hits.length))}</span>
-            <button type="button" class="rwd-search-clear" aria-label={t("清空")} on:click={() => (query = "")}>
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                   stroke-linecap="round" aria-hidden="true">
-                <path d="M6 6l12 12M18 6L6 18" />
-              </svg>
-            </button>
-          {/if}
-        </div>
+          <!-- ===== 搜索条（放在左列：搜索是「找某个设置」的导航动作，
+                 和 Tab 同类，不该横在内容区顶部占 42px 高度） ===== -->
+          <div class="rwd-searchbar">
+            <svg class="rwd-ic rwd-search-icon" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.search}</svg>
+            <!-- svelte-ignore a11y-autofocus -->
+            <input
+              class="rwd-search"
+              bind:this={searchEl}
+              type="search"
+              value={query}
+              placeholder={t("搜索设置项…")}
+              aria-label={t("搜索设置项")}
+              on:input={(e) => (query = e.currentTarget.value)}
+            />
+            {#if searching}
+              <span class="rwd-search-count">{t("{n} 项").replace("{n}", String(hits.length))}</span>
+              <button type="button" class="rwd-search-clear" aria-label={t("清空")} on:click={() => (query = "")}>
+                <svg class="rwd-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.close}</svg>
+              </button>
+            {/if}
+          </div>
+
+          <div class="rwd-tabs" role="tablist">
+            {#each visibleTabs as tab (tab.key)}
+              <button
+                type="button"
+                role="tab"
+                class="rwd-tab"
+                class:on={tab.key === activeTab?.key}
+                aria-selected={tab.key === activeTab?.key}
+                on:click={() => switchTab(tab.key, tab.label)}
+              >
+                <svg class="rwd-ic rwd-tab-ic" viewBox="0 0 24 24" aria-hidden="true">{@html tab.icon}</svg>
+                <span class="rwd-tab-label">{tab.label}</span>
+              </button>
+            {/each}
+          </div>
+
+          <div class="rwd-rail-foot">
+            <svg class="rwd-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.check}</svg>
+            <span>{t("改动即时保存")}</span>
+          </div>
+        </aside>
       {/if}
 
-      <!-- ===== 内容：二级页 or 分组渲染卡片 ===== -->
-      <!-- svelte-ignore a11y-no-static-element-interactions -->
-      <div class="rwd-body" on:click|stopPropagation>
+      <!-- ===== 右内容区 ===== -->
+      <div class="rwd-main">
+        {#if subPage}
+          <!-- 二级页头部：返回 + 标题（Readest 的「‹ 返回」形态） -->
+          <header class="rwd-subhead">
+            <button type="button" class="rwd-back" on:click={() => (subPage = null)}>
+              <svg class="rwd-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.back}</svg>
+              <span>{t("返回")}</span>
+            </button>
+            <h3 class="rwd-subhead-title">
+              {subPage === "translate"
+                ? t("翻译引擎配置")
+                : subPage === "glossary"
+                  ? t("术语表")
+                  : subPage === "cache"
+                    ? t("翻译缓存")
+                    : subPage === "fonts"
+                  ? t("管理字体")
+                  : subPage === "targetManager"
+                    ? t("笔记发送目标")
+                    : subPage === "docTree"
+                      ? (pendingTreeMode === "book"
+                          ? t("选择本书的发送目标")
+                          : t("选择默认目标"))
+                      : subPage === "templates"
+                        ? t("模板定制")
+                        : t("词典管理")}
+            </h3>
+            <button type="button" class="rwd-close" aria-label={t("关闭")} on:click={close}>
+              <svg class="rwd-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.close}</svg>
+            </button>
+          </header>
+        {:else}
+          <!-- 一级页头部：当前 Tab 名 + 关闭。
+               标题放这里而不是只靠左列高亮 —— 搜索命中跳转后左列可能滚出视口，
+               主区标题是「我现在在哪」的最后一道确认。 -->
+          <header class="rwd-head">
+            <h3 class="rwd-head-title">{activeTab ? activeTab.label : ""}</h3>
+            <button type="button" class="rwd-close" aria-label={t("关闭")} on:click={close}>
+              <svg class="rwd-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.close}</svg>
+            </button>
+          </header>
+        {/if}
+
+        <!-- ===== 内容：二级页 or 分组渲染卡片 ===== -->
+        <!-- svelte-ignore a11y-no-static-element-interactions -->
+        <div class="rwd-body" on:click|stopPropagation>
         {#if subPage === "dict"}
           <DictManagerPage {dictManager} on:changed={(e) => dispatch("dictChanged", e.detail)} />
 
@@ -684,7 +693,7 @@
               }}
             >
               <summary class="rwd-group-summary">
-                <span class="rwd-group-chevron" aria-hidden="true">›</span>
+                <svg class="rwd-group-chevron rwd-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.chevronRight}</svg>
                 <span class="rwd-group-summary-title">{group.title}</span>
                 <span class="rwd-group-count">
                   {activeCount > 0
@@ -775,6 +784,7 @@
           </button>
         {/if}
       </footer>
+      </div>
     </div>
   </div>
 {/if}

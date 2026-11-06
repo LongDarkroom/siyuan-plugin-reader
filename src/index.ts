@@ -439,6 +439,24 @@ export class ReaderPlugin extends Plugin {
     }
   }
 
+  /**
+   * 划词「问 AI」：优先把选段投进已打开的 AI 页签。
+   *
+   * 返回 false 表示页签没开 / 宿主未就绪 / 页签锁定的是别的书，
+   * 阅读器据此回落到右侧停靠栏（手机端没有页签，也会走这条回落）。
+   */
+  askAiInTab(
+    bookId: string,
+    quote: { text: string; sectionIndex?: number; chapterTitle?: string }
+  ): boolean {
+    try {
+      return !!this.aiTabs?.deliverQuote?.(bookId, quote);
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 向 AI 页签投递选段失败", { error: e });
+      return false;
+    }
+  }
+
   /** 打开指定书籍（供深链 / 命令面板 / 外部调用） */
   openBook(bookId: string, title?: string): void {
     try {

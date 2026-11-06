@@ -105,6 +105,27 @@ export class AiTabController {
     }
   }
 
+  /** 页签当前是否挂载（阅读器据此判断「问 AI」能不能直接投递） */
+  isOpen(): boolean {
+    return !!this.rec?.tab;
+  }
+
+  /**
+   * 把选段直接投到已打开的 AI 页签。
+   * 页签未挂载、宿主没就绪或锁定的是别的书时返回 false，由调用方回落停靠栏；
+   * 投递成功后聚焦页签——用户刚点「问 AI」，结果应当就在眼前。
+   */
+  deliverQuote(bookId: string, quote: any): boolean {
+    let ok = false;
+    try {
+      ok = !!this.rec?.view?.deliverQuote?.(bookId, quote);
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ai-tab-controller.ts · deliverQuote", "debug");
+    }
+    if (ok) this.open();
+    return ok;
+  }
+
   private mount(custom: any): void {
     if (this.rec) return;
     try {

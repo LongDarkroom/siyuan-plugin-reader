@@ -10,6 +10,7 @@
 -->
 <script lang="ts">
   import { t } from "../i18n/index.ts";
+  import { ICONS } from "./icons.ts";
   export let bilingualOn = false;
   /** 预翻译进行中 */
   export let bilingualActive = false;
@@ -23,11 +24,11 @@
 </script>
 
 <button
-  class="reader-btn reader-bilingual-btn"
+  class="reader-btn reader-bilingual-btn reader-chrome-text"
   class:reader-btn-active={bilingualOn}
   class:reader-btn-busy={bilingualActive}
   title={totalTokens != null
     ? `${t("双语对照 · AI Token")}: ${totalTokens}（${t("输入")} ${promptTokens} + ${t("输出")} ${completionTokens}）`
     : t("双语对照：在每段正文后注入译文（AI 翻译）")}
   on:click={onToggleBilingual}
->{t("双语")}{bilingualActive ? ` ${bilingualDone}/${bilingualTotal}` : ""}{totalTokens != null && !bilingualActive ? ` · ${totalTokens}T` : ""}</button>
+><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.translate}</svg><span>{t("双语")}{bilingualActive ? ` ${bilingualDone}/${bilingualTotal}` : ""}{totalTokens != null && !bilingualActive ? ` · ${totalTokens}T` : ""}</span></button>

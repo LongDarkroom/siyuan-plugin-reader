@@ -30,6 +30,8 @@ import { getLogger } from "../core/logger.ts";
   import { placeTip, TIP_DELAY_MS } from "./tooltip.ts";
   import { isHostDragActive, toHostPoint } from "./host-drag-bridge.ts";
   import BookToolbar from "./BookToolbar.svelte";
+  // 2026-11-06 统一线性图标：上下栏不再用字符/emoji 拼贴
+  import { ICONS } from "./icons.ts";
   // 2026-11-04 图片右键菜单（复制/保存），正文与灯箱共用
   import ImageContextMenu from "./ImageContextMenu.svelte";
   import PdfToolbar from "./PdfToolbar.svelte";
@@ -429,6 +431,10 @@ import { getLogger } from "../core/logger.ts";
   export let onTitleChange: ((title: string) => void) | undefined = undefined;
   /** 2026-11-05 AI 页签：把右侧助手提升为思源页签（手机端无页签，不提供） */
   export let onOpenAiTab: ((bookId: string) => void) | undefined = undefined;
+  /** 2026-11-06 划词「问 AI」：优先投到已打开的 AI 页签；返回 false 则回落停靠栏 */
+  export let onAskAiInTab:
+    | ((bookId: string, quote: AiChatQuote) => boolean)
+    | undefined = undefined;
   /** 翻译选中文本并直接发送到 AI 精读面板（委托 plugin.translateToAi） */
   export let onTranslateToAi: ((text: string) => void) | undefined = undefined;
   /** 双语段落批量翻译（委托 plugin.translateBatch，按书缓存 + 引擎链兜底）；
@@ -1014,23 +1020,25 @@ import { getLogger } from "../core/logger.ts";
   }
   // 脚注气泡（点击脚注直接展示内容，不跳转）
   let showFootnote = false;
-  // 2026-08-29 Phase 1：工具栏可见性（移动端中心点击切换，Readest 式沉浸阅读）
-  // ⚠️ 2026-10-08 起**仅在「顶栏悬浮」关闭时**才有意义（topBarFloating=false 的旧行为）。
-  //   悬浮模式下顶栏的显隐改由下面三个 topBar* 变量控制。
-  let toolbarVisible = true;
-  /* 2026-10-08 顶栏浮层化（对标底栏的「纯浮层 + 圆点 + 纯点击」范式）
-   *  ·顶栏脱离文档流（position:absolute），浮在正文上方，**不参与分页器几何**
-   *    ⇒ 收起/展开是纯 transform/opacity，**正文一个字都不动、不重排、不跳页**。
-   *    （这是相对 Readest 双档边距方案的关键取舍 —— 那套会让每次点圆点都重排，
-   *      正是 2026-10-07 底栏那轮用户亲自否决的「动态占位」。）
-   *  · 收起态在顶部中央留一个小圆点（`.reader-top-handle`），点一下浮起、再点收回。
-   *  · **纯点击，无 hover 触发区** —— 同底栏：用户明确否决过「鼠标靠近就自动弹出」。
-   *  · 显隐不落盘：每次打开书默认收起。
+  /* 2026-11-06 上下栏统一为「阅读界面 chrome」（微信读书 / Readest 同款）
+   *
+   *  · chromePinned —— 用户显式开合：顶栏与底栏**同时**显隐，一个状态驱动两栏；
+   *  · topBarKept  —— 仅因浮层（目录/搜索/设置/⋯）还开着而临时保持顶栏可见。
+   *    抽屉挂在顶栏锚点上，栏收起后锚点消失会留下「孤儿抽屉」。
+   *
+   * 下面两句 $: 是 topBarRevealed / bottomBarRevealed 的**唯一**写入点，
+   * 其它任何函数只改上面两个源状态，避免再出现两套布尔互相打架的旧问题。
+   *
+   * 显隐只改 opacity/transform（见 .reader-toolbar-floating 与 .reader-bottom-bar），
+   * 不写任何几何 ⇒ 正文零重排。不做常驻圆点，也不做 hover 触发区。
    */
-  let topBarPinned = false;       // 点击圆点 → 浮起 / 收回（唯一的主动作）
-  let topBarBarHover = false;     // 鼠标位于已展开的栏内（维持显示，否则栏内按钮点不到）
-  let topBarRevealed = false;     // 派生：当前是否显现
-  /** 顶栏 DOM（浮层模式下用于算底沿，供划词工具栏避让） */
+  let chromePinned = false;
+  let topBarKept = false;
+  let topBarRevealed = false;
+  let bottomBarRevealed = false;
+  $: topBarRevealed = chromePinned || topBarKept;
+  $: bottomBarRevealed = chromePinned;
+  /** 顶栏 DOM（浮起时用于算底沿，供划词工具栏避让） */
   let topBarEl: HTMLElement | null = null;
   let footnoteHTML = "";
   let footnoteType = t("脚注");
@@ -1187,12 +1195,8 @@ import { getLogger } from "../core/logger.ts";
   }
   /* 2026-08-30 底部进度条 · 默认完全隐藏（不占阅读高度、不挡文字）
    2026-10-07 改造为**纯点击**：去掉底部 38px 鼠标热区自动弹出。
-     · pinned   —— 点击把手后「浮起」，再点一次收回（唯一的主动作）
-     · barHover —— 鼠标在**已展开的栏内**（维持显示，否则栏内按钮无法点击）
-   hover 靠近即弹的机制已移除：阅读时频繁误触发，且用户对「何时出现」没有预期感。*/
-  let bottomBarPinned = false;       // 点击把手 → 浮起 / 收回
-  let bottomBarBarHover = false;     // 鼠标位于已展开的进度条自身上（维持显现）
-  let bottomBarRevealed = false;     // 派生：当前是否显现
+   2026-11-06 与顶栏合并为单一 chrome 状态（见上方 chromePinned），
+   显隐由 bottomBarRevealed 派生，不再有独立的 pinned / barHover。*/
   /* 2026-08-29 UI 全面优化 · 读者外框：进度条章节标记 */
   let chapterMarks: { left: number; title: string }[] = []; // 章节起始位置（0–100）
   /* ---- 2026-08-29 新增：书签 + 摘录汇总抽屉（对齐 Obsidian weave 的摘录沉淀链） ---- */
@@ -1359,7 +1363,7 @@ import { getLogger } from "../core/logger.ts";
   /**
    * 下边距写进分页器：**恒等于用户设定值**，永不被底栏影响。
    *
-   * 调用点：applyStylesInner（设置变更）、updateBottomBarReveal（显隐变化）。
+   * 调用点：applyStylesInner（设置变更）。
    * 保留这次显式写入是为了**复位** —— 若同一页面会话内曾经写过旧版的
    * `base + reserve` 历史值，需要在此写回纯 `base`，否则改过底栏后回不去。
    */
@@ -1381,218 +1385,101 @@ import { getLogger } from "../core/logger.ts";
   }
 
   /**
-   * 底部进度条显隐控制（2026-10-07 改造：去掉 hover 自动弹出，改为纯点击）。
+   * 上下栏的显隐控制（2026-11-06：微信读书式统一 chrome）。
    *
-   * ## 用户反馈（真机）
-   * 「等鼠标往这边移动的时候它就很灵敏的往上走，我不太喜欢，我想那种点击的情况，
-   *   这样会更有掌握感」——
-   *   hover 热区（底部 38px）自动弹出的机制在阅读时频繁误触发（想翻页结果栏弹出来），
-   *   且用户对「它什么时候出现」没有预期感。
+   * · chromePinned 用户显式开合 → 顶/底两栏一起显隐；
+   * · topBarKept 仅因浮层还开着而保持顶栏（抽屉需要锚点）；
+   * · 两句 $: 是 revealed 的唯一写入点（见状态声明处）。
    *
-   * ## 现在的规则
-   * · **点击把手 → 切换**（浮起 / 收回），这是唯一的主动作；
-   * · 鼠标在**已展开的栏内**时维持显示 —— 必须保留，
-   *   否则用户想点进度条上的「上一页/下一页」时，一移开鼠标栏就消失、根本点不到；
-   * · 移出栏外后若非 pinned（未点开）则收回。
-   *
-   * ⇒ 去掉 `bottomBarEdgeHover`（底部热区自动触发），它已被 click 取代。
-   *
-   * ## 副作用：无
-   * 底栏已是纯浮层、不参与分页器几何（见上方说明），
-   * 显隐变化**不需要**再刷新任何边距。仅在此保留一次调用，
-   * 用于复位可能残留的旧版 `base + reserve` 边距值。
+   * 显隐只改 opacity/transform，不写任何几何 ⇒ 正文零重排。
+   * 不做 hover 触发区：用户明确否决过「鼠标靠近就自动弹出」。
    */
-  function updateBottomBarReveal() {
-    bottomBarRevealed = bottomBarPinned || bottomBarBarHover;
-    applyBottomBarReserve();
+  function collapseChrome(): void {
+    chromePinned = false;
+    topBarKept = false;
   }
 
-  /**
-   * 鼠标在阅读区内移动。
-   *
-   * 2026-10-07：原逻辑用它判定「是否进入底部 38px 热区」以自动弹出。
-   * 现 hover 自动弹出已去掉，本函数**不再改显隐**，
-   * 只保留一个用途：把鼠标移出栏外时收起未固定的栏。
-   */
-  function onReaderMouseMove(_e: MouseEvent) {
-    // 刻意留空：热区自动弹出已移除（见 updateBottomBarReveal 注释）。
-    // 保留空函数是因为模板仍绑定它，避免连带改模板。
-    // 收起逻辑放在 onReaderLeave 与底栏自身的 mouseleave 里。
-  }
-
-  /** 鼠标离开阅读区：退出进度条自身，未固定则自动隐藏 */
-  function onReaderLeave() {
-    bottomBarBarHover = false;
-    updateBottomBarReveal();
-    // 2026-10-08：顶栏同理 —— 移出阅读区后，若不是用户点开的（pinned），
-    // 且栏内此刻没有 hover，就收回。pinned 的不动（用户显式点开的）。
-    if (isTopBarFloating()) {
-      topBarBarHover = false;
-      updateTopBarReveal();
-    }
-  }
-
-  /**
-   * 点击栏内「⌄」：立即完全收起（含 pinned）。
-   * 与把手「切换」的区别：这是无条件收起，不做「若已收起则展开」的分支。
-   */
-  function collapseBottomBar() {
-    bottomBarPinned = false;
-    bottomBarBarHover = false;
-    updateBottomBarReveal();
-  }
-
-  /**
- * 写入顶栏把手的命中区尺寸（`--reword-top-hit-h` / `-w`）。
- *
- * ## 为什么必须按上边距夹，而不是写死
- * Readest `getHeaderTriggerHeight()` 的注释写明了它踩过的坑（#4977/#5427）：
- * 触发区是个「盖子」—— **盖住的部分不能被选中、长按、点击**。
- * 它曾按 44px 写死，而 44 只是恰好等于默认上边距；一旦上边距被调小
- * （页眉关闭 / 用户手动收紧），触发区就悬在第一行文字上方、吞掉那里的划词。
- * ⇒ Readest 改成 `min(44, 内容顶边)`。
- *
- * 我们的默认上边距是 24（顶栏浮层化后），所以：
- * `h = clamp(16, min(28, marginTopPx - 4), 28)` —— 上边距 ≥32px 时恒为 28px，
- * 与底栏把手同尺寸，手感一致；上边距很小时退化到 16px 最小值。
- *
- * ⚠️ 诚实标注边界：上边距 < 20px 时命中区仍会压住一点字。
- *   这是刻意的 —— 再压更小就点不中圆点了，等于把功能整个废掉。
- *   20px 上边距本身已在正文字号的可读边缘，不建议再往下调。
- */
-function applyTopHandleHitHeight() {
-  if (!topBarEl) return;
-  const mt = Math.max(0, Number(settings.layout.marginTopPx) || 0);
-  const h = Math.min(28, Math.max(16, mt - 4));
-  topBarEl.style.setProperty("--reword-top-hit-h", `${h}px`);
-  // 宽度固定 28：宽度不受边距约束（左右方向没有「内容顶边」这种概念），
-  // 但跟随高度做成正圆手感更好。
-  topBarEl.style.setProperty("--reword-top-hit-w", `${Math.max(24, h)}px`);
-}
-
-  /* ==================== 顶栏浮层（2026-10-08） ==================== */
-
-  /** 是否走「顶栏浮层」模式（关闭时是 2026-10-08 之前的常驻占位行为） */
-  function isTopBarFloating(): boolean {
-    return settings.layout.topBarFloating !== false;
-  }
-
-  /**
-   * 顶栏显隐。
-   *
-   * ## 副作用：**刻意不做任何几何写入**
-   * 与底栏的 `applyBottomBarReserve()` 不同，这里**不碰分页器边距**：
-   * 顶栏是 `position: absolute`，收起/展开只改 opacity + transform，
-   * 而这**不改变任何元素的盒子尺寸** ⇒ 内容文档的分页/滚动几何完全不变。
-   *
-   * ⚠️ 若这里加「展开时给 top 加一段占位」，就会踩 2026-10-07 底栏那轮
-   * 用户亲自否决掉的「动态占位」：每次点圆点都重排正文、甚至跳页。
-   * 用户明确要的就是「浮在上面、文字不动、被盖住没关系」。
-   */
-  function updateTopBarReveal() {
-    topBarRevealed = isTopBarFloating() && (topBarPinned || topBarBarHover);
-  }
-
-  /* ================= 2026-10-25 移动端适配 B1：浮层栏自动收起 =================
-   * 用户真机反馈：顶/底栏弹出后一直挡着正文（移动端可视高度小，遮挡感强）。
-   * 只动 revealed/pinned 状态位（opacity/transform 过渡，零重排——
-   * 符合本文件"显隐不写几何"的铁律），触屏 3.5s 无交互自动收回。
-   * 触发：revealed 状态变化的响应式块 + 翻页（onRelocate，B2）。 */
-
-  const BAR_AUTO_HIDE_MS = 3500;
-  let barAutoHideTimer: any = null;
-
-  /** 完全收回顶/底浮层栏（含 pinned——自动收起本就是"替用户收"） */
-  function retractFloatingBars() {
-    if (!isTouchDevice()) return; // 桌面 hover/pinned 语义不动
-    let changed = false;
-    if (bottomBarRevealed || bottomBarPinned) {
-      bottomBarPinned = false;
-      bottomBarBarHover = false;
-      updateBottomBarReveal();
-      changed = true;
-    }
-    if (isTopBarFloating() && (topBarRevealed || topBarPinned)) {
-      // 顶栏收起联动收抽屉（与 toggleChrome 收起分支同语义，防孤儿抽屉）
-      closeAllPopovers();
-      topBarPinned = false;
-      topBarBarHover = false;
-      updateTopBarReveal();
-      changed = true;
-    }
-    if (changed && barAutoHideTimer) {
-      clearTimeout(barAutoHideTimer);
-      barAutoHideTimer = null;
-    }
-  }
-
-  /** revealed 变化驱动：浮起 → 排 3.5s 收回；全收 → 清计时器 */
-  function pokeBarAutoHide(revealed: boolean) {
-    if (!isTouchDevice()) return;
-    if (revealed) {
-      if (barAutoHideTimer) clearTimeout(barAutoHideTimer);
-      barAutoHideTimer = setTimeout(() => {
-        barAutoHideTimer = null;
-        retractFloatingBars();
-      }, BAR_AUTO_HIDE_MS);
-    } else if (barAutoHideTimer) {
-      clearTimeout(barAutoHideTimer);
-      barAutoHideTimer = null;
-    }
-  }
-  $: pokeBarAutoHide(topBarRevealed || bottomBarRevealed);
-
-  /**
-   * 统一开合顶/底两栏（2026-11-04，对标 Readest / 微信读书）。
-   *
-   * 两家都是「一次动作 = 整体阅读界面 chrome」：Readest 上下栏共用同一个
-   * hoveredBookKey，移动端点中心一起开关（usePagination.ts）；微信读书点屏幕
-   * 中间同上栏 + 下栏。此前这里上下各管各的，用户要看全两条栏必须点两次。
-   *
-   * 入口：顶部圆点 / 底部圆点 / 移动端中心点击 —— 三处都走这里。
-   * 收起时联动 closeAllPopovers：抽屉挂在顶栏锚点下，栏缩回后锚点消失（防孤儿抽屉）。
-   */
-  function toggleChrome() {
-    const willReveal = !(topBarRevealed || bottomBarRevealed);
-    // 2026-10-13 修复（孤儿抽屉）：收起与展开两个方向都要联动收抽屉。
-    //   - 展开：清残留抽屉，避免「锚点栏刚出现、抽屉挂在半空」；
-    //   - 收起：抽屉全部挂在顶栏锚点下，顶栏缩回圆点后锚点消失，
-    //     若不联动收起，抽屉会悬空成孤儿（真机截图：书签/标注面板悬在左上）。
-    // 直接走 closeAllPopovers()（含 showToc/showMarks/showSearch/设置/搜索/词典/
-    // 编辑态工具栏等全套），与「点空白收起」同一入口，语义一致；
-    // 它内部 releaseTopBarForPopover 只清 hover 保持态、不动 pinned，
-    // 随后我们再覆写 pinned，顺序安全。
+  /** 「点空白 / Esc / ⌄」的完整收起：浮层与两栏一起收。 */
+  function dismissChrome(): void {
     closeAllPopovers();
-    if (isTopBarFloating()) {
-      topBarPinned = willReveal;
-      topBarBarHover = false;
-      updateTopBarReveal();
-    }
-    bottomBarPinned = willReveal;
-    bottomBarBarHover = false;
-    updateBottomBarReveal();
+    collapseChrome();
   }
 
   /**
-   * 顶栏展开时，若某个浮层（目录/书签/搜索/设置）被打开，顶栏必须保持可见。
-   * 否则抽屉会挂在一个已收起的锚点下方 —— 角标指向空气、点它也不响应。
+   * 统一开合顶/底两栏（微信读书 / Readest 同款：一次动作 = 整体阅读界面 chrome）。
    *
-   * 只置 `topBarBarHover`（临时维持），不动 `topBarPinned`（显式意图）。
+   * 展开前先 closeAllPopovers()：避免「栏刚出现、旧抽屉挂在半空」；
+   * 收起时同样联动 —— 抽屉挂在顶栏锚点下，栏缩回后锚点消失会变孤儿。
    */
-  function ensureTopBarForPopover() {
-    if (!isTopBarFloating()) return;
-    topBarBarHover = true;
-    updateTopBarReveal();
+  function toggleChrome(): void {
+    const willReveal = !chromePinned;
+    closeAllPopovers();
+    chromePinned = willReveal;
+    topBarKept = false;
   }
 
   /**
-   * 关闭全部抽屉类浮层后，解除「为浮层而保持顶栏可见」的临时状态。
-   *（`topBarPinned` 不动 —— 用户点了圆点就是要它浮着，那是显式意图。）
+   * 浮层打开时保持顶栏可见。只动 topBarKept，不改 chromePinned ——
+   * 用户没点开栏时，关掉浮层后栏应回到收起态。
    */
-  function releaseTopBarForPopover() {
-    if (!isTopBarFloating()) return;
-    topBarBarHover = false;
-    updateTopBarReveal();
+  function ensureTopBarForPopover(): void {
+    topBarKept = true;
+  }
+
+  function releaseTopBarForPopover(): void {
+    topBarKept = false;
+  }
+
+  /** 栏内按住期间（拖进度条 / 连点翻页）不让 relocate 把栏收掉。 */
+  let chromePointerHeld = false;
+  let lastChromeInteractionMs = -1e9;
+  function onChromePointerDown(): void {
+    chromePointerHeld = true;
+    lastChromeInteractionMs = performance.now();
+  }
+  const onChromePointerUp = (): void => { chromePointerHeld = false; };
+  if (typeof window !== "undefined") {
+    window.addEventListener("pointerup", onChromePointerUp);
+    window.addEventListener("pointercancel", onChromePointerUp);
+  }
+
+  /**
+   * 翻页 / 滚动后收回两栏（微信读书：翻页即回到沉浸阅读）。
+   *
+   * 与旧的 3.5s 自动收起不同 —— 那套会在用户正读时突然抽走工具栏，
+   * 也可能在栏内操作中途消失。这里只由「真实地点变化」驱动，并避开：
+   * · 浮层还开着（需要锚点）；
+   * · 指针仍按在栏上（拖进度条、连点下一页）；
+   * · 刚点过栏（600ms 内），避免连续翻页每页都被打断。
+   */
+  function retractChromeOnRelocate(): void {
+    if (!topBarRevealed && !bottomBarRevealed) return;
+    if (chromePointerHeld) return;
+    if (performance.now() - lastChromeInteractionMs < 600) return;
+    if (
+      showSettings || showSearch || showMoreMenu || showShortcutHint ||
+      showToc || showMarks || activeDrawer || showFootnote || noteEditor.visible
+    ) return;
+    collapseChrome();
+  }
+
+  /**
+   * 首次开书演示一次手势：浮起两栏 + 一句提示，只提示一次。
+   * 不挂自动收起定时器 —— 用户点正文或翻页时自然收起，与常态交互同一套规则。
+   */
+  function maybeShowChromeGestureHint(): void {
+    try {
+      if (localStorage.getItem("reader.chrome-gesture-hint.v1")) return;
+      localStorage.setItem("reader.chrome-gesture-hint.v1", "1");
+    } catch {
+      return;
+    }
+    setTimeout(() => {
+      if (isDestroyed || !opened) return;
+      chromePinned = true;
+      topBarKept = false;
+      toast(t("点顶部中间的小圆点可以展开上下栏，点正文其他位置收起"), 4200);
+    }, 900);
   }
 
   /**
@@ -2336,13 +2223,9 @@ function applyTopHandleHitHeight() {
       const maxCols = Math.min(4, Math.max(1, Math.round(Number(settings.layout.maxColumnCount) || 2)));
       view.renderer.style.setProperty("--_max-column-count", String(maxCols));
       view.renderer.style.setProperty("--_reword-margin-top", `${settings.layout.marginTopPx}px`);
-      // 下边距经applyBottomBarReserve() 计算（底栏展开时要额外补一段占位）。
+        // 下边距经 applyBottomBarReserve() 复位（底栏是纯浮层，不参与分页几何）。
       applyBottomBarReserve();
     }
-    // 2026-10-08 顶栏浮层：把手命中区高度随上边距联动（见applyTopHandleHitHeight 注释）。
-    // ⚠️ 必须放在 if (view?.renderer) **之外** —— 它写的是宿主 DOM 的 CSS 变量，
-    // 与内容文档的 renderer 无关；PDF 模式下这段if 不执行，但圆点仍需正确尺寸。
-    applyTopHandleHitHeight();
     if (view?.renderer?.setStyles) {
       try {
         view.renderer.setStyles(buildStyles());
@@ -2923,12 +2806,22 @@ function applyTopHandleHitHeight() {
         const sel = doc.getSelection();
         if (sel && !sel.isCollapsed) return;
         if (typeof sel?.toString === "function" && sel.toString().trim()) return;
-        const w = doc.documentElement.clientWidth;
+        // 浮层或两栏开着时，任何点按先收起，不翻页也不开合（微信读书语义）
+        const anyOverlay =
+          showSettings || showSearch || showMoreMenu || showToc || showMarks ||
+          activeDrawer || showFootnote || noteEditor.visible;
+        if (topBarRevealed || bottomBarRevealed || anyOverlay) {
+          dismissChrome();
+          return;
+        }
+        const range = getVisibleXRange(doc);
+        if (!range) return;
+        const w = range.right - range.left;
         if (w <= 0) return;
-        const x = c.clientX;
-        if (x < w * 0.33) void view.goLeft();
-        else if (x > w * 0.67) void view.goRight();
-        else toggleToolbar(); // 中心点击：唤起/隐藏工具栏（Readest 式沉浸阅读）
+        const x = c.clientX - range.left;
+        if (settings.tapZoneTurn !== false && x < w * 0.33) void view.goLeft();
+        else if (settings.tapZoneTurn !== false && x > w * 0.67) void view.goRight();
+        else if (settings.centerTapChrome === true) toggleToolbar(); // 中心开合为可选第二模式，默认关（主入口是小圆点）
       }
     };
     trackDocListener(doc, "touchend", onTouchEnd, { passive: true });
@@ -3441,6 +3334,7 @@ function applyTopHandleHitHeight() {
         view.renderer?.focusView?.();
       } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · try { view.renderer?.focusView?.(); }", "debug"); }
       opened = true;
+      maybeShowChromeGestureHint();
       // [REword patch 2026-08-29] 确认是 PDF → 给页面四周留白区补上滚轮缩放监听
       if (isPdfBook()) bindStageWheel();
       diagMark("bindStageWheel 后 / 附加内容前");
@@ -4004,10 +3898,10 @@ function applyTopHandleHitHeight() {
       togglePdfRectMode();
       return;
     }
-    // Esc 关闭全部浮层（开了目录/搜索/设置/快捷键面板只能用此键关）
+    // Esc：先收浮层，再把顶/底两栏一起收起（微信读书同款）
     if (e.key === "Escape") {
       e.preventDefault();
-      closeAllPopovers();
+      dismissChrome();
       return;
     }
     // 2026-10-10：? 与 Mac 的 Shift+/ 唤出/收起快捷键面板。
@@ -4156,40 +4050,11 @@ function applyTopHandleHitHeight() {
   }
 
   /* ============================================================
-   * 底栏「页眉页脚」信息（2026-10-07 接通 showHeaderFooter）
+   * 底栏「页脚」信息（2026-10-07 接通 showHeaderFooter）
    * ------------------------------------------------------------
-   * ## 背景：这是一个存在已久的死设置
-   * 设置里的「显示页眉页脚」此前把值拆成 `showHeader` / `showFooter` 写进 settings，
-   * 但**这两个字段在执行层零命中**，且阅读器里**压根没有页眉/页脚 UI 组件**
-   * ⇒ 开关能点、能存、什么都不会发生。
-   *
-   * ## 为什么接到底栏而不是新造页眉/页脚
-   * ① 底栏已是既定交互（纯浮层 + 点击展开，见 applyBottomBarReserve）。
-   *    新造常驻页眉/页脚会与「底栏浮层盖文字」的决策冲突，且要改分页器几何。
-   * ② Readest 的 showHeader/showFooter 也是**浮在内容上方的带状 UI**，
-   *    语义上与底栏同源，不是新东西。
-   * ③ 底栏已有 progressText / etaText，加两行文本是纯增量、零几何改动。
+   * showHeader 现在门控顶栏的章节名（底栏那份 2026-11-06 方案 A 已撤，
+   * 顶栏是唯一去处）；showFooter 仍门控进度条 title 里的剩余章节。
    * ============================================================ */
-
-  /**
-   * 当前章节名。
-   *
-   * 取`tocItems` 中**起点不晚于当前 section** 的最后一项——
-   * 这是Foliate 目录的标准语义（目录项指向 section 起点）。
-   * 无目录（纯文本书）或索引异常时返回空串，调用方按「不显示」处理。
-   */
-  $: currentChapterTitle = (() => {
-    if (!settings.layout.showHeader) return "";
-    const idx = currentSectionIndex;
-    if (idx < 0 || !Array.isArray(tocItems) || !tocItems.length) return "";
-    let best = "";
-    for (const item of tocItems) {
-      const at = sectionIndexOfTocItem(item);
-      if (at >= 0 && at <= idx) best = item.title;
-      else if (at > idx) break;
-    }
-    return best.trim();
-  })();
 
   /**
    * 剩余页数 / 总页数（Readest 的 showRemainingPages）。
@@ -4481,22 +4346,6 @@ function applyTopHandleHitHeight() {
     catch (__e) { logSwallow(__e, "goNextChapter", "debug"); }
   }
 
-  // [REword patch 2026-08-29] 首尾页直达（对齐 PDF++ 「转到第一页 / 最后」）
-  function goFirstPage() {
-    if (!view) return
-    try { view.goTo(0) } catch (__e) { logSwallow(__e, "goFirstPage", "debug") }
-  }
-
-  function goLastPage() {
-    if (!view) return
-    try {
-      const last = view.book?.sections?.length
-        ? view.book.sections.length - 1
-        : 0
-      view.goTo(last)
-    } catch (__e) { logSwallow(__e, "goLastPage", "debug") }
-  }
-
   /** 箭头按下：立即翻一页 + 长按 450ms 后每 260ms 连翻 */
   function arrowDown(dir: "prev" | "next") {
     if (turnPressed && turnPressed !== dir) {
@@ -4582,22 +4431,9 @@ function applyTopHandleHitHeight() {
 
   /* ================= 2026-11-05 P0：AI 阅读助手 ================= */
 
-  /**
-   * 打开助手时收起顶/底浮层栏。
-   * 面板是常驻内容、不挂在顶栏锚点上，不需要「为浮层保持顶栏可见」；
-   * 两条栏又都浮在正文上方，窄屏或高文档下会和面板抢视觉高度。
-   */
+  /** 打开助手时收起两栏（面板常驻、不需要顶栏锚点，两条浮层会抢视觉高度）。 */
   function retractChromeForAi(): void {
-    if (isTopBarFloating() && (topBarRevealed || topBarPinned)) {
-      topBarPinned = false;
-      topBarBarHover = false;
-      updateTopBarReveal();
-    }
-    if (bottomBarRevealed || bottomBarPinned) {
-      bottomBarPinned = false;
-      bottomBarBarHover = false;
-      updateBottomBarReveal();
-    }
+    collapseChrome();
   }
 
   function toggleAiPanel() {
@@ -4629,13 +4465,22 @@ function applyTopHandleHitHeight() {
   }
 
   /**
-   * 划词「问 AI」：把选段带进右侧面板（面板未开则先打开）。
+   * 划词「问 AI」：把选段送到用户眼前的助手。
+   *
+   * 停靠栏已开着就以它为准；否则先试已打开的 AI 页签（手机端没有页签，
+   * aiOverlay 为真时跳过）；页签没开/锁定别的书/宿主未就绪时再回落到停靠栏。
    * 章节号取当前章 —— 选段跨章续接的极端场景下定位会失败，面板会给出提示。
    */
   function onSelAskAi() {
     const text = selToolbar.text?.trim();
     closeSelToolbar();
     if (!text) return;
+    const quote: AiChatQuote = {
+      text,
+      sectionIndex: currentSectionIndex,
+      chapterTitle: resolveChapterTitle(currentSectionIndex) || chapterLabel || undefined,
+    };
+    if (!showAiPanel && !aiOverlay && onAskAiInTab?.(bookId, quote)) return;
     if (!showAiPanel) {
       showAiPanel = true;
       showToc = false;
@@ -4645,11 +4490,6 @@ function applyTopHandleHitHeight() {
       retractChromeForAi();
       void tick().then(() => aiPanelComp?.focusComposer?.());
     }
-    const quote: AiChatQuote = {
-      text,
-      sectionIndex: currentSectionIndex,
-      chapterTitle: resolveChapterTitle(currentSectionIndex) || chapterLabel || undefined,
-    };
     void tick().then(() => aiPanelComp?.addQuote?.(quote));
   }
 
@@ -5936,31 +5776,19 @@ function applyTopHandleHitHeight() {
     applyStyles();
   }
 
-  // 2026-08-29 Phase 1：工具栏显隐切换（移动端中心点击）。面板打开时不隐藏，避免失去锚点感。
+  /**
+   * 中心点击 / 短按（触屏）：微信读书式唯一主手势。
+   * 有浮层开着 → 先全部收起（含两栏）；否则开合两栏。
+   */
   function toggleToolbar() {
-    // [REword patch 2026-08-29] Phase 2 触屏：单击空白处关闭所有浮层
-    // 触屏场景：用户点中心区时如果有浮层（搜索/设置/目录）打开，
-    // 应优先关闭浮层而不是 toggle 工具栏可见性（避免被遮挡的工具栏闪一下）
-    if (showSettings || showSearch || showMoreMenu) {
-      showSettings = false;
-      showSearch = false;
-      showMoreMenu = false;
-      releaseTopBarForPopover();
+    if (
+      showSettings || showSearch || showMoreMenu || showToc || showMarks ||
+      activeDrawer || showFootnote || noteEditor.visible
+    ) {
+      dismissChrome();
       return;
     }
-    if (showToc) {
-      showToc = false;
-      releaseTopBarForPopover();
-      return;
-    }
-    // 2026-10-08 顶栏浮层化：中心点击切的是「浮起/收回」，不是 `toolbarVisible`
-    //（后者在悬浮模式下已不再驱动顶栏的显示，只服务于 topBarFloating=false 的旧行为）。
-    // 2026-11-04：中心点击与两个圆点共用 toggleChrome —— 一次动作同时开合上下栏。
-    if (isTopBarFloating()) {
-      toggleChrome();
-      return;
-    }
-    toolbarVisible = !toolbarVisible;
+    toggleChrome();
   }
 
   function onSetTheme(key: string) {
@@ -6717,33 +6545,6 @@ function applyTopHandleHitHeight() {
       return;
     }
 
-    /* ---- 顶栏悬浮（2026-10-08）：切换模式会改变 stage 高度，必须显式重排 ----
-     *
-     * ## 为什么不能只靠通用的 setByPath + applyStyles
-     * 开关切的是**顶栏的定位方式**：
-     *   · 悬浮开：`position: absolute` → 顶栏不占流，`.reader-stage`（flex:1）**变高 36px**
-     *   · 悬浮关：回到文档流 → stage 矮 36px
-     * stage 高度变了 ⇒ 分页器的可用栏高变了 ⇒ 必须重排一次，
-     * 否则用户会看到「模式已切、内容却还是旧版式」。
-     *
-     * ⚠️ 与「收起/展开」刻意区分：那两个只改 transform/opacity，
-     *   **不碰任何盒子尺寸** ⇒ 零重排。这是本方案最大的好处，不能破坏。
-     */
-    if (path === "layout.topBarFloating") {
-      settings = settingsStore.update({
-        layout: { ...settings.layout, topBarFloating: value !== false },
-      });
-      // 切到「常驻顶部」时必须让顶栏可见，否则用户会看到一个空白的顶部区域
-      // （旧行为由 toolbarVisible 驱动，这里显式对齐）。
-      if (value === false) toolbarVisible = true;
-      updateTopBarReveal();
-      applyStyles();
-      // stage 盒子尺寸真的变了，ResizeObserver 会兜底；这里主动派发一次 resize
-      // + 强制 reflow，保证切档立刻生效（与 onDeviceClassResize 同一套路）。
-      scheduleReaderRelayout();
-      return;
-    }
-
     /* ---- 其余：按点号路径写入（fontWeight → text.fontWeight 等嵌套路径）---- */
     const next = setByPath(settings, path, value);
     settings = settingsStore.update(next);
@@ -7013,13 +6814,12 @@ function applyTopHandleHitHeight() {
    * 用 reader-view 容器监听（不是 document）的好处：思源顶栏/侧栏/命令面板/dock 的点击
    *   完全不触发本 listener → 不干扰思源原生 UI（如"管理"按钮）的点击时序。
    *
-   * 【2026-10-13 · 浮层收起交互语义表】（与《流程设计方案-浮层统一收起.md》对应）
-   *   · 点正文空白   → 收：划词工具栏 / 批注卡 / 抽屉(目录·书签·标注) / 脚注 / 词典；
-   *                    不收：圆点点开的顶栏（topBarPinned = 显式意图，显式操作显式收）
-   *   · 点浮层内部   → 不动（豁免：data-dismiss-ignore 根元素，见下方守卫）
-   *   · 点顶/底栏按钮 → 不动（click 自己 toggle）
-   *   · 点顶栏/底栏圆点 → 同时收两栏并联动收所有抽屉（toggleChrome 两分支都走 closeAllPopovers）
-  *   · Esc / 点 .reader-backdrop → 等价点空白
+   * 【2026-11-06 · 浮层收起交互语义表】（微信读书式 chrome）
+   *   · 点正文空白   → 收：划词工具栏 / 批注卡 / 抽屉 / 脚注 / 词典，以及顶/底两栏；
+   *   · 点浮层内部   → 不动（豁免：data-dismiss-ignore 根元素，见下方守卫）；
+   *   · 点顶/底栏按钮 → 不动（click 自己 toggle）；
+   *   · 中心点击     → 有浮层先全收，否则开合两栏；
+   *   · Esc / 点 .reader-backdrop → 等价点空白
   */
 
   /* 2026-10-14 合成事件防御（修复「批注卡输入中按 Shift 被误关」）：
@@ -7060,10 +6860,8 @@ function applyTopHandleHitHeight() {
     closeImageContextMenu();
     // 编辑态划词工具栏一并收起（重置为 create 态，避免残留 editingId）
     if (selToolbar.visible) closeSelToolbar();
-    // 2026-10-08 顶栏浮层化：抽屉全关了 ⇒ 解除「为浮层而保持顶栏可见」的临时状态。
-    // ⚠️ 只清 topBarBarHover，**不动 topBarPinned** ——
-    //   用户点圆点显式点开的顶栏是显式意图，点空白不该把它也收掉
-    //   （与底栏「移出栏外若非 pinned 则收回」的规则一致）。
+    // 2026-11-06：抽屉全关 ⇒ 解除「为浮层而保持顶栏可见」的临时状态。
+    // 只清 topBarKept，不动 chromePinned —— 用户显式点开的栏不应被关浮层带走。
     releaseTopBarForPopover();
     // 2026-10-08 批注卡片改版：折叠气泡（样式/色板）一并收起。
     // ⚠️ 必须挂在这里而不是另起 Esc 监听 —— 全局 `:3191` 的 Escape 已经走 closeAllPopovers，
@@ -7090,8 +6888,9 @@ function applyTopHandleHitHeight() {
       return;
     }
     // 2026-08-30 修复：守卫必须覆盖三个抽屉（此前只查 showToc，导致书签/摘录抽屉
-    // 开着时点空白不会收起）；activeDrawer 也纳入，避免状态残留时漏关
-    if (!showToc && !showMarks && !showSettings && !showSearch && !showMoreMenu && !showFootnote && !selToolbar.visible && !noteEditor.visible && !activeDrawer) return;
+    // 开着时点空白不会收起）；activeDrawer 也纳入，避免状态残留时漏关。
+    // 2026-11-06：顶/底栏开着也算「有东西要收」，否则点页边距空白收不起两栏。
+    if (!topBarRevealed && !bottomBarRevealed && !showToc && !showMarks && !showSettings && !showSearch && !showMoreMenu && !showFootnote && !selToolbar.visible && !noteEditor.visible && !activeDrawer) return;
     const t = _e.target as Element | null;
     if (!t) return;
     dbg.event("onContainerMouseDown", "▶ 入口", { target: t.tagName + "." + (typeof t.className === "string" ? t.className : ""), selVisible: selToolbar.visible, mode: selToolbar.mode });
@@ -7104,11 +6903,11 @@ function applyTopHandleHitHeight() {
     // 抽屉角标图标本身（点击 = toggle，由 on:click 处理，不走 mousedown 收起）
     if (t.closest?.("[data-drawer-anchor]")) return;
     // 2026-10-13 守卫集中化：豁免对象统一挂 data-dismiss-ignore 属性
-    //（现挂载：.reader-toolbar / .reader-sel-toolbar / .reader-note-editor / .reader-top-handle），
+    //（现挂载：.reader-toolbar / .reader-sel-toolbar / .reader-note-editor / .reader-bottom-bar），
     // 一条 closest 守卫替代旧 5 条类名列举 —— 以后新增浮层只要挂属性即可，不会再漏。
     // 等价迁移说明：
     //   · 旧 .reader-ann-editor 守卫是死代码（全库无任何运行时 DOM 挂该类），已删；
-    //   · .reader-toolbar / .reader-top-handle / 划词工具栏 / 批注卡 → 全部改挂属性。
+    //   · 顶栏 / 底栏 / 划词工具栏 / 批注卡 → 全部改挂属性。
     if (t.closest?.("[data-dismiss-ignore]")) return;
     // 2026-08-25 修复（回归）：foliate 内容区的点击需区分两种场景：
     //   A) 点了标注/高亮/SVG 绘制层 → 延迟一帧关闭（让 show-annotation / 选区事件先触发，避免竞争）；
@@ -7137,10 +6936,9 @@ function applyTopHandleHitHeight() {
           // 注意：不关 noteEditor，由 onShowAnnotation / showViewerForRec 全权控制
         });
       } else {
-        // 场景 B：点空白/普通文本 → 立即关闭工具栏 + 收起目录/书签/摘录抽屉
-        // 2026-08-30 修复：此前这里只关了划词工具栏，没关抽屉，
-        // 导致书签/摘录抽屉在正文区点空白关不掉；正文任意空白视为「终止操作」应一并收起
+        // 场景 B：点空白/普通文本 → 立即关闭工具栏 + 收起抽屉 + 收起两栏
         closeAllPopovers();
+        collapseChrome();
         if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null };
       }
       // 脚注是独立瞬时浮层，与标注/工具栏无耦合：在 foliate 阅读区任意点击都视为「点击外部」，
@@ -7149,8 +6947,9 @@ function applyTopHandleHitHeight() {
       if (showFootnote) closeFootnote();
       return;
     }
-    // 其他区域（空白等）：关闭所有浮层 + 划词工具栏 + 统一批注浮层
+    // 其他区域（空白等）：关闭所有浮层 + 划词工具栏 + 统一批注浮层 + 两栏
     closeAllPopovers();
+    collapseChrome();
     if (selToolbar.visible) closeSelToolbar();
     if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null };
   }
@@ -7830,6 +7629,11 @@ function applyTopHandleHitHeight() {
     // 必须挂内容文档：右键发生在 iframe 内，宿主 window 收不到；且与灯箱的 click 同处，
     // 才能保证 foliate 重建 section 后每个文档都被覆盖。
     trackDocListener(doc, "contextmenu", onContentImageContextMenu as EventListener);
+    // 2026-11-06 触屏时间戳：touch 之后浏览器还会补发 click，chrome 手势要据此去重
+    trackDocListener(doc, "touchstart", (() => { lastContentTouchMs = performance.now(); }) as EventListener, true);
+    // 2026-11-06 微信读书式 chrome：iframe 内的点击不会冒泡到父容器，
+    // 中心点击开合上下栏、点空白收起，必须挂在内容文档上。
+    trackDocListener(doc, "click", onContentChromeClick as EventListener);
     // 2026-08-29：点击脚注气泡外部（内容区）关闭；捕获阶段先于 onBookLink 的 link 事件
     trackDocListener(doc, "pointerdown", onFootnoteOutsidePointerDown as EventListener, true);
     // 2026-08-27 晚（P2.2）：专注模式滚动高亮（capture 捕获内部滚动容器）
@@ -7947,8 +7751,7 @@ function applyTopHandleHitHeight() {
    * @param frame 内容 iframe 元素；缺省时用可见容器本身（无 iframe 语境时的兜底）
    * @returns 局部坐标下的可见窗口；取不到时返回 null（调用方须回退到旧行为）
    */
-  function getVisibleWindowLocal(frame?: HTMLElement | null): Rect4 | null {
-    const containerEl = getFoliateContainerEl();
+  function getVisibleWindowLocal(frame?: HTMLElement | null): Rect4 | null {    const containerEl = getFoliateContainerEl();
     let fr: DOMRect | null = null;
     try { fr = frame?.getBoundingClientRect?.() ?? null; } catch { fr = null; }
     // 基准矩形：优先 foliate 的可见容器（分页模式的裁剪窗口），退到 .reader-stage
@@ -7974,6 +7777,24 @@ function applyTopHandleHitHeight() {
     const ox = fr ? fr.left : 0;
     const oy = fr ? fr.top : 0;
     return { left: left - ox, top: top - oy, right: right - ox, bottom: bottom - oy };
+  }
+
+  /**
+   * 内容文档里「当前可见页」的横向范围（iframe 局部坐标）。
+   *
+   * 分页模式下 iframe 被撑成整个 section 的宽度（多列横排、由 #container 裁剪），
+   * `doc.documentElement.clientWidth` 是**整节**宽度而不是一页的宽度。
+   * 直接拿它算 33%/67% 中心带，中心带会落在屏幕外的某一页上 ——
+   * 点击可见页面（只占整节的一小段）永远判不中，表现为「点中间没反应」。
+   * ⇒ 所有「按 x 比例分区」的手势都必须先换算到可见窗口。
+   */
+  function getVisibleXRange(doc: Document): { left: number; right: number } | null {
+    let frame: HTMLElement | null = null;
+    try { frame = ((doc?.defaultView as any)?.frameElement as HTMLElement | null) ?? null; } catch { frame = null; }
+    const vis = getVisibleWindowLocal(frame);
+    if (vis && vis.right - vis.left > 0) return { left: vis.left, right: vis.right };
+    const w = doc?.documentElement?.clientWidth || 0;
+    return w > 0 ? { left: 0, right: w } : null;
   }
 
   /**
@@ -8351,7 +8172,9 @@ function applyTopHandleHitHeight() {
     }
     const s = toContainerCoords(sx + fx, first.top + fy);
     const en = toContainerCoords(ex + fx, last.bottom + fy);
-    return { start: { x: s.x, y: s.y, h: Math.max(14, first.height) }, end: { x: en.x, y: en.y, h: Math.max(14, last.height) } };
+    // 竖条长度 = 选中蓝色背景的高度（range 矩形高），首末两端各取一次。
+    // 不按字号/行高估算：字号会比底色短，行高会比底色长，两端都对不齐。
+    return { start: { x: s.x, y: s.y, h: Math.max(1, first.height) }, end: { x: en.x, y: en.y, h: Math.max(1, last.height) } };
   }
 
   /** 是否块级盒：内联类（inline/inline-block/inline-flex/inline-table）的片段宽度就是文字本身，
@@ -10051,6 +9874,50 @@ function applyTopHandleHitHeight() {
     scheduleReadSelection();
   }
 
+  /** 最近一次内容区 touchstart（用于屏蔽触屏合成 click，防中心点按被处理两次）。 */
+  let lastContentTouchMs = -1e9;
+
+  /**
+   * 桌面中心点击开合上下栏（微信读书桌面端同款）。
+   *
+   * 内容在 iframe 里，父容器的 click 收不到，所以必须挂在每个内容文档上。
+   * 判定：
+   *  · 有选区 / 刚触摸过 → 不是「点空白」，跳过；
+   *  · 栏或浮层开着 → 任意位置点击都收起（链接照常由默认行为跳转，不 preventDefault）；
+   *  · 全收起时 → 只有页面中央 34% 的空白区域才开栏，两侧点击保持纯阅读。
+   */
+  function onContentChromeClick(e: MouseEvent): void {
+    if (e.isTrusted === false) return;
+    if (performance.now() - lastContentTouchMs < 700) return;
+    const doc = e.currentTarget as Document;
+    try {
+      const sel = doc.getSelection?.();
+      if (sel && !sel.isCollapsed) return;
+      if (sel && typeof sel.toString === "function" && sel.toString().trim()) return;
+    } catch { /* 跨 iframe 取选区失败时按无选区处理 */ }
+
+    const anyOverlay =
+      showSettings || showSearch || showMoreMenu || showToc || showMarks ||
+      activeDrawer || showFootnote || noteEditor.visible;
+    if (topBarRevealed || bottomBarRevealed || anyOverlay) {
+      dismissChrome();
+      return;
+    }
+    // 主入口是顶部中央的小圆点；中心点击是可选第二模式（默认关，避免抢划词/链接手势）
+    if (settings.centerTapChrome !== true) return;
+
+    const t = e.target as Element | null;
+    if (t?.closest?.("a,button,input,textarea,select,label,[contenteditable],[role=button],img,image,foliate-highlight,[data-annotation]")) return;
+    if ((t as any)?.namespaceURI === "http://www.w3.org/2000/svg") return;
+    // 必须按「可见页」而不是整节宽度判中心带（分页模式下整节远宽于一页）
+    const range = getVisibleXRange(doc);
+    if (!range) return;
+    const w = range.right - range.left;
+    if (w <= 0) return;
+    const x = e.clientX - range.left;
+    if (x >= w * 0.33 && x <= w * 0.67) toggleChrome();
+  }
+
   /** 2026-10-14 P2：滚动即收起划词工具栏 + 两端手柄（对齐微信读书——滚动/翻页时选区浮层消失）。
    *  用即时 hardClose（不走 140ms 收起动画）：工具栏/手柄在主文档浮层里位置固定，正文在 iframe 内滚动，
    *  动画期间会「钉在原地与文字脱节」，瞬收更干净。避让：拖手柄中、或正按住鼠标拖选（边缘自动滚动）时不收。 */
@@ -10220,7 +10087,7 @@ function applyTopHandleHitHeight() {
       // getBoundingClientRect() 已含transform —— 收起态顶栏被 translateY(-140%)
       // 移出视口，rect.bottom 会是负数/极小值，故必须同时检查 topBarRevealed。
       let top = r.top;
-      if (isTopBarFloating() && topBarRevealed && topBarEl) {
+      if (topBarRevealed && topBarEl) {
         const tb = topBarEl.getBoundingClientRect();
         // 兜底：只接受「在 stage 上方、且高度合理」的底沿。
         // 万一DOM 尚未布局（rect 全 0），宁可退回 stage 顶也不能把禁区算成 0。
@@ -10519,9 +10386,8 @@ function applyTopHandleHitHeight() {
       return;
     }
     dbgHud.relocateCalls++;
-    // 2026-10-25 移动端适配 B2：翻页即收顶/底浮层栏（真机反馈遮挡正文；
-    // relocate 也会在初始加载/改字号时触发，栏未浮起时是 no-op）。触屏 only。
-    retractFloatingBars();
+    // 2026-11-06：翻页/滚动即收两栏（微信读书同款；浮层开着或指针按在栏上时避让）。
+    retractChromeOnRelocate();
     // 2026-10-24 D2：跨页续接进行中 ⇒ **不收起**划词浮层，改为按新位置重锚。
     // （续接窗口内用户正在把选区往下一页接，收起会打断"选到一半"的连续动作。）
     if (isSelContinuationActive() && (selToolbar.visible || selHandles.visible)) {
@@ -13306,6 +13172,9 @@ function applyTopHandleHitHeight() {
       window.removeEventListener("orientationchange", onDeviceClassResize);
       // 2026-11-03 泄漏清理：与注册处对称（此前是匿名箭头函数，无法解绑）
       window.removeEventListener("pointerdown", onGlobalPointerDown, true);
+      // 2026-11-06：与模块初始化处的注册对称，避免销毁后仍持有组件闭包
+      window.removeEventListener("pointerup", onChromePointerUp);
+      window.removeEventListener("pointercancel", onChromePointerUp);
     }
     // 2026-08-30：清理 resize 重排防抖定时器
     if (readerRelayoutTimer) clearTimeout(readerRelayoutTimer);
@@ -13406,8 +13275,6 @@ function applyTopHandleHitHeight() {
 <div
   class="reader-view"
   bind:this={readerViewEl}
-  on:mousemove={onReaderMouseMove}
-  on:mouseleave={onReaderLeave}
   on:pointerover={onTipPointerOver}
   on:pointerout={onTipPointerOut}
   on:focusin={onTipFocusIn}
@@ -13422,52 +13289,49 @@ function applyTopHandleHitHeight() {
   class:ai-docked={showAiPanel && !aiOverlay}
   style="--re-sidebar-w:{sidebarWidth}px;--re-ai-w:{aiPanelWidth}px"
 >
-  <!-- 2026-10-08 顶栏浮层化：脱离文档流、浮在正文上方。
-       · class:reader-toolbar-floating —— 悬浮模式（topBarFloating，默认开）
-       · class:reader-toolbar-revealed —— 浮起态（收起态见 CSS的 translateY + opacity）
-       · class:reader-toolbar-hidden —— **仅** topBarFloating=false 的旧行为（display:none）
+  <!-- 2026-11-06 微信读书式上下栏：顶栏永远是浮层（脱离文档流、浮在正文上方）。
+       · reader-toolbar-floating —— 固定类名，不再有「常驻/悬浮」两档
+       · reader-toolbar-revealed —— 显隐唯一开关（收起态见 CSS 的 translateY + opacity）
        · bind:this —— 供 getContentBounds() 取真实底沿做划词工具栏避让
-       · mouseenter/leave —— 维持已浮起的栏（否则移开鼠标栏就消失、按钮点不到） -->
+       · pointerdown —— 记录「正在操作栏」，翻页/滚动收栏时避让 -->
   <div
-    class="reader-toolbar"
+    class="reader-toolbar reader-toolbar-floating"
     data-dismiss-ignore
-    class:reader-toolbar-floating={isTopBarFloating()}
-    class:reader-toolbar-revealed={isTopBarFloating() && topBarRevealed}
-    class:reader-toolbar-hidden={!isTopBarFloating() && !toolbarVisible}
+    class:reader-toolbar-revealed={topBarRevealed}
     class:reader-toolbar-iphone={isIphoneMode}
     bind:this={topBarEl}
-    on:mouseenter={() => { if (isTopBarFloating()) { topBarBarHover = true; updateTopBarReveal(); } }}
-    on:mouseleave={() => { if (isTopBarFloating()) { topBarBarHover = false; updateTopBarReveal(); } }}
+    on:pointerdown={onChromePointerDown}
   >
     <!-- 左：3 个抽屉触发器（目录 / 书签 / 摘录） + 返回键 -->
     <div class="reader-toolbar-left">
       <button
-        class="reader-btn"
+        class="reader-btn reader-chrome-btn"
         title={mobileOverlay ? t("返回书架") : (onCloseTab ? t("关闭阅读（书架在侧边栏）") : t("返回书架"))}
         on:click={() => (mobileOverlay ? onBack?.() : (onCloseTab ? onCloseTab() : onBack?.()))}
-      >‹</button>
+      ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.back}</svg></button>
       <button
-        class="reader-btn reader-drawer-anchor"
+        class="reader-btn reader-drawer-anchor reader-chrome-btn"
         data-drawer-anchor="toc"
         title={t("目录（点空白收起，再点收起）")}
         class:reader-btn-active={showToc}
         on:click={() => toggleDrawer("toc")}
-      >☰</button>
+      ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.toc}</svg></button>
       <button
-        class="reader-btn reader-drawer-anchor"
+        class="reader-btn reader-drawer-anchor reader-chrome-btn"
         data-drawer-anchor="marks"
         title={t("我的标记（书签 + 摘录，点空白收起）")}
         class:reader-btn-active={showMarks}
         on:click={() => toggleDrawer("marks")}
-      >📝</button>
+      ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.marks}</svg></button>
       {#if readerMode === "pdf"}
+        <span class="reader-bar-divider" aria-hidden="true"></span>
         <!-- 2026-09-09 P1：矩形框选（图表/排版块 → 跳转链接 + 图片快照） -->
         <button
-          class="reader-btn"
+          class="reader-btn reader-chrome-btn"
           title={t("矩形框选：框选图表区域，自动复制跳转链接 + 截图，粘贴到文档即可；右键点矩形可换色/删除；Esc 退出")}
           class:reader-btn-active={pdfRectMode}
           on:click={togglePdfRectMode}
-        >⬚</button>
+        ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.scan}</svg></button>
       {/if}
     </div>
     <!-- 中：书名 + 章节（真正居中）。
@@ -13476,7 +13340,9 @@ function applyTopHandleHitHeight() {
          ③ 进度百分比移到右侧工具组，避免挤占居中区 -->
     <div class="reader-toolbar-title">
       <span class="reader-title" title={title} style="user-select:text;cursor:text">{title}</span>
-      {#if chapterLabel && chapterLabel !== title}
+      <!-- 2026-11-06 方案 A：底栏不再重复章节名，顶栏成为唯一去处；
+           设置项「显示章节名」改为门控这里（原先门控的是已撤掉的底栏文本）。 -->
+      {#if settings.layout.showHeader && chapterLabel && chapterLabel !== title}
         <span class="reader-title-sep">·</span>
         <span class="reader-chapter" title={chapterLabel} style="user-select:text;cursor:text">{chapterLabel}</span>
       {/if}
@@ -13487,7 +13353,6 @@ function applyTopHandleHitHeight() {
          旧实现按 isIphoneMode 整组隐藏且无替代入口 → 手机上进不了设置/搜索（已修）。
          PDF 缩放/页码组两种模式都保留（缩放/翻页是刚需，见 PdfToolbar）。 -->
     <div class="reader-toolbar-right">
-      <span class="reader-progress" title={t("阅读进度")}>{progressText}</span>
       {#if !isCompactToolbar}
         <!-- 2026-10-14 地基重构：双语对照依赖向可重排 DOM 注入译文，仅 reflow 内容适用。
              由能力表 caps.reflow 门控（PDF 位图=false、漫画图片=false 均隐藏；EPUB/TXT=true）。
@@ -13506,35 +13371,35 @@ function applyTopHandleHitHeight() {
         {/if}
         <!-- 图书与 PDF 共用：阅读助手 + 设置 + 搜索 -->
         <button
-          class="reader-btn reader-ai-btn"
+          class="reader-btn reader-ai-btn reader-chrome-btn"
           title={t("阅读助手（AI，读当前章节）")}
           aria-label={t("阅读助手")}
           class:reader-btn-active={showAiPanel}
           on:click={toggleAiPanel}
-        >✦</button>
+        ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.sparkles}</svg></button>
         <button
-          class="reader-btn reader-settings-btn"
+          class="reader-btn reader-settings-btn reader-chrome-btn"
           title={t("设置")}
           class:reader-btn-active={showSettings}
           on:click={toggleSettings}
-        >⚙</button>
+        ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.settings}</svg></button>
         <button
-          class="reader-btn"
+          class="reader-btn reader-chrome-btn"
           title={t("搜索全书（F3 / ⌘F）")}
           class:reader-btn-active={showSearch}
           on:click={toggleSearch}
-        >🔍</button>
+        ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.search}</svg></button>
       {:else}
         <!-- 紧凑顶栏：双语/设置/搜索收进 ⋯（按钮 44×44 命中区由 .reader-toolbar-iphone /
              (pointer:coarse) 规则放大） -->
         <button
-          class="reader-btn reader-more-btn"
+          class="reader-btn reader-more-btn reader-chrome-btn"
           title={t("更多")}
           aria-label={t("更多")}
           aria-expanded={showMoreMenu}
           class:reader-btn-active={showMoreMenu}
           on:click={toggleMoreMenu}
-        >⋯</button>
+        ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.more}</svg></button>
       {/if}
       <!-- [REword 2026-09-02] PDF 界面专属：缩放 + 页码。iPhone 模式下也保留（缩放/翻页是刚需） -->
       {#if readerMode === "pdf"}
@@ -13554,21 +13419,19 @@ function applyTopHandleHitHeight() {
     </div>
   </div>
 
-  <!-- 2026-10-08 · 顶栏「把手」：常驻顶部中央的小圆点（对标底栏 .reader-bottom-handle）。
-       收起态贴顶显示圆点；展开态被顶栏顶到下方中央，再次点击收起。
-       2026-11-04：两个圆点语义合并 —— 点任意一个都同时开合上下两栏（toggleChrome）。
-       ⚠️ 命中区高度由 CSS 的 --reword-top-hit-h 夹到「不越过正文顶边」
-       （Readest #4977/#5427：触发区压过第一行会吞掉那里的划词与点击）。 -->
-  {#if isTopBarFloating()}
-  <button
-    class="reader-top-handle"
-    class:reader-top-handle-revealed={topBarRevealed}
-    title={topBarRevealed ? t("点击收起工具栏") : t("点击展开工具栏")}
-    on:click={toggleChrome}
-    data-dismiss-ignore
-  >
-    <span class="reader-top-handle-dot"></span>
-  </button>
+  <!-- 2026-11-06 · 上下栏的唯一显式入口：顶栏收起时贴顶中央的小圆点。
+       点一下两栏同时浮出；浮出后圆点隐藏（收起靠 ⌄ / 点空白 / Esc / 翻页）。
+       命中区高度按上边距夹住，不越过正文顶边（Readest #4977/#5427 的坑）。 -->
+  {#if !topBarRevealed}
+    <button
+      class="reader-top-handle"
+      title={t("点击展开工具栏")}
+      on:click={toggleChrome}
+      data-dismiss-ignore
+      style="--reword-top-hit-h:{Math.min(28, Math.max(16, (Number(settings.layout.marginTopPx) || 24) - 4))}px"
+    >
+      <span class="reader-top-handle-dot"></span>
+    </button>
   {/if}
 
   {#if cornerHint}
@@ -14034,19 +13897,20 @@ function applyTopHandleHitHeight() {
   <!-- 底部控制栏：翻页 + 进度条。独立在 .reader-stage 之外（2026-08-25 修复：
        此前误置于 stage 内，被 position:absolute 的 .reader-container 遮挡 + overflow:hidden 裁切导致不可见）。
        2026-08-30 改造：① 目录 / 书签 / 摘录三个入口已统一上移到顶栏左侧，底栏不再重复摆放；
-       ② 进度条默认完全隐藏（macOS 程序坞机制）：纯点击唤起 —— 底部中央圆点与顶部圆点
-          共用一个开关，点任意一个同时浮起上下两栏；隐藏态移出文档流，绝不遮挡正文文字。 -->
+       2026-11-06：底栏与顶栏共用 chromePinned（中心点击一起开合），不再有常驻圆点。 -->
   <div
     class="reader-bottom-bar"
+    data-dismiss-ignore
     class:bottom-bar-revealed={bottomBarRevealed}
-    on:mouseenter={() => { bottomBarBarHover = true; updateBottomBarReveal(); }}
-    on:mouseleave={() => { bottomBarBarHover = false; updateBottomBarReveal(); }}
+    on:pointerdown={onChromePointerDown}
   >
-    <button class="reader-btn reader-bottom-collapse" title={t("收起进度条")} on:click={collapseBottomBar}>⌄</button>
-    <button class="reader-btn" title={t("第一页（Home）")} on:click={goFirstPage}>⏮</button>
-    <!-- 2026-10-25 P0-2：章节跳转（⏮◀⏪|进度|⏩▶⏭，对标微信读书底栏） -->
-    <button class="reader-btn" title={t("上一章（Alt+←）")} on:click={goPrevChapter}>⏪</button>
-    <button class="reader-btn" title={t("上一页")} on:click={turnPrev}>◀</button>
+    <button class="reader-btn reader-bottom-collapse reader-chrome-btn reader-chrome-btn-sm" title={t("收起工具栏")} on:click={dismissChrome}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.chevronDown}</svg></button>
+    <!-- 2026-10-25 P0-2：章节跳转（首页 上一章 | 上一页 | 进度 | 下一页 | 下一章 末页，对标微信读书底栏）
+         2026-11-06：单箭头=翻页、双箭头=跳章，两组用图标形状区分，不再靠字符宽窄。
+         2026-11-06 方案 A：撤掉「首页 / 末页」（Home / End 键仍是同一动作），
+         底栏只留一条「翻页 + 进度」主线，9 个控件降到 7 个。 -->
+    <button class="reader-btn reader-chrome-btn reader-chrome-btn-sm" title={t("上一章（Alt+←）")} on:click={goPrevChapter}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.prevChapter}</svg></button>
+    <button class="reader-btn reader-chrome-btn" title={t("上一页")} on:click={turnPrev}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.chevronLeft}</svg></button>
     <div class="reader-progress-wrap">
       {#if chapterMarks.length}
         {#each chapterMarks as m (m.left)}
@@ -14072,38 +13936,22 @@ function applyTopHandleHitHeight() {
     <!-- 2026-10-07 接通「显示页眉页脚」：章节名（页眉位）。
          2026-11-04 方案 C：页脚位的剩余章节与 ETA 不再常驻，
          合并进上面进度条的 title —— 底栏原先把 9 个控件 + 3 段 11px 文字
-         挤在一行，是「显小」的主因；收掉后字号才放得开。 -->
-    {#if currentChapterTitle}
-      <span class="reader-chapter-name" title={currentChapterTitle}>{currentChapterTitle}</span>
-    {/if}
+         挤在一行，是「显小」的主因；收掉后字号才放得开。
+         2026-11-06 方案 A：章节名也撤出底栏（顶栏已有），底栏只留百分比一处数值。 -->
     <span class="reader-progress-text">{progressText}</span>
-    <button class="reader-btn" title={t("下一页")} on:click={turnNext}>▶</button>
-    <button class="reader-btn" title={t("下一章（Alt+→）")} on:click={goNextChapter}>⏩</button>
-    <button class="reader-btn" title={t("最后一页（End）")} on:click={goLastPage}>⏭</button>
+    <button class="reader-btn reader-chrome-btn" title={t("下一页")} on:click={turnNext}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.chevronRight}</svg></button>
+    <button class="reader-btn reader-chrome-btn reader-chrome-btn-sm" title={t("下一章（Alt+→）")} on:click={goNextChapter}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.nextChapter}</svg></button>
   </div>
-
-  <!-- 2026-08-30 · 底部进度条「把手」：常驻底部中央的小圆点。
-       收起态在底部中央显示小圆点，点击固定展开；展开态圆点被进度条顶到上方中央，
-       再次点击即可收起（无需去左侧找向下箭头）。
-       2026-11-04：与顶栏圆点共用一个开关（toggleChrome），点一次上下两栏一起开合。 -->
-  <button
-    class="reader-bottom-handle"
-    class:reader-bottom-handle-revealed={bottomBarRevealed}
-    title={bottomBarRevealed ? t("点击收起工具栏") : t("点击展开工具栏")}
-    on:click={toggleChrome}
-  >
-    <span class="reader-bottom-handle-dot"></span>
-  </button>
 
   <!-- 2026-08-28：连续朗读控制条（参考 Readest 朗读体验） -->
   {#if showTtsBar}
   <div class="reader-tts-bar">
-    <button class="reader-btn reader-tts-btn" title={t("上一句")} on:click={ttsPrev}>⏮</button>
+    <button class="reader-btn reader-tts-btn" title={t("上一句")} on:click={ttsPrev}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.prevSentence}</svg></button>
     <button class="reader-btn reader-tts-btn reader-tts-play" title={t("播放/暂停（Space）")} on:click={ttsTogglePlay}>
-      {ttsState === "playing" ? "⏸" : "▶"}
+      <svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ttsState === "playing" ? ICONS.pause : ICONS.play}</svg>
     </button>
-    <button class="reader-btn reader-tts-btn" title={t("下一句")} on:click={ttsNext}>⏭</button>
-    <button class="reader-btn reader-tts-btn" title={t("停止")} on:click={ttsStop}>⏹</button>
+    <button class="reader-btn reader-tts-btn" title={t("下一句")} on:click={ttsNext}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.nextSentence}</svg></button>
+    <button class="reader-btn reader-tts-btn" title={t("停止")} on:click={ttsStop}><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.stop}</svg></button>
     <div class="reader-tts-meta">
       <span class="reader-tts-progress">{ttsProgress.total ? ttsProgress.index + 1 : 0}/{ttsProgress.total}</span>
       <span class="reader-tts-current" title={ttsCurrentText}>{ttsCurrentText}</span>
@@ -14141,7 +13989,7 @@ function applyTopHandleHitHeight() {
     不需要「点空白收起」；而目录/搜索仍保留该行为。
   -->
   {#if (showToc || showSearch) && !showSettings && !sidebarPinned}
-    <div class="reader-backdrop" on:click={closeAllPopovers} aria-hidden="true"></div>
+    <div class="reader-backdrop" on:click={dismissChrome} aria-hidden="true"></div>
   {/if}
 
   <!-- 2026-10-25 P0-1：停靠侧栏的拖宽把手（仅在停靠面板在场时渲染） -->
@@ -14618,10 +14466,13 @@ function applyTopHandleHitHeight() {
    */
 
   .reader-view {
-    /* 2026-11-04 方案 C：顶栏浮起后的底沿锚点（基准档 = 8 顶距 + 44 栏高 + 2 呼吸）。
-       所有靠顶浮层（backdrop / 抽屉 / 搜索 / 设置 / ⋯ / 把手）统一消费此变量，
-       宽屏档在文件末尾覆写为 59px —— 改顶栏尺寸只需动这一处，避免六处锚点各自漂移。 */
-    --reword-chrome-top: 54px;
+    /* 顶栏浮起后的底沿锚点（2026-11-06：8 顶距 + 52 栏高 + 2 呼吸 = 62）。
+       栏高 = 34 按钮 + 8×2 内边距 + 1×2 描边；按钮从「字符行高约 30」
+       统一成 34 方框后栏高变长，锚点必须跟着走，否则备份/抽屉/搜索浮层
+       会从栏内开始铺，挡住按钮下沿。
+       所有靠顶浮层（backdrop / 抽屉 / 搜索 / 设置 / ⋯）统一消费此变量，
+       宽屏档在文件末尾覆写为 64px。 */
+    --reword-chrome-top: 62px;
     /* 2026-11-05 浮层语义令牌（划词工具栏 / 批注卡共用）：
        白天跟随思源主题（surface 94% + 毛玻璃、深字），夜间切恒深色（白字）。
        ⇒ 两张卡片同色，不再「工具栏黑、批注卡白」。
@@ -14707,20 +14558,20 @@ function applyTopHandleHitHeight() {
     z-index: 1;
   }
   /* ================================================================
-   * 2026-10-08 · 顶栏浮层化（默认开启，class:reader-toolbar-floating）
+   * 2026-11-06 · 顶栏浮层（微信读书式 chrome，永远浮层）
    * ================================================================
-   * 对标底栏的「纯浮层 + 半透明毛玻璃 + 圆点把手 + 纯点击切换」范式。
+   * 与底栏对称：脱离文档流 + 半透明毛玻璃 + 中心点击开合。
    *
    * ## 为什么脱离文档流
-   * 现状顶栏是 flex 子项（flex-shrink:0），**实打实占掉36px 阅读高度**，
+   * 顶栏若是 flex 子项（flex-shrink:0），会实打实占掉 36px 阅读高度，
    * 首行距顶 = 36 + marginTopPx。改为 absolute 后 .reader-stage（flex:1）
-   * 立刻占满，首行距顶只剩 marginTopPx —— 这就是用户要的「文字更靠近上边框」。
+   * 立刻占满，首行距顶只剩 marginTopPx —— 文字更靠近上边框。
    *
    * ## 为什么显隐**不写任何几何**
    * 收起/展开只改 opacity + transform，**不改变任何元素的盒子尺寸**
    * ⇒ 内容文档的分页/滚动几何完全不变：正文不重排、不跳页。
    * ⚠️ 绝不能在这里加「展开时给 margin-top 加一段占位」—— 那是 2026-10-07
-   * 底栏那轮用户亲自否决的「动态占位」，且会让每次点圆点都重排正文。
+   * 底栏那轮用户亲自否决的「动态占位」，且会让每次开合都重排正文。
    */
   .reader-toolbar-floating {
     position: absolute;
@@ -14728,18 +14579,23 @@ function applyTopHandleHitHeight() {
     left: 8px;
     right: 8px;
     /* z-index 高于 stage(0) / backdrop(1) / floating-layer(2)，与底栏(5)同级；
-       圆点把手(7)在其之上。仍远低于思源原生 UI（同底栏的取值口径）。
+       仍远低于思源原生 UI（同底栏的取值口径）。
        2026-10-24 Phase 1：z 值 token 化（--rz-*，见 reader-ui.less 分层表），下同。 */
     z-index: var(--rz-toolbar);
     /* 悬浮药丸条质感（与底栏对称）：思源 surface 底 + 圆角 + 半透明毛玻璃。
        不透明实色会「糊掉一块」，半透明能隐约看见底下的字，更像浮在上面。 */
-    border-radius: var(--b3-border-radius, 8px);
-    background: color-mix(in srgb, var(--b3-theme-surface, var(--b3-theme-background, #fff)) 82%, transparent);
-    -webkit-backdrop-filter: blur(12px) saturate(1.2);
-    backdrop-filter: blur(12px) saturate(1.2);
-    box-shadow: var(--b3-point-shadow, 0 2px 10px rgba(0, 0, 0, 0.12));
-    /* 顶部一道极淡的分隔线：与正文有边界但不突兀（与底栏 border-top 对称） */
-    border-bottom: 1px solid color-mix(in srgb,
+    /* 2026-11-06 浮层质感统一（与底栏同参数）：
+       半径 14（8 半径在 48 高的栏上四角显得「方」）、透明度 88%、
+       模糊 18 + 饱和度 1.5（玻璃感更明显），阴影分两层（近处细、远处散）。 */
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--b3-theme-surface, var(--b3-theme-background, #fff)) 88%, transparent);
+    -webkit-backdrop-filter: blur(18px) saturate(1.5);
+    backdrop-filter: blur(18px) saturate(1.5);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.06),
+      0 8px 24px rgba(0, 0, 0, 0.12);
+    /* 极淡描边：半透明底需要一条边界线，否则栏与正文糊在一起 */
+    border: 1px solid color-mix(in srgb,
       var(--b3-border-color, rgba(255, 255, 255, 0.1)) 55%, transparent);
     /* 收起态：向上滑出 + 缩小，层次感与底栏对称 */
     opacity: 0;
@@ -14755,6 +14611,52 @@ function applyTopHandleHitHeight() {
     pointer-events: auto;
     transform: translateY(0) scale(1);
   }
+  /* ================================================================
+   * 上下栏入口小圆点（2026-11-06 恢复为显式主入口）
+   * ----------------------------------------------------------------
+   * 只在两栏收起时渲染；点一下 toggleChrome → 上下栏同时浮出。
+   * 命中区高度由模板内联写入 `--reword-top-hit-h`：
+   * clamp(16, 上边距 - 4, 28) —— 绝不越过正文顶边，否则会吞掉首行的
+   * 划词与点击（Readest #4977/#5427 的原题）。
+   * ================================================================ */
+  .reader-top-handle {
+    position: absolute;
+    left: 50%;
+    top: 4px;
+    z-index: var(--rz-toolbar);
+    display: inline-flex;
+    align-items: flex-start;
+    justify-content: center;
+    width: 28px;
+    height: var(--reword-top-hit-h, 20px);
+    padding: 0;
+    border: none;
+    border-radius: 999px;
+    background: transparent;
+    cursor: pointer;
+    opacity: 0.5;
+    transform: translateX(-50%);
+    transition: opacity var(--reword-dur-fast, 120ms) var(--reword-ease);
+    pointer-events: auto;
+  }
+  .reader-top-handle:hover {
+    opacity: 1;
+  }
+  .reader-top-handle-dot {
+    display: block;
+    width: 8px;
+    height: 8px;
+    margin-top: calc((var(--reword-top-hit-h, 20px) - 8px) / 2);
+    border-radius: 50%;
+    background: var(--b3-theme-on-surface, #666);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    transition: transform var(--reword-dur-fast, 120ms) var(--reword-ease),
+      background-color var(--reword-dur-fast, 120ms) var(--reword-ease);
+  }
+  .reader-top-handle:hover .reader-top-handle-dot {
+    transform: scale(1.35);
+    background: var(--b3-theme-primary, #378add);
+  }
   /* ⚠️ color-mix 兜底（与底栏同源教训）：上面那条 background 用的是
      `color-mix(...)`。若宿主环境不支持该函数，**整条声明会失效**，
      background 退为 transparent ⇒ 顶栏下方文字直接透出、控件不可见。
@@ -14769,60 +14671,6 @@ function applyTopHandleHitHeight() {
     .reader-toolbar-floating {
       transition: none;
     }
-  }
-  /* ================================================================
-   * 顶栏「把手」：常驻顶部中央的小圆点（对标 .reader-bottom-handle）
-   * ================================================================
-   * ⚠️ 命中区高度必须夹到「不越过正文顶边」——
-   * Readest `getHeaderTriggerHeight()` 的注释写明了踩过的坑（#4977/#5427）：
-   * 触发区是个「盖子」，盖住的部分不能被选中/长按/点击；
-   * 曾因写死 44px 而在页眉关闭、上边距变小后**盖住第一行、吞掉那里的划词**。
-   * ⇒ 高度 = min(28, marginTopPx - 4)，由 applyTopHandleHitHeight() 写入
-   *   `--reword-top-hit-h`；上边距过小时退化到 16px 最小值。
-   */
-  .reader-top-handle {
-    position: absolute;
-    left: 50%;
-    top: 4px;
-    /* 高于顶栏浮层(5)，与底栏把手(7)同一层 */
-    z-index: var(--rz-handle);
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: var(--reword-top-hit-w, 28px);
-    height: var(--reword-top-hit-h, 24px);
-    padding: 0;
-    border: none;
-    border-radius: 50%;
-    background: transparent;
-    cursor: pointer;
-    opacity: 0.5;
-    transform: translateX(-50%);
-    transition: top var(--reword-dur-base) var(--reword-ease),
-      opacity var(--reword-dur-fast, 120ms) var(--reword-ease);
-    pointer-events: auto;
-  }
-  .reader-top-handle:hover {
-    opacity: 1;
-  }
-  /* 浮起态：从顶部 4px 上移到顶栏下方中央（消费顶栏底沿变量，
-     与底栏把手的 .reader-bottom-handle-revealed 对称）。 */
-  .reader-top-handle.reader-top-handle-revealed {
-    top: var(--reword-chrome-top, 54px);
-  }
-  .reader-top-handle-dot {
-    display: block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--b3-theme-on-surface, #666);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-    transition: transform var(--reword-dur-fast, 120ms) var(--reword-ease),
-      background-color var(--reword-dur-fast, 120ms) var(--reword-ease);
-  }
-  .reader-top-handle:hover .reader-top-handle-dot {
-    transform: scale(1.35);
-    background: var(--b3-theme-primary, #378add);
   }
   /* ===== 2026-10-25 角落自动翻页：L 形双条进度（Readest PageTurnHint 复刻） =====
      物理边定位（非 logical，RTL 下角检测已镜像、条仍在物理角上）；
@@ -14915,14 +14763,6 @@ function applyTopHandleHitHeight() {
     font-size: 13px;
     flex-shrink: 0;
   }
-  /* ⚠️ 2026-10-08：这条**只服务「顶栏悬浮」关闭时的旧行为**（topBarFloating=false，
-     即 2026-10-08 之前顶栏常驻文档流、中心点击切换显隐）。
-     悬浮模式下顶栏的收起态由 .reader-toolbar-floating 的
-     opacity/transform 承担 —— 绝不能用 display:none，
-     那会让整个元素从渲染树消失、过渡动画无从播放。 */
-  .reader-toolbar-hidden {
-    display: none;
-  }
   /* 2026-08-29 Phase 1：触屏设备放大点按目标，避免误触（仅 coarse 指针生效） */
   @media (pointer: coarse) {
     .reader-btn { min-height: 36px; padding: 8px 10px; }
@@ -14941,6 +14781,68 @@ function applyTopHandleHitHeight() {
   }
   .reader-btn:hover {
     background: var(--b3-theme-background-light, rgba(0, 0, 0, 0.06));
+  }
+  /* 2026-11-06 统一图标语言：上下栏全部改用 24 网格线性图标（icons.ts 单一真源）。
+     此前顶栏是字符/emoji（‹ ☰ 📝 ✦ ⚙ 🔍 ⋯）、设置面板是 SVG 线性图标，
+     两套语言并排出现就会「丑」——现在两者共用同一套笔画参数。 */
+  .reader-ic {
+    width: 18px;
+    height: 18px;
+    display: block;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.75;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    /* 图标本身不参与命中，整块 34px 方框才是按钮（见 .reader-chrome-btn） */
+    pointer-events: none;
+  }
+  /* 每个栏位按钮统一 34×34 方框：同尺寸 ⇒ 图标间距、垂直中线都对齐。
+     `.reader-btn` 的 6px 8px 内边距在方框里会把图标顶偏，故这里归零。 */
+  .reader-chrome-btn {
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    border-radius: 9px;
+  }
+  /* 次要动作（收起 / 首页 / 跳章 / 末页）：30 方框 + 16 图标。
+     与 34 的翻页箭头形成一档层级 —— 底栏有 9 个控件，全同尺寸时
+     「下一页」会淹没在图标森林里；缩小次要键，主路径才跳出来。
+     触摸设备由 (pointer: coarse) 的 40 方框规则统一接管，不在此叠。 */
+  .reader-chrome-btn-sm {
+    width: 30px;
+    height: 30px;
+  }
+  .reader-chrome-btn-sm .reader-ic {
+    width: 16px;
+    height: 16px;
+  }
+  /* 触摸设备：命中区一律放大到 40×40（图标回 18），不分主次 ——
+     手指没有「次要动作」的概念，30px 的键只会造成误触。 */
+  @media (pointer: coarse) {
+    .reader-chrome-btn,
+    .reader-chrome-btn-sm {
+      width: 40px;
+      height: 40px;
+      padding: 0;
+    }
+    .reader-chrome-btn-sm .reader-ic {
+      width: 18px;
+      height: 18px;
+    }
+  }
+  /* 组内分隔（左右两组各一条，PDF 扫描入口前也有一条） */
+  .reader-bar-divider {
+    width: 1px;
+    height: 18px;
+    margin: 0 4px;
+    flex: none;
+    background: var(--b3-border-color, rgba(0, 0, 0, 0.1));
+    opacity: 0.7;
   }
   .reader-btn-active {
     background: var(--b3-theme-primary-light, rgba(55, 138, 221, 0.18));
@@ -14994,6 +14896,12 @@ function applyTopHandleHitHeight() {
     padding: 10px 12px;
     font-size: 16px;
   }
+  /* 图标按钮自己撑满 44×44，不能被上一条的 10/12 内边距挤成 58 宽 */
+  .reader-toolbar-iphone .reader-chrome-btn {
+    width: 44px;
+    height: 44px;
+    padding: 0;
+  }
   /* iPhone 模式下 .reader-zoom-btn / .reader-zoom-label 的放大规则见
      全局 src/reader/reader-controls.less（2026-09-02 界面分流后这两个元素
      由 PdfToolbar 渲染，scoped 后代选择器命中不到）。 */
@@ -15019,13 +14927,7 @@ function applyTopHandleHitHeight() {
   .reader-spacer {
     flex: 1;
   }
-  .reader-progress {
-    font-size: 13px;
-    color: var(--b3-theme-on-surface-light, #888);
-    min-width: 36px;
-    text-align: right;
-  }
-  /* 设置按钮移到顶部右侧：与进度百分比 2% 之间留出 2px 间距 */
+  /* 设置按钮与右侧工具组保持 2px 间距 */
   .reader-settings-btn {
     margin-left: 2px;
   }
@@ -15090,36 +14992,44 @@ function applyTopHandleHitHeight() {
   }
   .reader-floating-layer > .reader-tip.ready { opacity: 1; }
 
-  /* 2026-10-14 P1：选区两端「定位标识」手柄（对齐微信读书：小圆点 + 细竖 caret，竖条高度=行高）。
-     圆点落在选区首行左上 / 末行右下；竖条沿行方向探入正文，拖拽实时改选区（见 onSelHandlePointerDown）。
-     margin 负半尺寸让 left/top 命中圆点中心；竖条高度用 --sh（由 updateSelHandles 按行高注入），随字号缩放。 */
+  /* 2026-11-06：对齐微信读书的「小圆点 + 细竖条」。
+     元素本身是 24px 透明热区（只管拖拽命中，不画出来）；圆点由 ::after 画在中心，
+     竖条由 ::before 沿中心线探入选中行，长度 --sh = 选中背景高度。 */
   .reader-sel-handle {
     position: absolute;
-    width: 11px;
-    height: 11px;
-    margin: -5.5px 0 0 -5.5px;
-    border-radius: 50%;
-    background: var(--b3-theme-primary, #3b82f6);
-    border: 1.5px solid #fff;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.28);
+    width: 24px;
+    height: 24px;
+    margin: -12px 0 0 -12px;
+    background: transparent;
     pointer-events: auto;
     touch-action: none; /* 拖拽优先于滚动/系统选区 */
     cursor: ew-resize;
     z-index: var(--rz-sel-handle);
   }
+  .reader-sel-handle::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 8.5px;
+    height: 8.5px;
+    border-radius: 50%;
+    background: var(--b3-theme-primary, #3b82f6);
+    transform: translate(-50%, -50%);
+  }
   .reader-sel-handle::before {
     content: "";
     position: absolute;
     left: 50%;
-    width: 2px;
+    width: 1.5px;
     height: var(--sh, 20px);
-    margin-left: -1px;
+    margin-left: -0.75px;
     border-radius: 1px;
     background: var(--b3-theme-primary, #3b82f6);
   }
   .reader-sel-handle--start::before { top: 50%; }  /* 起点：竖条从圆心向下探入首行 */
   .reader-sel-handle--end::before { bottom: 50%; }  /* 终点：竖条从圆心向上探入末行 */
-  .reader-sel-handle.active { transform: scale(1.25); }
+  .reader-sel-handle.active::after { transform: translate(-50%, -50%) scale(1.25); }
 
   /* 2026-10-24 批 C：页边驻留提示 —— 手柄拖进页边带、还没到翻页时长时出现的方向提示。
      只锚在指针旁、不占布局、pointer-events:none（挡住手柄自身命中就麻烦了）；
@@ -16387,10 +16297,14 @@ function applyTopHandleHitHeight() {
     height: 0;
   }
   .reader-switch-track {
-    width: 36px;
-    height: 20px;
-    border-radius: 10px;
+    width: 42px;
+    height: 25px;
+    /* 无全局重置：不写 border-box 时 42×25 会被 2px 内边距撑成 46×29，
+       滑块行程也会从 17 变成 21。 */
+    box-sizing: border-box;
+    border-radius: 999px;
     background: var(--b3-theme-background-light, rgba(0, 0, 0, 0.12));
+    box-shadow: inset 0 0 0 0.5px rgba(22, 26, 34, 0.05);
     transition: background 200ms ease-out;
     position: relative;
   }
@@ -16399,18 +16313,21 @@ function applyTopHandleHitHeight() {
     position: absolute;
     top: 2px;
     left: 2px;
-    width: 16px;
-    height: 16px;
+    width: 21px;
+    height: 21px;
     border-radius: 50%;
     background: #fff;
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-    transition: transform 200ms ease-out;
+    /* 双层投影：近处 1px 定边界、远处 6px 造悬浮，与设置面板分段胶囊同参数 */
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.18),
+      0 2px 6px rgba(0, 0, 0, 0.14);
+    transition: transform 0.2s cubic-bezier(0.32, 0.72, 0, 1);
   }
   .reader-switch input:checked + .reader-switch-track {
     background: var(--b3-theme-primary, #378add);
   }
   .reader-switch input:checked + .reader-switch-track::after {
-    transform: translateX(16px);
+    transform: translateX(17px);
   }
 
   .reader-popover {
@@ -16511,7 +16428,7 @@ function applyTopHandleHitHeight() {
    * ================================================================
    * ① 侧栏 popover（目录/书签摘录/搜索）→ 底部 sheet：
    *    280px 窄 popover 在手机上又窄又矮还遮正文；改为贴底全宽 sheet，
-   *    底部让出 44px 给圆点把手/进度条区。角标小三角一并隐藏（锚点语义不再成立）。
+   *    底部让出 44px 给进度条区。角标小三角一并隐藏（锚点语义不再成立）。
    * ② TTS 朗读条：横向一长条在窄屏溢出 → 允许横向滚动（改动最小的方案）。 */
   .reader-view.re-phone .reader-toc,
   .reader-view.re-phone .reader-bookmarks,
@@ -16556,9 +16473,8 @@ function applyTopHandleHitHeight() {
   .reader-view.re-phone .reader-tts-bar::-webkit-scrollbar {
     display: none;
   }
-  /* 2026-10-25 移动端适配 B3：圆点把手命中区让位首/末行。
-     手机上把手是次要入口（中心点按 toggle + 翻页自动收起已是主路径）：
-     顶把手贴顶 22px、底把手贴底 24px、圆点缩小。桌面/平板不变。 */
+  /* 2026-11-06：手机端圆点是显式主入口（中心点按默认关），
+     所以命中区贴顶、保持可点，圆点略小不压字。 */
   .reader-view.re-phone .reader-top-handle {
     top: 0;
     height: 22px;
@@ -16566,15 +16482,10 @@ function applyTopHandleHitHeight() {
   .reader-view.re-phone .reader-top-handle-dot {
     width: 5px;
     height: 5px;
+    margin-top: 4px;
   }
-  .reader-view.re-phone .reader-bottom-handle:not(.reader-bottom-handle-revealed) {
-    bottom: 0;
-    height: 24px;
-  }
-  .reader-view.re-phone .reader-bottom-handle-dot {
-    width: 5px;
-    height: 5px;
-  }
+  /* 2026-10-25 移动端适配 B3：手机上中心点按 toggle 是主路径，栏内点击目标已在
+     coarse 指针媒体查询里放大；这里只保留极小屏的工具栏紧凑化。 */
   /* ================================================================
    * 2026-10-26 路线 A · 极小屏档（对标「思阅」SiReader 的 420/380 断点）
    * ----------------------------------------------------------------
@@ -16688,14 +16599,12 @@ function applyTopHandleHitHeight() {
   .reader-view.ai-docked .reader-bottom-bar {
     right: calc(var(--re-ai-w, 420px) + 8px);
   }
-  /* 两个圆点把手跟着正文区中线走，而不是整宽中线 */
-  .reader-view.ai-docked .reader-top-handle,
-  .reader-view.ai-docked .reader-bottom-handle {
+  /* 圆点跟着正文区中线走，而不是整宽中线 */
+  .reader-view.ai-docked .reader-top-handle {
     left: calc((100% - var(--re-ai-w, 420px)) / 2);
   }
   /* 左目录 + 右助手同时打开：中线 = 两侧让位后的剩余区域中点 */
-  .reader-view.ai-docked.sidebar-docked .reader-top-handle,
-  .reader-view.ai-docked.sidebar-docked .reader-bottom-handle {
+  .reader-view.ai-docked.sidebar-docked .reader-top-handle {
     left: calc(50% + (var(--re-sidebar-w, 280px) - var(--re-ai-w, 420px)) / 2);
   }
   /* 拖宽把手（停靠栏右缘） */
@@ -18239,14 +18148,18 @@ function applyTopHandleHitHeight() {
        2026-10-07：底栏改为**纯浮层**（浮在文字上层、盖住部分正文，正文不动），
        视觉上改半透明毛玻璃 —— 不透明实色会「糊掉一块」，
        半透明能隐约看见底下的字，更像「浮在上面」。 */
-    border-radius: var(--b3-border-radius, 8px);
-    background: color-mix(in srgb, var(--b3-theme-surface, var(--b3-theme-background, #fff)) 82%, transparent);
-    -webkit-backdrop-filter: blur(12px) saturate(1.2);
-    backdrop-filter: blur(12px) saturate(1.2);
-    /* 顶部一道极淡的分隔线：与正文有边界但不突兀 */
-    border-top: 1px solid color-mix(in srgb,
+    /* 2026-11-06：与顶栏同参数（半径 14 / 88% / blur 18 / 双层阴影），
+       两条栏必须是「同一块玻璃」；此前底栏还留着 8px 半径 + 82% 的旧参数，
+       顶栏一改就会露馅。 */
+    border-radius: 14px;
+    background: color-mix(in srgb, var(--b3-theme-surface, var(--b3-theme-background, #fff)) 88%, transparent);
+    -webkit-backdrop-filter: blur(18px) saturate(1.5);
+    backdrop-filter: blur(18px) saturate(1.5);
+    border: 1px solid color-mix(in srgb,
       var(--b3-border-color, rgba(255, 255, 255, 0.1)) 55%, transparent);
-    box-shadow: var(--b3-point-shadow, 0 2px 10px rgba(0, 0, 0, 0.12));
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.06),
+      0 8px 24px rgba(0, 0, 0, 0.12);
     /* 2026-08-30 改造：默认完全隐藏（macOS 程序坞机制）。
        移出文档流（absolute + translateY(140%)）以免占据/遮挡阅读高度；
        显现时从底部平滑滑入、覆盖底部，隐藏态不拦截任何事件、不挡正文。 */
@@ -18262,7 +18175,7 @@ function applyTopHandleHitHeight() {
     transition: opacity var(--reword-dur-base) var(--reword-ease),
       transform var(--reword-dur-base) var(--reword-ease);
   }
-  /* 显现态：点击把手浮起 → 平滑滑入 + 回到原尺寸 */
+  /* 显现态：中心点击开栏 → 平滑滑入 + 回到原尺寸 */
   .reader-bottom-bar.bottom-bar-revealed {
     opacity: 1;
     pointer-events: auto;
@@ -18278,61 +18191,15 @@ function applyTopHandleHitHeight() {
       border-top: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.1));
     }
   }
-  /* 收起按钮：进度条左上角，点击即收起（解除固定） */
+  /* 收起按钮：进度条左上角，点击即收起（解除固定）。
+     按「次要动作」处理：比其余图标低一档亮度，视觉上不抢翻页键。 */
   .reader-bottom-collapse {
-    font-size: 15px;
-    line-height: 1;
-    padding: 0 7px;
     color: var(--b3-theme-on-surface-light, #888);
   }
   @media (prefers-reduced-motion: reduce) {
     .reader-bottom-bar {
       transition: none;
     }
-  }
-  /* 2026-08-30 · 底部进度条「把手」：常驻的中央圆点，收起 / 展开都可见、可点。
-     收起态贴底显示圆点；展开态被进度条顶到其上方中央，再次点击收起。 */
-  .reader-bottom-handle {
-    position: absolute;
-    left: 50%;
-    bottom: 8px;
-    z-index: var(--rz-handle); /* 高于进度条（--rz-toolbar），展开时把手位于进度条上方仍可见可点 */
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    border: none;
-    border-radius: 50%;
-    background: transparent;
-    cursor: pointer;
-    opacity: 0.5;
-    transform: translateX(-50%);
-    transition: bottom var(--reword-dur-base) var(--reword-ease),
-      opacity var(--reword-dur-fast, 120ms) var(--reword-ease);
-    pointer-events: auto;
-  }
-  .reader-bottom-handle:hover {
-    opacity: 1;
-  }
-  /* 展开态：从底部 8px 上移到进度条上方中央（基准栏高 44 + 16 呼吸） */
-  .reader-bottom-handle.reader-bottom-handle-revealed {
-    bottom: 68px;
-  }
-  .reader-bottom-handle-dot {
-    display: block;
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--b3-theme-on-surface, #666);
-    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
-    transition: transform var(--reword-dur-fast, 120ms) var(--reword-ease),
-      background-color var(--reword-dur-fast, 120ms) var(--reword-ease);
-  }
-  .reader-bottom-handle:hover .reader-bottom-handle-dot {
-    transform: scale(1.35);
-    background: var(--b3-theme-primary, #378add);
   }
   /* 2026-08-28：连续朗读控制条（参考 Readest 朗读体验） */
   .reader-tts-bar {
@@ -18351,17 +18218,20 @@ function applyTopHandleHitHeight() {
     z-index: 1;
     font-size: 13px;
   }
+  /* 朗读条按钮与上下栏同口径（2026-11-06）：32px 方框 + 18px 线性图标；
+     播放键略大 34px 并着主色，作为唯一「主要动作」。 */
   .reader-tts-btn {
-    min-width: 30px;
-    height: 30px;
-    padding: 0 8px;
+    min-width: 32px;
+    width: 32px;
+    height: 32px;
+    padding: 0;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    font-size: 15px;
   }
   .reader-tts-play {
-    font-size: 17px;
+    width: 34px;
+    height: 34px;
     color: var(--b3-theme-primary, #378add);
   }
   .reader-tts-meta {
@@ -18483,19 +18353,7 @@ function applyTopHandleHitHeight() {
     text-align: right;
   }
 
-  /* 2026-10-07 · 底栏页眉位（showHeader）。2026-11-04 方案 C：
-     页脚位的「剩余章节」与 ETA 不再常驻（最挤的一排），
-     合并进进度条的 title，底栏只留章节名 + 百分比。 */
-  .reader-chapter-name {
-    font-size: 12px;
-    color: var(--b3-theme-on-surface-light, #888);
-    /* 章节名可能很长；单行截断 + 完整名挂 title（避免底栏被长标题撑变形） */
-    max-width: 30%;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 0 1 auto;
-  }
+  /* 2026-11-06 方案 A：底栏只有百分比一处数值（章节名回顶栏、首末页退役）。 */
 
   .reader-error {
     position: absolute;
@@ -18575,69 +18433,99 @@ function applyTopHandleHitHeight() {
   }
 
   /* ================================================================
-   * 2026-11-04 方案 C · 上下栏视觉放大（宽屏档）
+   * 2026-11-06 方案 A · 轻质单栏（宽屏档）
    * ----------------------------------------------------------------
-   * 基准档（所有设备）：按钮/书名 15、章节 13、底栏文字 12、轨道 6、内边距 6–8。
-   * 本档只在「宽屏 + 鼠标」再放一档：按钮/书名 16、章节 14、底栏文字 13、轨道 7。
-   * 两栏都是浮层 —— 增高只改覆盖范围，不参与分页几何，正文不重排。
-   * ⚠️ 改这里的栏高必须同步 --reword-chrome-top 与底栏把手的展开偏移，
-   *    它们都按「顶距 8 + 栏高 + 呼吸」推导（49 + 8 = 57 → 59；底栏 57 + 16 → 73）。
+   * 只改「宽屏 + 鼠标」这一档：栏高 54 → 44，字号整体收一档
+   * （书名 16→13、章节 14→12、数值 13→11.5），图标 19→17 / 17→16，
+   * 主键 36→30、次要键 32→28。顶栏去掉 0% 与竖分隔线，
+   * 底栏撤掉首末页与重复章节名 —— 信息密度让位给字号呼吸感。
+   * 两栏都是浮层 —— 改尺寸只改覆盖范围，不参与分页几何，正文不重排。
+   * ⚠️ 改栏高必须同步 --reword-chrome-top（顶距 8 + 栏高 44 + 呼吸 2 = 54）。
    * ================================================================ */
   @media (min-width: 900px) and (pointer: fine) {
     .reader-view {
-      --reword-chrome-top: 59px;
+      --reword-chrome-top: 54px;
     }
     .reader-toolbar {
-      gap: 9px;
-      padding: 9px 12px;
-      padding-top: calc(9px + env(safe-area-inset-top, 0px));
-      padding-left: calc(12px + env(safe-area-inset-left, 0px));
-      padding-right: calc(12px + env(safe-area-inset-right, 0px));
+      height: 44px;
+      /* 无全局重置：不写 border-box 时 44 会被上下内边距撑成 60。 */
+      box-sizing: border-box;
+      gap: 6px;
+      padding: 0 7px;
+      padding-left: calc(7px + env(safe-area-inset-left, 0px));
+      padding-right: calc(7px + env(safe-area-inset-right, 0px));
     }
     .reader-btn {
-      font-size: 16px;
-      padding: 7px 9px;
+      font-size: 13px;
+      padding: 0 6px;
+    }
+    .reader-chrome-btn {
+      width: 30px;
+      height: 30px;
+      padding: 0;
+    }
+    .reader-ic {
+      width: 17px;
+      height: 17px;
+    }
+    /* 主次层级保留：次要键 28 / 16，仍比主键小一档 */
+    .reader-chrome-btn-sm {
+      width: 28px;
+      height: 28px;
+    }
+    .reader-chrome-btn-sm .reader-ic {
+      width: 16px;
+      height: 16px;
     }
     .reader-title {
-      font-size: 16px;
+      font-size: 13px;
+      font-weight: 550;
+      letter-spacing: 0.01em;
     }
-    .reader-chapter,
+    .reader-chapter {
+      font-size: 12px;
+    }
     .reader-title-sep {
-      font-size: 14px;
+      font-size: 11px;
+    }
+    .reader-toolbar-title {
+      gap: 5px;
+      padding: 0 10px;
     }
     .reader-bottom-bar {
-      gap: 9px;
-      padding: 9px 12px;
-      padding-bottom: calc(9px + env(safe-area-inset-bottom, 0px));
+      height: 44px;
+      box-sizing: border-box;
+      gap: 4px;
+      padding: 0 7px;
+      padding-bottom: calc(0px + env(safe-area-inset-bottom, 0px));
     }
-    .reader-bottom-collapse {
-      font-size: 16px;
+    .reader-progress-wrap {
+      padding: 0 6px;
+      min-width: 90px;
     }
-    .reader-progress-text,
-    .reader-chapter-name {
-      font-size: 13px;
+    .reader-progress-text {
+      font-size: 11.5px;
+      min-width: 34px;
+      font-variant-numeric: tabular-nums;
     }
     .reader-chapter-tick {
-      height: 11px;
+      height: 7px;
     }
     .reader-progress-bar,
     .reader-progress-bar::-webkit-slider-runnable-track {
-      height: 7px;
+      height: 4px;
     }
     .reader-progress-bar::-webkit-slider-thumb {
-      width: 16px;
-      height: 16px;
+      width: 13px;
+      height: 13px;
       margin-top: -4.5px;
     }
     .reader-progress-bar::-moz-range-track {
-      height: 7px;
+      height: 4px;
     }
     .reader-progress-bar::-moz-range-thumb {
-      width: 16px;
-      height: 16px;
-    }
-    .reader-bottom-handle.reader-bottom-handle-revealed {
-      bottom: 73px;
+      width: 13px;
+      height: 13px;
     }
   }
 </style>

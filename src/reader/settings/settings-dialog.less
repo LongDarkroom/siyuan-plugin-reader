@@ -57,7 +57,7 @@
      把正文糊住，用户看不到参数改动的实时效果——这正是本次返工的核心诉求。
      现在遮罩完全透明（只保留点击接管），面板仍居中（用户明确不要抽屉形态）；
      正文从面板四周透出，仍能实时观察参数变化。
-     移动端（≤640px）仍在下方媒体查询里恢复压暗 + 模糊。 */
+     移动端（≤720px）仍在下方媒体查询里恢复压暗 + 模糊。 */
   background: transparent;
   backdrop-filter: none;
   -webkit-backdrop-filter: none;
@@ -87,12 +87,17 @@
  * 会被内容（尤其 `.rwd-body` 内的长列表）撑破，导致 `height` 失效。
  */
 .rwd-panel {
+  /* 2026-11-06 方案 A：左导航 196 + 右内容，宽 780。
+     680 宽放不下「196 导航 + 足够宽的行（标签 + 176 控件列）」，
+     会把行压成两行；780 ≈ 196 + 584，是两侧都不拥挤的最小值。 */
   display: flex;
-  flex-direction: column;
-  width: min(680px, calc(100% - 48px));
-  height: min(620px, 82vh);
+  flex-direction: row;
+  width: min(780px, calc(100% - 48px));
+  height: min(600px, 84vh);
+  /* 1px 描边算在 780 里面，否则面板实宽 782，和 rail 196 + 主区 584 对不上。 */
+  box-sizing: border-box;
   min-height: 0;
-  border-radius: 16px;
+  border-radius: 18px;
   /*
    * 2026-10-10 液体玻璃：面板本体半透明，靠 backdrop-filter 让背后的内容
    * 透出来（这就是「玻璃」）。配 4 件事才有质感：
@@ -104,7 +109,10 @@
    * ⚠️ 内层（.rwd-body 等）仍是实色，保证文字对比度不因玻璃而下降。
    * ⚠️ 描边用半透明白而非纯白：深色主题下纯白描边会变成刺眼亮边。
    */
-  background: color-mix(in srgb, var(--b3-theme-background, #1c1c1e) 92%, transparent);
+  /* 2026-11-06：透明度 92% → 96%。92% 时背后的正文会隐隐透上来，
+     在本面板 780×600 的大面积上会显脏；96% 仍保留玻璃感的边缘与模糊，
+     但文字对比度已经和实色无异。 */
+  background: color-mix(in srgb, var(--b3-theme-background, #1c1c1e) 96%, transparent);
   backdrop-filter: blur(28px) saturate(1.8);
   -webkit-backdrop-filter: blur(28px) saturate(1.8);
   color: var(--b3-theme-on-background, #e8e8ea);
@@ -116,18 +124,43 @@
   overflow: hidden;
   animation: rwd-rise 0.14s cubic-bezier(0.4, 0, 0.2, 1);
 
+  /* ---- 内部质感令牌（2026-11-06 对齐 demo） ----
+   * 之前面板内所有面都吃 `--b3-theme-surface`，浅色主题下那是**灰**：
+   * 灰卡片压在灰面板上，层次是反的，观感发闷。demo 的层级是
+   *   面板（近白）→ 导航列（浅灰）→ 卡片（白）→ 控件槽（浅灰凹槽）。
+   * 这里把四层拆成令牌，深色主题在下方成对覆写：
+   * 浅色靠「白卡 + 发丝线」，深色靠「4.5% 白卡 + 亮 0.5px 内描边」。
+   *
+   * 字体也显式声明：思源宿主字体栈在不同版本/主题下会漂，
+   * 面板是 780px 的大面积文本区，字形一漂整块观感就散。
+   */
+  --rwd-font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+  --rwd-ink: var(--b3-theme-on-background, #1c1d21);
+  --rwd-ink2: var(--b3-theme-on-surface, #5f646d);
+  --rwd-ink3: var(--b3-theme-on-surface-light, #8b919b);
+  --rwd-line: var(--b3-border-color, rgba(22, 26, 34, 0.08));
+  --rwd-card-bg: var(--b3-theme-background, #fff);
+  --rwd-field: var(--b3-theme-surface, rgba(22, 26, 34, 0.05));
+  --rwd-field2: color-mix(in srgb, var(--b3-theme-on-background, #1c1d21) 14%, transparent);
+  --rwd-hover: color-mix(in srgb, var(--b3-theme-on-background, #1c1d21) 6%, transparent);
+  --rwd-hover2: color-mix(in srgb, var(--b3-theme-on-background, #1c1d21) 10%, transparent);
+  --rwd-pill-bg: var(--b3-theme-background, #fff);
+  --rwd-pill-shadow: 0 1px 2px rgba(20, 28, 45, 0.10), 0 0 0 0.5px rgba(22, 26, 34, 0.06);
+  font-family: var(--rwd-font);
+  -webkit-font-smoothing: antialiased;
+
   /* ---- 界面字号基准（2026-10-07，整体 +1px 对齐思源 UI） ----
    * 集中定义的原因：本面板原先各处硬编码 11/12/12.5/13px，整体偏小一档。
    * 抽成变量后要再调只改这一处；新增控件也一律引用变量、不写字面量。
    */
   --rwd-fs-label: 14px;      /* 行标题（原 13） */
   --rwd-fs-hint: 12px;       /* 行副说明（原 11） */
-  --rwd-fs-group: 13px;      /* 分组标题（原 12） */
+  --rwd-fs-group: 12px;      /* 分组标题：小一号 + 拉开字距，像「标签」而不是「小标题」 */
   --rwd-fs-ctrl: 13.5px;     /* 下拉 / 次要按钮（原 12.5） */
-  --rwd-fs-seg: 13px;        /* 分段按钮（原 12） */
-  --rwd-fs-value: 14px;      /* 步进/ 滑块数值（原 13） */
+  --rwd-fs-seg: 12.5px;      /* 分段按钮：与 demo 一致，胶囊内文字略小于标题 */
+  --rwd-fs-value: 13px;      /* 步进/ 滑块数值：数值是辅助信息，不该和标题同号 */
   --rwd-fs-stepbtn: 15px;    /* 步进按钮符号（原 14） */
-  --rwd-row-min: 48px;       /* 行高（原 44；2026-10-10 由 46 提到 48：46/47 混用会出现 1px 抖动） */
+  --rwd-row-min: 56px;       /* 行高（2026-11-06：48 → 56，与 32px 控件留出上下 12px 呼吸） */
   /*
    * 控件列宽（2026-10-10 新增，对齐改造的核心）。
    *
@@ -145,6 +178,20 @@
   --rwd-ctrl-w: 176px;
 }
 
+/* 深色成对：思源的深色钩子在 <html> 上，部分主题版本改挂 html/body 类名。 */
+:root[data-theme-mode="dark"] .rwd-panel,
+html.theme--dark .rwd-panel,
+body.theme--dark .rwd-panel {
+  --rwd-ink2: var(--b3-theme-on-surface, #a8adb5);
+  --rwd-card-bg: rgba(255, 255, 255, 0.045);
+  --rwd-field: rgba(255, 255, 255, 0.07);
+  --rwd-field2: rgba(255, 255, 255, 0.17);
+  --rwd-hover: rgba(255, 255, 255, 0.06);
+  --rwd-hover2: rgba(255, 255, 255, 0.11);
+  --rwd-pill-bg: rgba(255, 255, 255, 0.14);
+  --rwd-pill-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+}
+
 @keyframes rwd-rise {
   from { transform: translateY(8px) scale(0.99); opacity: 0; }
   to   { transform: none; opacity: 1; }
@@ -152,74 +199,172 @@
 
 /* ---- 头部高度常量 ----
  *
- * 一级页头部 = .rwd-tabs（padding 10px + Tab 内容 46px ≈ 56px）
- *            + .rwd-searchbar（padding 16px + 输入框 26px ≈ 42px）
- *            = 98px（.rwd-head-total）
- * 二级页头部 = .rwd-subhead：只一行「返回 + 标题」，自身≈46px。
- *
- * ## 为什么二级页不再补足到 98px（2026-10-10 改）
- * 此前为了消除「进/出二级页滚动条忽隐忽现」的跳动，把二级页头部
- * 强行 min-height 到 98px，导致标题下方多出约 52px 空白（真机反馈：头部留白
- * 太多、观感丑）。实测该跳动在真机几乎不可察（.rwd-panel 高度固定，
- * 滚动条本身不显眼），而 52px 头部空白是一眼可见的缺陷 —— 取舍反了。
- * 现在二级页头部贴合自身高度（--rwd-head-sub），少掉的 42px 高度
- * 直接还给内容区（.rwd-body 是 flex:1，高度变大、内容更多可见）。
+ * 一级页：左列头部（.rwd-rail-head）与主区头部（.rwd-head）同为 56px，
+ *        两条横线在同一条水平线上，不会一高一低。
+ * 二级页：.rwd-subhead 同高 56px —— 一级/二级切换时正文顶边不动。
  */
 :root {
-  --rwd-head-tabs: 56px;
-  --rwd-head-search: 42px;
-  --rwd-head-total: 98px;
-  /* 二级页头部：与 tab 条同高，视觉紧凑、无多余留白 */
-  --rwd-head-sub: 52px;
+  --rwd-head-h: 56px;
 }
 
-.rwd-tabs {
+/* 统一线性图标（与上下栏 icons.ts 同参数）：24 网格 / 1.75 描边 / 圆头 */
+.rwd-ic {
+  width: 17px;
+  height: 17px;
+  display: block;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+}
+
+/* ===================== 左导航（方案 A） ===================== */
+
+.rwd-rail {
+  width: 196px;
+  /* 本项目无全局重置；不写 border-box 时 196 会被左右各 10px 内边距撑成 217，
+     主区就少 21px（780 = 196 + 584 的设计值失效）。 */
+  box-sizing: border-box;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0 10px 12px;
+  /* 半透明衬底（比主区低一档）⇒ 导航与内容有层次但不割裂；
+     右侧 0.5px 发丝线，与行分隔线同一档粗细。 */
+  background: color-mix(in srgb, var(--b3-theme-surface, var(--b3-theme-background, #fff)) 60%, transparent);
+  border-right: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+}
+
+.rwd-rail-head {
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 10px 12px 0;
-  border-bottom: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+  height: var(--rwd-head-h);
   flex: none;
-  /* 同 .rwd-subhead：min-height 必须是 border-box，否则 padding 会额外累加
-   * （本项目无全局 box-sizing 重置，详见 .rwd-subhead 处的说明）。 */
+  padding: 0 6px;
   box-sizing: border-box;
-  min-height: var(--rwd-head-tabs);
+  border-bottom: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+  margin: 0 -10px;
+  padding-left: 16px;
+}
+
+.rwd-rail-title {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--rwd-ink, #e8e8ea);
+}
+
+/* ---- 导航列表（一级页的 Tab） ----
+ * 竖排 pill：图标 + 文字。选中态是主色淡底 + 主色文字，
+ * 靠背景块表达选中，不再用「下划线贴在边框上」那种容易和分割线打架的写法。 */
+.rwd-tabs {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin-top: 10px;
+  flex: none;
 }
 
 .rwd-tab {
   display: flex;
-  flex-direction: column;
   align-items: center;
-  gap: 3px;
-  padding: 8px 14px 10px;
+  gap: 9px;
+  height: 35px;
+  padding: 0 10px;
   border: none;
   background: none;
-  color: var(--b3-theme-on-surface-light, #9a9aa0);
-  font-size: 12px;
+  color: var(--rwd-ink2, #9a9aa0);
+  font-size: 13.5px;
   font-family: inherit;
+  text-align: left;
   line-height: 1;
   cursor: pointer;
-  border-radius: 8px 8px 0 0;
-  transition: color 0.12s, background 0.12s;
+  border-radius: 9px;
+  transition: color 0.14s ease, background 0.14s ease;
 }
 
-.rwd-tab svg { width: 20px; height: 20px; }
+.rwd-tab .rwd-tab-ic { opacity: 0.9; }
 
-.rwd-tab:hover { color: var(--b3-theme-on-background, #e8e8ea); background: var(--b3-list-hover, rgba(255,255,255,0.04)); }
+.rwd-tab:hover {
+  color: var(--rwd-ink, #e8e8ea);
+  background: var(--rwd-hover);
+}
 
-.rwd-tab.on { color: var(--b3-theme-primary, #5b7cfa); }
+/*
+ * 选中态：主色淡底 + 主色图标 + 正文色文字。
+ * ⚠️ 文字不染主色：淡主色底上的主色文字 CR 只有 3~4（审计 R3 拦的就是这类），
+ *   强调交给图标与底块 —— 图标是图形元素，只受 3:1 非文本对比约束。
+ * ⚠️ 底色用 color-mix(primary 12%) 而非 --b3-theme-primary-light：
+ *   后者在部分主题里是**实心**强调色（审计 R2），会把整颗 pill 糊成蓝块。
+ */
+.rwd-tab.on {
+  color: var(--rwd-ink, #e8e8ea);
+  background: color-mix(in srgb, var(--b3-theme-primary, #5b7cfa) 12%, transparent);
+}
+.rwd-tab.on .rwd-tab-ic { color: var(--b3-theme-primary, #5b7cfa); }
 
-.rwd-tab.on .rwd-tab-label { font-weight: 500; }
+.rwd-tab.on .rwd-tab-label { font-weight: 600; }
+
+/* 左列底部说明：只表达「无需点保存」，不放按钮 */
+.rwd-rail-foot {
+  margin-top: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--b3-theme-on-surface-light, #9a9aa0);
+}
+.rwd-rail-foot .rwd-ic { width: 13px; height: 13px; }
+
+/* ===================== 右内容区 ===================== */
+
+.rwd-main {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* 一级页主区头部：当前 Tab 名 + 关闭 */
+.rwd-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--rwd-head-h);
+  flex: none;
+  box-sizing: border-box;
+  padding: 0 12px 0 20px;
+  border-bottom: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+}
+
+.rwd-head-title {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--rwd-ink, #e8e8ea);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 .rwd-close {
-  margin-left: auto;
   width: 30px; height: 30px;
+  flex: none;
   display: flex; align-items: center; justify-content: center;
   border: none; background: none;
   color: var(--b3-theme-on-surface-light, #9a9aa0);
   border-radius: 8px; cursor: pointer;
 }
-.rwd-close svg { width: 16px; height: 16px; }
 .rwd-close:hover { background: var(--b3-list-hover, rgba(255,255,255,0.06)); color: var(--b3-theme-on-background, #e8e8ea); }
 
 /* ===================== 内容区 ===================== */
@@ -228,30 +373,40 @@
   flex: 1;
   min-height: 0;
   overflow-y: auto;
-  padding: 16px 20px 20px;
+  padding: 16px 20px 22px;
   scrollbar-width: thin;
-  /*
-   * 2026-10-10 玻璃化配套：极淡实色衬底（主题背景 3%）。
-   * 面板本体已 92% 透明 + backdrop-filter 透出背景，若这里全透明，
-   * 长文滚动时背后的正文会「透」到内容区干扰阅读；3% 几乎不可见，
-   * 但足以稳住对比度（玻璃感仍由面板外缘承担）。
-   */
-  background: color-mix(in srgb, var(--b3-theme-background, #1c1c1e) 3%, transparent);
+  scrollbar-color: var(--b3-border-color, rgba(127, 127, 127, 0.4)) transparent;
+}
+/* 这层衬底已在面板 96% 时失去意义（透不上来），删除以免
+   深色主题下内容区比面板更黑，出现「中间一块更暗」的色块。
+   滚动条做细：10px 轨道 + 3px 内缩圆角，比系统默认的宽条轻。 */
+.rwd-body::-webkit-scrollbar { width: 10px; }
+.rwd-body::-webkit-scrollbar-track { background: transparent; }
+.rwd-body::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  border: 3px solid transparent;
+  background: var(--b3-border-color, rgba(127, 127, 127, 0.4));
+  background-clip: content-box;
 }
 
 .rwd-group-title {
-  margin: 14px 0 8px;
+  margin: 16px 0 8px 2px;
   font-size: var(--rwd-fs-group);
-  font-weight: 500;
-  color: var(--b3-theme-on-surface-light, #9a9aa0);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  color: var(--rwd-ink3, #9a9aa0);
 }
 /* 第一个分组紧贴顶部，不留多余空白 */
 .rwd-body > .rwd-card:first-of-type { margin-top: 0; }
 
 .rwd-card {
-  border-radius: 10px;
-  background: var(--b3-theme-surface, rgba(255, 255, 255, 0.03));
-  border: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.07));
+  border-radius: 12px;
+  /* 白卡浮在浅灰面板上（深色主题由令牌翻成 4.5% 白）—— 层次反了的话
+     灰卡片压灰面板会显得整块「糊住」，这是此前与 demo 最大的观感差。 */
+  background: var(--rwd-card-bg, #fff);
+  /* 发丝线（0.5px）而非 1px：卡内每条行分隔也是 0.5px，
+     外框比内线粗会让卡片像「两个框套着」。 */
+  border: 0.5px solid var(--rwd-line, rgba(255, 255, 255, 0.07));
   overflow: hidden;
 }
 
@@ -266,7 +421,7 @@
   padding: 0 14px;
   /* 2026-10-10 节奏美化：1px → 0.5px。1px 在多行密集时形成明显横向栅格，
      0.5px 与本项目既有的 0.5px 描边体系一致，更贴近思源原生观感。 */
-  border-bottom: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.05));
+  border-bottom: 0.5px solid var(--rwd-line, rgba(255, 255, 255, 0.05));
 }
 .rwd-card > .rw-row:last-child,
 .rwd-card > div:last-child .rw-row:last-child { border-bottom: none; }
@@ -336,7 +491,7 @@
   max-width: 100%;
   font-size: var(--rwd-fs-hint);
   line-height: 1.3;
-  color: var(--b3-theme-on-surface-light, #9a9aa0);
+  color: var(--rwd-ink3, #9a9aa0);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -347,7 +502,7 @@
 .rw-preset-current {
   font-size: var(--rwd-fs-hint);
   line-height: 1.4;
-  color: var(--b3-theme-on-surface-light, #9a9aa0);
+  color: var(--rwd-ink3, #9a9aa0);
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -363,39 +518,106 @@
  *     0.5px（配合 0.5px 描边体系）更接近思源原生观感。
  */
 .rw-label { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
-.rw-label-text { font-size: var(--rwd-fs-label); line-height: 1.4; }
+/* demo 的行标题是「近黑 + 中等字重」；纯 400 在 14px 下会显得发虚。 */
+.rw-label-text { font-size: var(--rwd-fs-label); font-weight: 500; line-height: 1.4; color: var(--rwd-ink, #e8e8ea); }
 .rw-hint {
   font-size: var(--rwd-fs-hint);
-  color: var(--b3-theme-on-surface-light, #8a8a90);
+  color: var(--rwd-ink3, #8a8a90);
   line-height: 1.5;
   /*
    * 最多 2 行 + 超出省略（2026-10-10）。
    * 实测：说明放开到 3 行时，同卡片的行高会随文字长度在 48/49/60px 之间跳，
-   * 反而更参差。限2 行后行高只在「单行说明 48px / 双行说明 60px」两档稳定，
-   * 观感整齐且信息不丢（超出的部分可悬停看title）。
+   * 反而更参差。限2 行后行高只在「单行说明 48px / 双行说明 60px」两档稳定。
+   * 2026-11-06 起 hint 被压到 ≤16 字，实际不会再触顶；需要讲全的长引导改走 info ⓘ。
    */
   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
 }
 
+/* ---- 行内 ⓘ（2026-11-06 长说明收进问号） ----
+ * 用 inline-flex 而不是给 .rw-label-text 加 flex：标签本身要能换行，
+ * 改 flex 会让长标签变成不换行的匿名 flex 项直接溢出。
+ */
+.rw-info {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  margin-left: 4px;
+  /* 与 14px 行高的标签基线上对齐，比 middle 略下移 */
+  vertical-align: -2px;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--rwd-ink3, #8a8a90) 45%, transparent);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--rwd-ink3, #8a8a90);
+  cursor: help;
+  flex: none;
+  transition: color 120ms ease, border-color 120ms ease;
+}
+/* 只有问号 + 圆点：外圈由按钮自身的 14px 描边提供，SVG 不再画第二个圆
+ * （两圈同心叠在一起会发灰，看着像瞄准镜而不是提示） */
+.rw-info svg { width: 11px; height: 11px; display: block; fill: none; stroke: currentColor; stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+.rw-info:hover,
+.rw-info:focus-visible,
+.rw-info[aria-expanded="true"] {
+  color: var(--b3-theme-primary, #3574f0);
+  border-color: color-mix(in srgb, var(--b3-theme-primary, #3574f0) 60%, transparent);
+  outline: none;
+}
+
+/* ---- ⓘ 浮层（body 单例；避开 .rwd-card 的 overflow:hidden） ---- */
+.rw-tip {
+  position: fixed;
+  left: 0;
+  top: 0;
+  z-index: 10000;
+  max-width: 288px;
+  padding: 9px 11px;
+  box-sizing: border-box;
+  border-radius: 9px;
+  background: rgba(34, 37, 43, 0.96);
+  color: #f3f4f6;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.55;
+  text-align: left;
+  white-space: normal;
+  box-shadow: 0 8px 24px rgba(10, 12, 16, 0.3);
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 120ms ease-out, transform 120ms ease-out;
+}
+.rw-tip.on { opacity: 1; transform: none; }
+
 .rw-control { display: flex; align-items: center; gap: 8px; flex: none; }
 
-/* ---- 开关（44×24 胶囊） ---- */
+/* ---- 开关（42×25 胶囊，对齐 demo / iOS 比例） ----
+ * 关闭态轨道吃 field2（比卡片深一档），滑块恒为白 + 阴影 ——
+ * 原先关闭态滑块是灰的，和轨道糊成一团，看不出「这是一颗能拨的钮」。
+ */
 .rw-switch { position: relative; display: inline-flex; cursor: pointer; }
 .rw-switch input { position: absolute; opacity: 0; width: 0; height: 0; }
 .rw-switch-track {
-  width: 44px; height: 24px; border-radius: 12px;
-  background: var(--b3-theme-surface, rgba(255,255,255,0.12));
-  border: 1px solid var(--b3-border-color, rgba(255,255,255,0.1));
-  transition: background 0.15s;
+  width: 42px; height: 25px; border-radius: 999px;
+  /* 无全局重置：不写 border-box 时 42×25 会被 2px 内边距撑成 46×29，
+     滑块行程也从 17 变成 21，和 demo / iOS 的比例对不上。 */
+  box-sizing: border-box;
+  background: var(--rwd-field2, rgba(255,255,255,0.17));
+  transition: background 0.18s ease;
   display: flex; align-items: center; padding: 2px;
 }
 .rw-switch-thumb {
-  width: 18px; height: 18px; border-radius: 50%;
-  background: var(--b3-theme-on-surface-light, #9a9aa0);
-  transition: transform 0.15s, background 0.15s;
+  width: 21px; height: 21px; border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24);
+  transition: transform 0.18s cubic-bezier(0.32, 0.72, 0, 1);
 }
-.rw-switch input:checked + .rw-switch-track { background: var(--b3-theme-primary, #5b7cfa); border-color: transparent; }
-.rw-switch input:checked + .rw-switch-track .rw-switch-thumb { transform: translateX(20px); background: #fff; }
+.rw-switch input:checked + .rw-switch-track { background: var(--b3-theme-primary, #5b7cfa); }
+.rw-switch input:checked + .rw-switch-track .rw-switch-thumb { transform: translateX(17px); }
 
 /* ---- 滑块 ---- */
 .rw-slider-wrap { display: flex; align-items: center; gap: 10px; }
@@ -411,18 +633,18 @@
   text-align: center;
   border-radius: 3px;
   font-size: 10px;
-  color: var(--b3-theme-on-surface-light, #9a9aa0);
-  background: var(--b3-theme-surface, rgba(127, 127, 127, 0.12));
+  color: var(--rwd-ink3, #9a9aa0);
+  background: var(--rwd-field, rgba(127, 127, 127, 0.12));
   user-select: none;
 }
 /* 双滑块时把控制区收窄，给标签腾出空间（否则两滑块 + 两个数值会挤爆一行） */
 .rw-slider-paired { flex: 1 1 auto; min-width: 0; }
 .rw-slider-paired input[type="range"] { flex: 1 1 auto; min-width: 80px; width: auto; }
 .rw-slider-wrap input[type="range"] {
-  width: 140px; height: 3px; appearance: none; -webkit-appearance: none;
+  width: 140px; height: 4px; appearance: none; -webkit-appearance: none;
   background: linear-gradient(to right,
     var(--b3-theme-primary, #5b7cfa) 0 var(--rw-pct, 50%),
-    var(--b3-theme-surface, rgba(255,255,255,0.14)) var(--rw-pct, 50%) 100%);
+    var(--rwd-field2, rgba(255,255,255,0.17)) var(--rw-pct, 50%) 100%);
   border-radius: 2px; outline: none; cursor: pointer;
 }
 .rw-slider-wrap input[type="range"]::-webkit-slider-thumb {
@@ -430,24 +652,36 @@
   background: #fff; border: 2px solid var(--b3-theme-primary, #5b7cfa);
   box-shadow: 0 1px 3px rgba(0,0,0,0.3);
 }
-.rw-value { font-size: var(--rwd-fs-value); color: var(--b3-theme-on-surface-light, #9a9aa0); min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
+.rw-value { font-size: var(--rwd-fs-value); color: var(--rwd-ink2, #5f646d); min-width: 40px; text-align: right; font-variant-numeric: tabular-nums; }
 
 /* ---- 数值步进（数值 − ＋，对齐 Readest） ---- */
-.rw-stepper { display: inline-flex; align-items: center; gap: 2px; }
+/* 步进器做成一个 32px 高的凹槽（– 值 +），与下拉/分段按钮同高同底色；
+   此前是两个独立小方块（26px）+ 裸数字，比旁边的下拉矮一截、左边缘也对不齐。 */
+.rw-stepper {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  height: 32px;
+  padding: 2px;
+  border-radius: 8px;
+  box-sizing: border-box;
+  background: var(--rwd-field, rgba(255,255,255,0.07));
+}
 .rw-stepper button {
-  width: 26px; height: 26px; border: none; border-radius: 6px;
-  background: var(--b3-theme-surface, rgba(255,255,255,0.07));
-  color: var(--b3-theme-on-background, #e8e8ea);
+  width: 28px; height: 28px; border: none; border-radius: 6px;
+  background: none;
+  color: var(--rwd-ink, #e8e8ea);
   font-size: var(--rwd-fs-stepbtn); line-height: 1; cursor: pointer;
 }
-.rw-stepper button:hover { background: var(--b3-list-hover, rgba(255,255,255,0.1)); }
+.rw-stepper button:hover { background: var(--rwd-hover2, rgba(255,255,255,0.1)); }
 /* 只读态（2026-10-07）：跟随思源字号那行 —— 值可见但不可改。
    用 :disabled 而非只降透明度，是为了让浏览器原生的禁用光标/焦点行为一并生效。 */
 .rw-stepper button:disabled { cursor: default; opacity: 0.45; }
-.rw-stepper button:disabled:hover { background: var(--b3-theme-surface, rgba(255,255,255,0.07)); }
-.rw-row-readonly .rw-label-text { color: var(--b3-theme-on-surface-light, #8a8a90); }
+.rw-stepper button:disabled:hover { background: none; }
+.rw-row-readonly .rw-label-text { color: var(--rwd-ink3, #8a8a90); }
 .rw-stepper-value {
   min-width: 52px; text-align: center; font-size: var(--rwd-fs-value);
+  color: var(--rwd-ink, #e8e8ea);
   font-variant-numeric: tabular-nums;
 }
 
@@ -456,12 +690,13 @@
   /* 2026-10-10 对齐改造：min-width:132px → 统一列宽，令牌一处可调 */
   width: min(var(--rwd-ctrl-w), 40vw);
   min-width: 0;
-  height: 30px; padding: 0 8px;
-  border-radius: 6px; border: 1px solid var(--b3-border-color, rgba(255,255,255,0.1));
-  background: var(--b3-theme-surface, rgba(255,255,255,0.05));
-  color: var(--b3-theme-on-background, #e8e8ea);
+  height: 32px; padding: 0 10px;
+  border-radius: 8px; border: none;
+  background: var(--rwd-field, rgba(255,255,255,0.05));
+  color: var(--rwd-ink, #e8e8ea);
   font-size: var(--rwd-fs-ctrl); font-family: inherit; cursor: pointer;
 }
+.rw-select:focus { outline: none; box-shadow: inset 0 0 0 1px var(--b3-theme-primary, #5b7cfa); }
 
 /* ---- 分段按钮 ---- */
 /* 2026-10-10 对齐改造：容器取统一列宽（此前 inline-flex + 内容定宽 = 109px，
@@ -470,18 +705,35 @@
 .rw-segmented {
   display: inline-flex;
   width: min(var(--rwd-ctrl-w), 40vw);
+  height: 32px;
+  box-sizing: border-box;
   flex: none;
-  padding: 2px; border-radius: 7px;
-  background: var(--b3-theme-surface, rgba(255,255,255,0.06));
+  padding: 3px; border-radius: 9px;
+  background: var(--rwd-field, rgba(255,255,255,0.06));
 }
 .rw-segmented button {
   flex: 1 1 0;         /* 均分容器宽度 */
   min-width: 0;        /* 允许收缩到内容以下，配合 ellipsis */
-  padding: 4px 6px; border: none; border-radius: 5px; background: none;
-  color: var(--b3-theme-on-surface-light, #9a9aa0); font-size: var(--rwd-fs-seg); font-family: inherit; cursor: pointer;
+  height: 26px;
+  padding: 0 8px; border: none; border-radius: 7px; background: none;
+  color: var(--rwd-ink2, #9a9aa0); font-size: var(--rwd-fs-seg); font-family: inherit; cursor: pointer;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  transition: background 0.14s ease, color 0.14s ease, box-shadow 0.14s ease;
 }
-.rw-segmented button.on { background: var(--b3-theme-primary, #5b7cfa); color: #fff; }
+.rw-segmented button:hover:not(.on) { color: var(--rwd-ink, #e8e8ea); }
+/*
+ * 选中胶囊（2026-11-06 对齐 demo / iOS）：
+ * 旧实现是主色实心 + 白字 —— 在浅色主题里像一颗「按钮」而不是「滑块」，
+ * 同一张卡片里两个控件都在喊主色，非常吵。demo 的做法是：
+ *   凹槽（浅灰）里浮一颗白胶囊，靠阴影 + 描边表达凸起，文字用正文色。
+ * 深色主题由 --rwd-pill-bg / --rwd-pill-shadow 翻成 14% 白 + 亮描边。
+ */
+.rw-segmented button.on {
+  background: var(--rwd-pill-bg, #fff);
+  color: var(--rwd-ink, #1c1d21);
+  font-weight: 550;
+  box-shadow: var(--rwd-pill-shadow);
+}
 .rw-segmented button:disabled { cursor: default; opacity: 0.55; }
 
 /* ---- 胶囊标签（单选、可换行、按内容宽度）---- */
@@ -493,11 +745,12 @@
   max-width: var(--rwd-ctrl-w);
 }
 .rw-chips button {
-  padding: 4px 12px; border: 1px solid var(--b3-border-color, rgba(255,255,255,0.14));
-  border-radius: 999px; background: var(--b3-theme-surface, rgba(255,255,255,0.06));
-  color: var(--b3-theme-on-surface-light, #9a9aa0); font-size: var(--rwd-fs-seg); font-family: inherit; cursor: pointer;
+  padding: 4px 12px; border: none;
+  border-radius: 999px; background: var(--rwd-field, rgba(255,255,255,0.06));
+  color: var(--rwd-ink2, #9a9aa0); font-size: var(--rwd-fs-seg); font-family: inherit; cursor: pointer;
   white-space: nowrap;
 }
+.rw-chips button:hover:not(.on) { color: var(--rwd-ink, #e8e8ea); }
 .rw-chips button.on {
   border-color: var(--b3-theme-primary, #5b7cfa);
   background: var(--b3-theme-primary, #5b7cfa); color: #fff;
@@ -510,7 +763,7 @@
   width: 26px; height: 26px; padding: 0; border: 1px solid var(--b3-border-color, rgba(255,255,255,0.14));
   border-radius: 50%; background: none; cursor: pointer;
 }
-.rw-color-hex { font-size: 11px; color: var(--b3-theme-on-surface-light, #9a9aa0); font-variant-numeric: tabular-nums; }
+.rw-color-hex { font-size: 11px; color: var(--rwd-ink3, #9a9aa0); font-variant-numeric: tabular-nums; }
 .rw-color-row { display: inline-flex; align-items: center; gap: 12px; }
 .rw-quick-colors { display: inline-flex; gap: 6px; }
 .rw-quick-colors button {
@@ -590,14 +843,15 @@
 /* ---- 输入框 ---- */
 .rw-entry { display: inline-flex; align-items: center; gap: 6px; }
 .rw-entry input[type="text"] {
-  min-width: 150px; height: 28px; padding: 0 8px;
-  border-radius: 6px; border: 1px solid var(--b3-border-color, rgba(255,255,255,0.1));
-  background: var(--b3-theme-surface, rgba(255,255,255,0.05));
-  color: var(--b3-theme-on-background, #e8e8ea); font-size: 12.5px; font-family: inherit;
+  min-width: 150px; height: 32px; padding: 0 10px;
+  border-radius: 8px; border: none;
+  background: var(--rwd-field, rgba(255,255,255,0.05));
+  color: var(--rwd-ink, #e8e8ea); font-size: var(--rwd-fs-ctrl); font-family: inherit;
 }
+.rw-entry input[type="text"]:focus { outline: none; box-shadow: inset 0 0 0 1px var(--b3-theme-primary, #5b7cfa); }
 .rw-entry-go {
-  height: 28px; padding: 0 10px; border: none; border-radius: 6px;
-  background: var(--b3-theme-primary, #5b7cfa); color: #fff; font-size: 12px; font-family: inherit; cursor: pointer;
+  height: 32px; padding: 0 12px; border: none; border-radius: 8px;
+  background: var(--b3-theme-primary, #5b7cfa); color: #fff; font-size: var(--rwd-fs-seg); font-family: inherit; cursor: pointer;
 }
 
 /*
@@ -608,52 +862,65 @@
 .rw-action {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  height: 28px;
-  padding: 0 9px 0 12px;
-  background: var(--b3-theme-surface, rgba(255, 255, 255, 0.09));
-  border: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.14));
-  color: var(--b3-theme-on-background, #e8e8ea);
+  gap: 4px;
+  height: 32px;
+  border-radius: 8px;
+  padding: 0 10px 0 13px;
+  font-size: var(--rwd-fs-ctrl);
+  font-family: inherit;
+  cursor: pointer;
+  background: var(--rwd-field, rgba(255, 255, 255, 0.09));
+  border: 0.5px solid var(--rwd-line, rgba(255, 255, 255, 0.14));
+  color: var(--rwd-ink, #e8e8ea);
 }
-.rw-action:hover { background: var(--b3-list-hover, rgba(255, 255, 255, 0.15)); }
+.rw-action:hover { background: var(--rwd-hover2, rgba(255, 255, 255, 0.15)); }
 .rw-action svg { width: 13px; height: 13px; opacity: 0.7; }
 
 /* ===================== 底部操作条 ===================== */
 
 .rwd-footer {
   display: flex; align-items: center; justify-content: space-between;
-  padding: 12px 20px; border-top: 1px solid var(--b3-border-color, rgba(255,255,255,0.08));
+  gap: 12px;
+  height: 56px;
+  box-sizing: border-box;
+  padding: 0 16px 0 20px;
+  border-top: 0.5px solid var(--rwd-line, rgba(255,255,255,0.08));
   flex: none;
 }
-.rwd-btn { height: 32px; padding: 0 16px; border-radius: 7px; font-size: var(--rwd-fs-ctrl); font-family: inherit; cursor: pointer; border: 1px solid transparent; }
-.rwd-btn-ghost { background: none; color: var(--b3-theme-on-surface-light, #9a9aa0); }
-.rwd-btn-ghost:hover { color: var(--b3-theme-on-background, #e8e8ea); }
-.rwd-btn-primary { background: var(--b3-theme-primary, #5b7cfa); color: #fff; }
+.rwd-btn { height: 32px; padding: 0 16px; border-radius: 9px; font-size: var(--rwd-fs-ctrl); font-family: inherit; cursor: pointer; border: none; transition: background 0.14s ease, color 0.14s ease, transform 0.1s ease; }
+.rwd-btn:active { transform: scale(0.985); }
+.rwd-btn-ghost { background: none; color: var(--rwd-ink2, #9a9aa0); }
+.rwd-btn-ghost:hover { background: var(--rwd-hover); color: var(--rwd-ink, #e8e8ea); }
+.rwd-btn-primary { background: var(--b3-theme-primary, #5b7cfa); color: #fff; font-weight: 550; box-shadow: 0 2px 8px color-mix(in srgb, var(--b3-theme-primary, #5b7cfa) 35%, transparent); }
 /* 禁用态：文档树未打勾时「确定选择」不可点（灰底 + 禁止光标） */
 .rwd-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .rwd-btn:disabled:hover { background: var(--b3-theme-primary, #5b7cfa); }
 /* 底部右侧按钮组（docTree：「确定选择」+「完成」并排） */
 .rwd-footer-actions { display: flex; align-items: center; gap: 8px; }
 
-/* ===================== 搜索条（2026-10-07 第 3 批） ===================== */
-
+/* ===================== 搜索条（2026-11-06 移入左列） =====================
+ * 宽度只有 176px（196 - 左右各 10），所以不再「图标 + 输入框」并排占两列，
+ * 而是把图标绝对定位到输入框内部，输入框吃掉整行宽度。
+ * 搜索是「找设置项」的导航动作，和 Tab 同一类，放左列比横在内容区顶部更合理。
+ */
 .rwd-searchbar {
+  position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 12px;
-  border-bottom: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+  gap: 6px;
+  margin-top: 12px;
   flex: none;
-  /* 同 .rwd-tabs / .rwd-subhead：border-box 让 min-height 含 padding。 */
-  box-sizing: border-box;
-  min-height: var(--rwd-head-search);
 }
 
 .rwd-search-icon {
+  position: absolute;
+  left: 9px;
+  top: 50%;
   width: 14px;
   height: 14px;
-  flex: none;
-  color: var(--b3-theme-on-surface-light, #9a9aa0);
+  transform: translateY(-50%);
+  pointer-events: none;
+  color: var(--rwd-ink3, #9a9aa0);
 }
 
 /*
@@ -664,36 +931,39 @@
 .rwd-search {
   flex: 1;
   min-width: 0;
-  height: 26px;
+  height: 30px;
   border: none;
-  border-radius: 6px;
-  padding: 0 8px;
-  background: var(--b3-theme-surface, rgba(255, 255, 255, 0.06));
-  color: var(--b3-theme-on-background, #e8e8ea);
+  border-radius: 8px;
+  padding: 0 8px 0 28px;
+  background: var(--rwd-field, rgba(255, 255, 255, 0.06));
+  color: var(--rwd-ink, #e8e8ea);
   font-size: 12.5px;
   font-family: inherit;
   outline: none;
   appearance: none;
   -webkit-appearance: none;
+  transition: background 0.14s ease, box-shadow 0.14s ease;
 }
-.rwd-search::placeholder { color: var(--b3-theme-on-surface-light, #8a8a90); }
+.rwd-search::placeholder { color: var(--rwd-ink3, #8a8a90); }
 /*
  *聚焦态用 inset 描边而非 border：
  * input 默认 content-box，给 border 会让盒模型凭空多 2px —— 每次聚焦/失焦
  * 输入框宽度就跳一下（父容器是 flex，字号跳动很难看）。inset box-shadow
  * 不参与布局，视觉上等效于描边。
  */
-.rwd-search:focus { box-shadow: inset 0 0 0 1px var(--b3-theme-primary, #5b7cfa); }
+.rwd-search:focus { background: var(--b3-theme-background, rgba(255, 255, 255, 0.09)); box-shadow: inset 0 0 0 1px var(--b3-theme-primary, #5b7cfa); }
 .rwd-search::-webkit-search-cancel-button,
 .rwd-search::-webkit-search-decoration { -webkit-appearance: none; appearance: none; }
 
 .rwd-search-count {
   flex: none;
-  font-size: 11px;
-  padding: 1px 7px;
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--b3-theme-on-surface-light, #9a9aa0);
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 4px 6px;
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--b3-theme-primary, #5b7cfa) 14%, transparent);
+  color: var(--b3-theme-primary, #5b7cfa);
+  font-variant-numeric: tabular-nums;
 }
 
 .rwd-search-clear {
@@ -712,47 +982,43 @@
 .rwd-search-clear svg { width: 13px; height: 13px; }
 .rwd-search-clear:hover { background: var(--b3-list-hover, rgba(255, 255, 255, 0.08)); color: var(--b3-theme-on-background, #e8e8ea); }
 
-/* ===================== 二级页头部（词典管理 / 发送目标 / 模板定制等） ===================== */
-
-/*
- * 高度贴合自身内容（--rwd-head-sub = 52px），不再补足到一级页的 98px。
- * 2026-10-10：此前 min-height:98px 造成标题下方约 52px 大片空白（真机反馈：丑）。
- * 现在高度收紧，内容垂直居中；少掉的高度还给内容区（.rwd-body flex:1），
- * 二级页能显示更多内容，无「进/出二级页」的头部跳动。
+/* ===================== 二级页头部（词典管理 / 发送目标 / 模板定制等） =====================
+ * 二级页左列整列隐藏（导航在子页里没有意义），主区铺满；
+ * 头部与一级页 .rwd-head 同高 56px、同一条底边线 —— 进出二级页时正文顶边不动。
  */
 .rwd-subhead {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 9px 12px;
-  border-bottom: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+  padding: 0 12px 0 16px;
+  border-bottom: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
   flex: none;
   /*
    * ⚠️ box-sizing 必须显式写 border-box（本项目无全局重置）。
    * 默认 content-box 下 min-height 只管**内容盒**，padding(上下 18px)+border(1px)
    * 会额外累加 ⇒ 设 52px 实际渲染成 71px，头部凭空多出 ~22px 空白。
-   * 改用 border-box 后：52px 即头部最终高度（含 padding），内容垂直居中无空带。
    */
   box-sizing: border-box;
-  /* 52px ≈ 与一级页 tab 条(56px)齐平；比旧值 98px 少 46px，该高度直接还给内容区。 */
-  min-height: var(--rwd-head-sub);
+  min-height: var(--rwd-head-h);
 }
 
 .rwd-back {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
-  height: 26px;
+  gap: 4px;
+  height: 30px;
   padding: 0 10px 0 7px;
   border: none;
-  border-radius: 7px;
-  background: var(--b3-theme-surface, rgba(255, 255, 255, 0.06));
-  color: var(--b3-theme-on-background, #e8e8ea);
-  font-size: 12.5px;
+  border-radius: 8px;
+  background: none;
+  color: var(--b3-theme-on-surface-light, #9a9aa0);
+  font-size: 13px;
   font-family: inherit;
   cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
 }
-.rwd-back svg { width: 15px; height: 15px; }
+.rwd-back svg { width: 16px; height: 16px; }
+.rwd-back:hover { background: var(--b3-list-hover, rgba(127, 127, 127, 0.1)); color: var(--b3-theme-on-background, #e8e8ea); }
 .rwd-back:hover { background: var(--b3-list-hover, rgba(255, 255, 255, 0.12)); }
 
 .rwd-subhead-title {
@@ -811,9 +1077,9 @@
   align-items: center;
   justify-content: space-between;
   gap: 16px;
-  min-height: 44px;
+  min-height: 48px;
   padding: 4px 14px;
-  border-bottom: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.05));
+  border-bottom: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.05));
 }
 .rwd-card > .rwd-hit-row:last-child { border-bottom: none; }
 
@@ -859,9 +1125,13 @@
   white-space: nowrap;
 }
 
-/* ===================== 移动端：底部抽屉 ===================== */
-
-@media (max-width: 640px) {
+/* ===================== 移动端：底部抽屉 =====================
+ * 方案 A 是「左列 + 右内容」的横向结构，窄屏放不下 196px 左列，
+ * 故在 ≤720px 折回竖排：左列变成顶部「搜索 + 横向滚动 Tab」条，
+ * 主区占满剩余高度。面板仍是固定高度（理由见主 .rwd-panel 注释），
+ * 底部抽屉形态下给 88vh，Home Indicator 区不被内容压住。
+ */
+@media (max-width: 720px) {
   /* 移动端恢复压暗 + 模糊：底部抽屉本身盖住大半屏，透明底会让正文与面板「糊成一片」。
      桌面端无蒙版的理由（要边调边看）在手机上不成立。 */
   .rwd-backdrop {
@@ -870,24 +1140,43 @@
     -webkit-backdrop-filter: blur(12px) saturate(1.4);
   }
   .rwd-panel {
-    /* 同样必须固定高度（见主 .rwd-panel 的注释）。
-       移动端留 88vh：底部抽屉形态下方的 Home Indicator 区不能被内容压住，
-       故比桌面多给6vh—— 但依然是固定值，不是 max-height。 */
+    flex-direction: column;
     width: 100%; max-width: none;
-    height: min(620px, 88vh);
+    height: min(680px, 88vh);
     border-radius: 16px 16px 0 0;
     align-self: flex-end;
   }
-  .rw-swatches { grid-template-columns: repeat(2, 1fr); }
-  .rwd-tab { padding: 8px 10px 10px; }
-  .rwd-tab-label { font-size: 11px; }
-  /* 2026-10-24 移动端适配 Phase 4：5+ 个 tab 在窄屏必然溢出 → 横向滚动 */
+  /* 左列横过来：标题与「改动即时保存」隐藏（窄屏没有它们的空间），
+     搜索 + Tab 条压缩成顶部一条。 */
+  .rwd-rail {
+    width: 100%;
+    flex: none;
+    flex-direction: column;
+    padding: 0 12px 9px;
+    border-right: none;
+    border-bottom: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+  }
+  .rwd-rail-head { display: none; }
+  .rwd-searchbar { margin-top: 10px; }
   .rwd-tabs {
+    flex-direction: row;
+    gap: 2px;
+    margin-top: 8px;
     overflow-x: auto;
     scrollbar-width: none;
   }
   .rwd-tabs::-webkit-scrollbar { display: none; }
-  .rwd-tab { flex-shrink: 0; }
+  .rwd-tab {
+    flex: 0 0 auto;
+    height: 32px;
+    padding: 0 10px;
+    gap: 6px;
+    font-size: 13px;
+  }
+  .rwd-tab-ic { width: 15px; height: 15px; }
+  .rwd-rail-foot { display: none; }
+  .rwd-head { padding: 0 10px 0 16px; }
+  .rw-swatches { grid-template-columns: repeat(2, 1fr); }
 }
 
 /* ===================== 词典管理（二级页内容） ===================== */
@@ -1275,26 +1564,24 @@
   padding: 9px 12px;
   cursor: pointer;
   list-style: none;           /* 去掉 Chrome 默认三角，改用自绘 chevron */
-  border-radius: 9px;
-  border: 1px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
-  background: rgba(255, 255, 255, 0.03);
-  font-size: 12.5px;
+  border-radius: 12px;
+  border: 0.5px solid var(--b3-border-color, rgba(255, 255, 255, 0.08));
+  background: var(--b3-theme-surface, rgba(255, 255, 255, 0.03));
+  font-size: 13px;
   color: var(--b3-theme-on-background, #e8e8ea);
   user-select: none;
 }
 .rwd-group-summary::-webkit-details-marker { display: none; }
 .rwd-group-summary:hover { background: rgba(255, 255, 255, 0.07); }
 
-/* 收起时箭头朝下，展开时朝上（Svelte/原生 details 自带 open 态） */
+/* 收起时箭头朝右，展开时朝下（Svelte/原生 details 自带 open 态） */
 .rwd-group-chevron {
-  display: inline-block;
-  font-size: 16px;
-  line-height: 1;
+  width: 14px;
+  height: 14px;
   color: var(--b3-theme-on-surface-light, #9a9aa0);
-  transform: rotate(90deg);
   transition: transform 0.15s ease;
 }
-.rwd-group-collapsed[open] .rwd-group-chevron { transform: rotate(-90deg); }
+.rwd-group-collapsed[open] .rwd-group-chevron { transform: rotate(90deg); }
 
 .rwd-group-summary-title { flex: 1; font-weight: 500; }
 

@@ -10,6 +10,7 @@
 -->
 <script lang="ts">
   import { t } from "../i18n/index.ts";
+  import { ICONS } from "./icons.ts";
   export let zoomLabel = "";
   export let pdfCurrentPage = 0;
   export let pdfTotalPages = 0;
@@ -28,23 +29,23 @@
     class="reader-btn reader-zoom-btn"
     title={t("缩小（⌘/Ctrl + -）")}
     on:click={onZoomOut}
-  >−</button>
+  ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.zoomOut}</svg></button>
   <span class="reader-zoom-label">{zoomLabel}</span>
   <button
     class="reader-btn reader-zoom-btn"
     title={t("放大（⌘/Ctrl + =）")}
     on:click={onZoomIn}
-  >+</button>
+  ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.zoomIn}</svg></button>
   <button
     class="reader-btn reader-zoom-btn"
     title={t("适应宽度（⌘/Ctrl + 1）")}
     on:click={onFitWidth}
-  >↔</button>
+  ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.fitWidth}</svg></button>
   <button
     class="reader-btn reader-zoom-btn"
     title={t("适应整页（⌘/Ctrl + 2）")}
     on:click={onFitPage}
-  >⊡</button>
+  ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.fitPage}</svg></button>
 </span>
 
 <!-- PDF「第 N/T 页」+ 跳转输入框（对齐 Obsidian PDF++ Go to page） -->
@@ -54,7 +55,7 @@
     title={t("上一页（←）")}
     disabled={!pdfTotalPages}
     on:click={() => onGoPage(Math.max(1, pdfCurrentPage - 1))}
-  >‹</button>
+  ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.chevronLeft}</svg></button>
   <span class="reader-page-label">
     <input
       class="reader-page-input"
@@ -75,5 +76,5 @@
     title={t("下一页（→）")}
     disabled={!pdfTotalPages}
     on:click={() => onGoPage(Math.min(pdfTotalPages, pdfCurrentPage + 1))}
-  >›</button>
+  ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.chevronRight}</svg></button>
 </span>
