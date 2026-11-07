@@ -264,7 +264,9 @@ export function buildChangelogDialogHtml(
             }</div></section>`
         )
         .join("");
-      return `<section class="cl-page" data-cl-page="${i}"${i === active ? "" : " hidden"}>
+      return `<section class="cl-page" data-cl-page="${i}"${i === active ? "" : " hidden"}${
+        isCurrent ? ' data-cl-current="true"' : ""
+      }>
         <div class="cl-ver-head">
           <h2>v${escapeHtml(v.version)}</h2>
           ${v.date ? `<time>${escapeHtml(v.date)}</time>` : ""}
@@ -272,15 +274,21 @@ export function buildChangelogDialogHtml(
         </div>
         ${lead}
         <div class="cl-groups">${groups}</div>
-        <footer class="cl-foot">
-          <span>${escapeHtml(isCurrent ? labels.current : labels.archived)}</span>
-          <button type="button" class="cl-ok" data-cl-ok>${escapeHtml(labels.ok)}</button>
-        </footer>
       </section>`;
     })
     .join("");
 
-  return `<div class="cl-dialog">
+  // 页脚放在滚动区之外：版本页再长，「知道了」也始终在弹窗底部
+  const foot = `<footer class="cl-foot">
+      <span class="cl-foot-status">${escapeHtml(
+        versions[active].version === cur ? labels.current : labels.archived
+      )}</span>
+      <button type="button" class="cl-ok" data-cl-ok>${escapeHtml(labels.ok)}</button>
+    </footer>`;
+
+  return `<div class="cl-dialog" data-cl-text-current="${escapeHtml(labels.current)}" data-cl-text-archived="${escapeHtml(
+    labels.archived
+  )}">
     <header class="cl-head">
       <div class="cl-script">What's new</div>
       <h1 class="cl-title">${escapeHtml(labels.title)}</h1>
@@ -294,6 +302,7 @@ export function buildChangelogDialogHtml(
       </nav>
       <main class="cl-main">${pages}</main>
     </div>
+    ${foot}
   </div>`;
 }
 
@@ -306,6 +315,10 @@ export function wireChangelogDialog(root: HTMLElement, onClose: () => void): voi
   const railButtons = Array.from(root.querySelectorAll<HTMLElement>("[data-cl-ver]"));
   const pages = Array.from(root.querySelectorAll<HTMLElement>("[data-cl-page]"));
   const main = root.querySelector<HTMLElement>(".cl-main");
+  const footStatus = root.querySelector<HTMLElement>(".cl-foot-status");
+  const dialogEl = root.querySelector<HTMLElement>(".cl-dialog");
+  const currentText = dialogEl?.getAttribute("data-cl-text-current") || "";
+  const archivedText = dialogEl?.getAttribute("data-cl-text-archived") || "";
 
   root.addEventListener("click", (ev) => {
     const target = ev.target as HTMLElement | null;
@@ -327,6 +340,9 @@ export function wireChangelogDialog(root: HTMLElement, onClose: () => void): voi
     pages.forEach((p, i) => {
       p.hidden = i !== idx;
     });
+    if (footStatus) {
+      footStatus.textContent = pages[idx]?.hasAttribute("data-cl-current") ? currentText : archivedText;
+    }
     if (main) main.scrollTop = 0;
     btn.scrollIntoView({ block: "nearest", inline: "nearest" });
   });

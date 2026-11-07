@@ -1442,7 +1442,9 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   --cl-accent: #ff7b74;
 }
 .re-changelog-dialog .b3-dialog__container {
-  max-width: 94vw;
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
   overflow: hidden;
   border-radius: 18px;
   box-shadow: 0 0 0 1px var(--cl-line), 0 2px 8px rgba(0, 0, 0, 0.08), 0 18px 48px rgba(0, 0, 0, 0.22);
@@ -1451,8 +1453,13 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
 .re-changelog-dialog .b3-dialog__header {
   display: none;
 }
+/* 思源现行内容挂在 __body（老版本是 __content），两代选择器都收 */
+.re-changelog-dialog .b3-dialog__body,
 .re-changelog-dialog .b3-dialog__content {
+  flex: 1;
+  min-height: 0;
   display: flex;
+  flex-direction: column;
   padding: 0;
   overflow: hidden;
 }
@@ -1464,7 +1471,7 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   flex: 1;
   min-width: 0;
   min-height: 0;
-  height: min(74vh, 720px);
+  height: 100%;
   display: flex;
   flex-direction: column;
   background: var(--cl-page);
@@ -1480,35 +1487,35 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
 .re-changelog-dialog .cl-head {
   position: relative;
   flex: none;
-  padding: 28px 36px 18px;
+  padding: 18px 28px 12px;
 }
 .re-changelog-dialog .cl-script {
   font-family: "Snell Roundhand", "Segoe Script", "Bradley Hand", cursive;
-  font-size: 24px;
+  font-size: 18px;
   line-height: 1;
   letter-spacing: 0.4px;
   color: var(--cl-ink-2);
-  opacity: 0.78;
+  opacity: 0.62;
 }
 .re-changelog-dialog .cl-title {
-  margin: 4px 0 8px;
-  font-size: 36px;
-  line-height: 1.12;
-  letter-spacing: -0.02em;
+  margin: 2px 0 4px;
+  font-size: 26px;
+  line-height: 1.18;
+  letter-spacing: -0.022em;
   font-weight: 750;
   color: var(--cl-ink);
 }
 .re-changelog-dialog .cl-sub {
   margin: 0;
-  max-width: 620px;
+  max-width: 560px;
   color: var(--cl-ink-3);
-  font-size: 13px;
-  line-height: 1.6;
+  font-size: 12.5px;
+  line-height: 1.55;
 }
 .re-changelog-dialog .cl-close {
   position: absolute;
-  top: 18px;
-  right: 20px;
+  top: 12px;
+  right: 14px;
   width: 32px;
   height: 32px;
   display: grid;
@@ -1534,25 +1541,39 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-columns: 184px minmax(0, 1fr);
+  grid-template-columns: 168px minmax(0, 1fr);
+  overflow: hidden;
 }
 .re-changelog-dialog .cl-rail {
   position: relative;
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
-  padding: 10px 12px 24px 24px;
+  overscroll-behavior: contain;
+  padding: 6px 10px 14px 20px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.18) transparent;
+}
+.re-changelog-dialog .cl-rail::-webkit-scrollbar {
+  width: 8px;
+}
+.re-changelog-dialog .cl-rail::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+  background-clip: padding-box;
 }
 .re-changelog-dialog .cl-rail::before {
   content: "";
   position: absolute;
-  left: 33px;
-  top: 34px;
-  bottom: 24px;
+  left: 28px;
+  top: 30px;
+  bottom: 18px;
   width: 1px;
   background: var(--cl-line);
 }
 .re-changelog-dialog .cl-rail-label {
-  margin: 0 0 10px 24px;
+  margin: 0 0 6px 22px;
   font-size: 11px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
@@ -1562,7 +1583,7 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   position: relative;
   display: block;
   width: 100%;
-  padding: 8px 10px 8px 24px;
+  padding: 6px 8px 6px 22px;
   border: 0;
   border-radius: 10px;
   background: transparent;
@@ -1575,10 +1596,10 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
 .re-changelog-dialog .cl-ver::before {
   content: "";
   position: absolute;
-  left: 4px;
-  top: 15px;
-  width: 11px;
-  height: 11px;
+  left: 3px;
+  top: 13px;
+  width: 9px;
+  height: 9px;
   border: 2px solid var(--cl-line);
   border-radius: 50%;
   background: var(--cl-page);
@@ -1602,14 +1623,14 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 650;
   letter-spacing: -0.01em;
 }
 .re-changelog-dialog .cl-ver-date {
   display: block;
-  margin-top: 1px;
-  font-size: 11px;
+  margin-top: 0;
+  font-size: 10.5px;
   color: var(--cl-ink-3);
 }
 .re-changelog-dialog .cl-new {
@@ -1636,8 +1657,21 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
 /* ---- 右栏详情 ---- */
 .re-changelog-dialog .cl-main {
   min-width: 0;
+  min-height: 0;
   overflow-y: auto;
-  padding: 14px 32px 26px 8px;
+  overscroll-behavior: contain;
+  padding: 8px 26px 16px 6px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(0, 0, 0, 0.18) transparent;
+}
+.re-changelog-dialog .cl-main::-webkit-scrollbar {
+  width: 8px;
+}
+.re-changelog-dialog .cl-main::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.18);
+  background-clip: padding-box;
 }
 .re-changelog-dialog .cl-page {
   animation: re-cl-page-in 0.22s ease both;
@@ -1659,39 +1693,39 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   display: flex;
   align-items: flex-end;
   flex-wrap: wrap;
-  gap: 12px;
-  padding: 4px 0 12px;
+  gap: 10px;
+  padding: 0 0 8px;
 }
 .re-changelog-dialog .cl-ver-head h2 {
   margin: 0;
-  font-size: 28px;
-  line-height: 1.1;
-  letter-spacing: -0.025em;
+  font-size: 20px;
+  line-height: 1.15;
+  letter-spacing: -0.02em;
   font-weight: 750;
   color: var(--cl-ink);
 }
 .re-changelog-dialog .cl-ver-head time {
-  padding-bottom: 4px;
+  padding-bottom: 2px;
   color: var(--cl-ink-3);
   font-size: 12px;
 }
 .re-changelog-dialog .cl-lead {
-  margin: 0 0 16px;
-  padding: 12px 15px;
-  border-radius: 12px;
+  margin: 0 0 10px;
+  padding: 9px 12px;
+  border-radius: 10px;
   background: var(--cl-brand-soft);
   color: var(--cl-ink-2);
-  font-size: 13px;
-  line-height: 1.7;
+  font-size: 12.5px;
+  line-height: 1.55;
 }
 .re-changelog-dialog .cl-groups {
   display: grid;
-  gap: 12px;
+  gap: 8px;
 }
 .re-changelog-dialog .cl-group {
-  padding: 18px 20px 16px;
+  padding: 12px 14px 11px;
   border: 1px solid var(--cl-line);
-  border-radius: 16px;
+  border-radius: 12px;
   background: var(--cl-card);
   box-shadow: 0 1px 2px rgba(20, 20, 25, 0.03);
 }
@@ -1699,9 +1733,9 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 0 0 8px;
-  font-size: 16px;
-  line-height: 1.4;
+  margin: 0 0 6px;
+  font-size: 14.5px;
+  line-height: 1.35;
   font-weight: 700;
   letter-spacing: -0.01em;
   color: var(--cl-ink);
@@ -1710,7 +1744,7 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   content: "";
   flex: none;
   width: 3px;
-  height: 16px;
+  height: 14px;
   border-radius: 2px;
   background: var(--cl-brand);
 }
@@ -1724,46 +1758,46 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
 }
 .re-changelog-dialog .cl-lead p,
 .re-changelog-dialog .cl-group-body p {
-  margin: 0 0 8px;
+  margin: 0 0 4px;
   color: var(--cl-ink-2);
-  font-size: 13px;
-  line-height: 1.72;
+  font-size: 12.5px;
+  line-height: 1.58;
 }
 .re-changelog-dialog .cl-group-body ul {
   display: grid;
-  gap: 7px;
+  gap: 4px;
   margin: 0;
   padding: 0;
   list-style: none;
 }
 .re-changelog-dialog .cl-group-body ul li {
   position: relative;
-  padding-left: 16px;
+  padding-left: 14px;
   color: var(--cl-ink-2);
-  font-size: 13px;
-  line-height: 1.72;
+  font-size: 12.5px;
+  line-height: 1.58;
 }
 .re-changelog-dialog .cl-group-body ul li::before {
   content: "";
   position: absolute;
   left: 1px;
-  top: 9px;
-  width: 6px;
-  height: 6px;
+  top: 7px;
+  width: 5px;
+  height: 5px;
   border-radius: 50%;
   background: var(--cl-accent);
 }
 .re-changelog-dialog .cl-group-body ol {
   display: grid;
-  gap: 6px;
+  gap: 4px;
   margin: 0;
   padding-left: 20px;
 }
 .re-changelog-dialog .cl-group-body ol li {
   padding-left: 2px;
   color: var(--cl-ink-2);
-  font-size: 13px;
-  line-height: 1.72;
+  font-size: 12.5px;
+  line-height: 1.58;
 }
 .re-changelog-dialog .cl-group-body ol li::marker {
   color: var(--cl-accent);
@@ -1812,20 +1846,22 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   text-align: left;
 }
 .re-changelog-dialog .cl-foot {
+  flex: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  margin-top: 16px;
-  padding-top: 14px;
+  margin: 0;
+  padding: 10px 28px 12px;
   border-top: 1px solid var(--cl-line);
+  background: var(--cl-page);
   color: var(--cl-ink-3);
   font-size: 12px;
 }
 .re-changelog-dialog .cl-ok {
-  padding: 7px 18px;
+  padding: 6px 16px;
   border: 0;
-  border-radius: 9px;
+  border-radius: 8px;
   background: var(--cl-ink);
   color: var(--cl-page);
   font-family: inherit;
@@ -1847,26 +1883,33 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   line-height: 1.7;
 }
 
-/* ---- 窄屏：版本列横过来 ---- */
-@media (max-width: 760px) {
-  .re-changelog-dialog .cl-dialog {
-    height: min(82vh, 720px);
+/* ---- 矮窗口：先收 hero，把高度让给正事 ---- */
+@media (max-height: 620px) {
+  .re-changelog-dialog .cl-script {
+    display: none;
   }
   .re-changelog-dialog .cl-head {
-    padding: 22px 20px 12px;
+    padding-top: 14px;
+  }
+}
+
+/* ---- 窄屏：版本列横过来 ---- */
+@media (max-width: 760px) {
+  .re-changelog-dialog .cl-head {
+    padding: 16px 18px 10px;
   }
   .re-changelog-dialog .cl-script {
-    font-size: 21px;
+    font-size: 16px;
   }
   .re-changelog-dialog .cl-title {
-    font-size: 28px;
+    font-size: 23px;
   }
   .re-changelog-dialog .cl-sub {
     font-size: 12px;
   }
   .re-changelog-dialog .cl-close {
-    top: 12px;
-    right: 12px;
+    top: 10px;
+    right: 10px;
   }
   .re-changelog-dialog .cl-body {
     display: flex;
@@ -1876,7 +1919,7 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
     flex: none;
     display: flex;
     gap: 8px;
-    padding: 2px 16px 12px;
+    padding: 2px 14px 10px;
     overflow-x: auto;
     overflow-y: hidden;
     border-bottom: 1px solid var(--cl-line);
@@ -1910,17 +1953,20 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   .re-changelog-dialog .cl-main {
     flex: 1;
     min-height: 0;
-    padding: 16px 16px 20px;
+    padding: 10px 14px 12px;
   }
   .re-changelog-dialog .cl-ver-head h2 {
-    font-size: 23px;
+    font-size: 19px;
   }
   .re-changelog-dialog .cl-group {
-    padding: 15px 15px 13px;
-    border-radius: 14px;
+    padding: 11px 12px 10px;
+    border-radius: 12px;
   }
   .re-changelog-dialog .cl-group h3 {
-    font-size: 15px;
+    font-size: 14px;
+  }
+  .re-changelog-dialog .cl-foot {
+    padding: 10px 16px 12px;
   }
 }
 

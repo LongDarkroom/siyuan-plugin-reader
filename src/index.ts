@@ -312,7 +312,8 @@ export class ReaderPlugin extends Plugin {
       if (!html) return;
       const dialog = new Dialog({
         title: `${t("更新日志")} v${PLUGIN_VERSION}`,
-        width: "min(920px, 94vw)",
+        width: "min(860px, calc(100vw - 56px))",
+        height: "min(68vh, 620px)",
         hideCloseIcon: true,
         content: html,
       });
