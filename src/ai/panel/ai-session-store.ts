@@ -20,17 +20,30 @@ import {
  */
 
 export const AI_SESSIONS_KEY_PREFIX = "reword-reader-ai-sessions:";
+/** 上限只约束非置顶会话；置顶会话不因数量被淘汰 */
 export const MAX_SESSIONS = 20;
+/** 置顶 + 非置顶的总硬上限，防止 localStorage 无限膨胀 */
+export const MAX_TOTAL_SESSIONS = 30;
 export const MAX_SESSION_TITLE = 60;
 /** 单本书会话落盘预算（JSON 字符数）；超出时从最旧的非当前会话开始淘汰 */
 export const MAX_SESSION_STORAGE_CHARS = 800_000;
+
+/** 标题来源：本地截取 / AI 概括 / 用户手改。缺省（旧数据）不参与自动命名 */
+export type AiSessionTitleSource = "local" | "ai" | "user";
 
 export interface AiChatSession {
   id: string;
   /** 空串表示尚未命名，UI 显示「新对话」 */
   title: string;
+  /**
+   * 标题来源。local 才允许被 AI 覆盖；user 永不被覆盖；
+   * 旧数据没有该字段（undefined）→ 视为用户标题，自动命名不碰。
+   */
+  titleSource?: AiSessionTitleSource;
   createdAt: number;
   updatedAt: number;
+  /** 置顶：列表单独成组、排序优先、不参与淘汰 */
+  pinned?: boolean;
   messages: AiChatMessage[];
 }
 
@@ -80,13 +93,16 @@ export function createSession(messages: AiChatMessage[] = [], now = Date.now(), 
   const list = normalizeChatMessages(messages);
   const created = list.length ? asTime(list[0]?.createdAt, now) : now;
   const updated = list.length ? asTime(list[list.length - 1]?.createdAt, now) : now;
-  return {
+  const text = String(title || titleFromMessages(list)).trim().slice(0, MAX_SESSION_TITLE);
+  const session: AiChatSession = {
     id: newSessionId(),
-    title: String(title || titleFromMessages(list)).trim().slice(0, MAX_SESSION_TITLE),
+    title: text,
     createdAt: created,
     updatedAt: Math.max(created, updated),
     messages: list,
   };
+  if (text) session.titleSource = "local";
+  return session;
 }
 
 /** 追加/更新消息后刷新会话：标题只在空的时候自动生成，用户改过的标题不覆盖 */
@@ -96,17 +112,66 @@ export function touchSession(
   now = Date.now(),
 ): AiChatSession {
   const list = normalizeChatMessages(messages);
-  return {
+  const title = session.title || titleFromMessages(list);
+  const next: AiChatSession = {
     ...session,
-    title: session.title || titleFromMessages(list),
+    title,
     updatedAt: Math.max(session.updatedAt, now),
     messages: list,
   };
+  // 旧会话已带标题且没有来源 → 保持 undefined（视为用户标题，不自动覆盖）
+  if (!session.title && title && !session.titleSource) next.titleSource = "local";
+  return next;
 }
 
+/** 手动重命名：标记 user，之后自动命名永远不再覆盖 */
 export function renameSession(session: AiChatSession, title: string): AiChatSession {
   const next = String(title || "").replace(/\s+/g, " ").trim().slice(0, MAX_SESSION_TITLE);
-  return { ...session, title: next || session.title };
+  if (!next) return session;
+  return { ...session, title: next, titleSource: "user" };
+}
+
+/** 写入 AI 标题：只改标题与来源，其余字段原样保留 */
+export function applyAiSessionTitle(session: AiChatSession, title: string): AiChatSession {
+  const next = String(title || "").replace(/\s+/g, " ").trim().slice(0, MAX_SESSION_TITLE);
+  if (!next) return session;
+  return { ...session, title: next, titleSource: "ai" };
+}
+
+/** 历史列表排序：置顶在前，组内最近更新优先 */
+export function sortSessionsForHistory(sessions: AiChatSession[]): AiChatSession[] {
+  return sessions.slice().sort((a, b) => {
+    const pa = a.pinned ? 1 : 0;
+    const pb = b.pinned ? 1 : 0;
+    if (pa !== pb) return pb - pa;
+    return b.updatedAt - a.updatedAt;
+  });
+}
+
+/** 数量上限：置顶全留（总数 ≤30），非置顶最多 20 条 */
+function limitSessions(sessions: AiChatSession[]): AiChatSession[] {
+  const out: AiChatSession[] = [];
+  let plain = 0;
+  for (const s of sortSessionsForHistory(sessions)) {
+    if (out.length >= MAX_TOTAL_SESSIONS) break;
+    if (s.pinned) {
+      out.push(s);
+      continue;
+    }
+    if (plain >= MAX_SESSIONS) continue;
+    out.push(s);
+    plain++;
+  }
+  return out;
+}
+
+/** 置顶/取消置顶；置顶总数达到硬上限时拒绝并返回原对象 */
+export function setSessionPinned(state: AiSessionState, id: string, pinned: boolean): AiSessionState {
+  const target = state.sessions.find((s) => s.id === id);
+  if (!target || !!target.pinned === !!pinned) return state;
+  if (pinned && state.sessions.filter((s) => s.pinned).length >= MAX_TOTAL_SESSIONS) return state;
+  const sessions = state.sessions.map((s) => (s.id === id ? { ...s, pinned: pinned || undefined } : s));
+  return { ...state, sessions: sortSessionsForHistory(sessions) };
 }
 
 function normalizeSession(raw: any, now: number): AiChatSession | null {
@@ -116,13 +181,18 @@ function normalizeSession(raw: any, now: number): AiChatSession | null {
   const created = asTime(raw.createdAt, messages[0]?.createdAt || now);
   const updated = Math.max(created, asTime(raw.updatedAt, messages[messages.length - 1]?.createdAt || now));
   const title = String(raw.title || "").replace(/\s+/g, " ").trim().slice(0, MAX_SESSION_TITLE);
-  return {
+  const session: AiChatSession = {
     id,
     title: title || titleFromMessages(messages),
     createdAt: created,
     updatedAt: updated,
     messages,
   };
+  if (raw.pinned === true) session.pinned = true;
+  if (raw.titleSource === "local" || raw.titleSource === "ai" || raw.titleSource === "user") {
+    session.titleSource = raw.titleSource;
+  }
+  return session;
 }
 
 export function emptySessionState(): AiSessionState {
@@ -141,7 +211,7 @@ export function normalizeSessionState(raw: any, now = Date.now()): AiSessionStat
     out.push(s);
   }
   out.sort((a, b) => b.updatedAt - a.updatedAt);
-  const sessions = out.slice(0, MAX_SESSIONS);
+  const sessions = limitSessions(out);
   const wanted = typeof src.activeId === "string" ? src.activeId : "";
   const activeId = sessions.some((s) => s.id === wanted) ? wanted : (sessions[0]?.id || "");
   return { version: 1, activeId, sessions };
@@ -155,7 +225,7 @@ function stateChars(state: AiSessionState): number {
   }
 }
 
-/** 超出预算时淘汰最旧的非当前会话；当前会话永远保留 */
+/** 超出预算时淘汰最旧的非当前、非置顶会话；当前与置顶会话永远保留 */
 export function trimSessionState(state: AiSessionState): AiSessionState {
   const next: AiSessionState = {
     version: 1,
@@ -164,7 +234,7 @@ export function trimSessionState(state: AiSessionState): AiSessionState {
   };
   let chars = stateChars(next);
   while (chars > MAX_SESSION_STORAGE_CHARS) {
-    const candidates = next.sessions.filter((s) => s.id !== next.activeId);
+    const candidates = next.sessions.filter((s) => s.id !== next.activeId && !s.pinned);
     if (!candidates.length) break;
     candidates.sort((a, b) => a.updatedAt - b.updatedAt);
     const dropId = candidates[0].id;
@@ -229,6 +299,17 @@ export function withActiveSession(state: AiSessionState, id: string): AiSessionS
 export function removeSession(state: AiSessionState, id: string): AiSessionState {
   const sessions = state.sessions.filter((s) => s.id !== id);
   const activeId = state.activeId === id ? (sessions[0]?.id || "") : state.activeId;
+  return { version: 1, activeId, sessions };
+}
+
+/** 按保留天数清理超期会话（置顶不受影响）；0/非法 = 永久，无变化时原样返回 */
+export function pruneSessionsByAge(state: AiSessionState, days: number, now = Date.now()): AiSessionState {
+  const n = Math.round(Number(days));
+  if (!Number.isFinite(n) || n <= 0) return state;
+  const cutoff = now - n * 86400000;
+  const sessions = state.sessions.filter((s) => s.pinned || Number(s.updatedAt) >= cutoff);
+  if (sessions.length === state.sessions.length) return state;
+  const activeId = sessions.some((s) => s.id === state.activeId) ? state.activeId : (sessions[0]?.id || "");
   return { version: 1, activeId, sessions };
 }
 

@@ -14,6 +14,7 @@
  */
 
 import { PLATFORM_PRESETS } from "./settings/ai-platform-presets.ts";
+import { AUTO_RENAME_PROMPT_MAX, DEFAULT_AUTO_RENAME_PROMPT } from "./auto-title.ts";
 
 /** AI 设置（持久化于 hiword-ai.json） */
 export interface AiSettings {
@@ -175,6 +176,17 @@ export interface AiSettings {
   sessionRetentionDays?: number;
   /** 会话落盘节流间隔（ms）；0 = 不节流 */
   sessionSaveThrottleMs?: number;
+  /**
+   * 会话自动重命名：首条消息发出后让模型概括标题（默认关）。
+   * 只覆盖「本地生成且未改过」的标题；用户手改过的标题永不覆盖。
+   */
+  autoRenameSession?: boolean;
+  /** 命名专用平台 id；空 = 跟随当前对话的平台 */
+  autoRenamePlatformId?: string;
+  /** 命名专用模型；空 = 跟随当前平台默认模型 */
+  autoRenameModel?: string;
+  /** 命名提示词，{message} 会被替换成用户第一句话 */
+  autoRenamePrompt?: string;
 
   // 2026-08-21 精简：以下字段已删除(从 21 个 → 14 个,-33%)
   //  - chatApi: 强制 OpenAI 兼容,不再支持多格式
@@ -623,6 +635,11 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
   vocabSkipKnown: true,
   sessionRetentionDays: 0,
   sessionSaveThrottleMs: 800,
+  // 2026-11-07：会话自动重命名（默认关；默认跟随当前对话平台与模型）
+  autoRenameSession: false,
+  autoRenamePlatformId: "",
+  autoRenameModel: "",
+  autoRenamePrompt: DEFAULT_AUTO_RENAME_PROMPT,
   // 2026-08-21 精简：双模式字段 defaultMode / chatPromptTemplate 已删除
 };
 
@@ -742,6 +759,18 @@ export function normalizeAiSettings(raw: any): AiSettings {
   const { platforms, activePlatformId } = platformsOf(r);
   const activePlat = activePlatformOf({ platforms, activePlatformId }) || platforms[0];
   const syncedModels = activePlat?.models && activePlat.models.length ? activePlat.models : strArr(r.models, []);
+  // 命名平台必须存在于平台列表；不存在就回到「跟随当前」，模型随之清空。
+  // 指定平台时模型不在该平台列表里 → 回落第一个，避免请求带着无效模型。
+  const renamePlatformWanted = str(r.autoRenamePlatformId, "").trim();
+  const renamePlat = renamePlatformWanted
+    ? platforms.find((p) => p.id === renamePlatformWanted) || null
+    : null;
+  const renamePlatformId = renamePlat ? renamePlat.id : "";
+  const renameModelWanted = str(r.autoRenameModel, "").trim();
+  const renameModel = renamePlat
+    ? (renamePlat.models.includes(renameModelWanted) ? renameModelWanted : (renamePlat.models[0] || ""))
+    : "";
+  const renamePromptRaw = str(r.autoRenamePrompt, "").trim();
   return {
     enabled: bool(r.enabled, false),
     // 顶层 baseUrl/apiKey/models/modelParams 为「当前激活平台」的镜像，供旧消费方读取；
@@ -848,6 +877,13 @@ export function normalizeAiSettings(raw: any): AiSettings {
     vocabSkipKnown: bool(r.vocabSkipKnown, true),
     sessionRetentionDays: Math.round(num(r.sessionRetentionDays, 0, 0, 365)),
     sessionSaveThrottleMs: Math.round(num(r.sessionSaveThrottleMs, 800, 0, 5000)),
+    // 2026-11-07：会话自动重命名（提示词空串回退默认，超长截断）
+    autoRenameSession: bool(r.autoRenameSession, false),
+    autoRenamePlatformId: renamePlatformId,
+    autoRenameModel: renameModel,
+    autoRenamePrompt: renamePromptRaw
+      ? renamePromptRaw.slice(0, AUTO_RENAME_PROMPT_MAX)
+      : DEFAULT_AUTO_RENAME_PROMPT,
     // 2026-08-21 精简：defaultMode / chatPromptTemplate 双模式字段已删除
     //   若 raw 中存在,normalize 会忽略(用户可自行编辑 promptTemplate)
   };

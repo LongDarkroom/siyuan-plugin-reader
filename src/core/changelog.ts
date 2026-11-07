@@ -129,15 +129,205 @@ export function sliceVersionSection(markdown: string, version: string): string {
  * 跟着 .b3-typography 走）；拿不到（移动端裁剪 / 加载顺序）就回落 <pre> 纯文本，
  * 转义后再塞，绝不把日志正文当 HTML 拼。
  */
-export function renderChangelogHtml(section: string): string {
+function renderMarkdownBlock(markdown: string, plainClass: string): string {
   const Lute = (globalThis as { Lute?: { New?: () => { Md2HTML?: (md: string) => string } } }).Lute;
   if (Lute?.New) {
     try {
-      const html = Lute.New().Md2HTML?.(section);
+      const html = Lute.New().Md2HTML?.(markdown);
       if (html) return html;
     } catch {
       // 渲染器抛错照样回落纯文本
     }
   }
-  return `<pre class="re-changelog__plain">${escapeHtml(section)}</pre>`;
+  return `<pre class="${plainClass}">${escapeHtml(markdown)}</pre>`;
+}
+
+export function renderChangelogHtml(section: string): string {
+  return renderMarkdownBlock(section, "re-changelog__plain");
+}
+
+/** 更新日志里的一节：`### 标题` + 正文 markdown */
+export interface ChangelogGroup {
+  title: string;
+  markdown: string;
+}
+
+/** 一个版本：标题行里的版本号 / 日期，首段的引导语，以及若干 `###` 小节 */
+export interface ChangelogVersion {
+  version: string;
+  date: string;
+  lead: string;
+  groups: ChangelogGroup[];
+}
+
+/** 版本标题行：`v0.5.5 (2026-11-06)` / `v0.7.0（2026-10-30）`，括号半角全角都认 */
+const VERSION_HEAD_RE = /^v?(\d[\w.+-]*)[ \t]*(?:[(（][ \t]*([^)）]*?)[ \t]*[)）])?[ \t]*$/;
+
+function stripTrailingRule(markdown: string): string {
+  return markdown.replace(/\n-{3,}[ \t]*$/, "").replace(/\s+$/, "");
+}
+
+/**
+ * 把整份 CHANGELOG 拆成版本列表（文件顺序 = 新→旧）。
+ *
+ * - 只认二级标题 `## `；文档最前面的标题/前言不算版本；
+ * - 版本号与日期都从标题行取，日期括号半角、全角都收（两个插件的日志写法不同）；
+ * - 首个 `### ` 之前是引导语，之后按 `### ` 切小节；
+ * - 段尾的 `---` 分隔线剥掉，别让它跑进正文。
+ */
+export function parseChangelogVersions(markdown: string): ChangelogVersion[] {
+  const heads: { index: number; bodyStart: number; title: string }[] = [];
+  const headRe = /^##[ \t]+(.+?)[ \t]*$/gm;
+  let m: RegExpExecArray | null;
+  while ((m = headRe.exec(markdown))) {
+    const lineEnd = markdown.indexOf("\n", m.index);
+    heads.push({
+      index: m.index,
+      bodyStart: lineEnd < 0 ? markdown.length : lineEnd + 1,
+      title: m[1].trim(),
+    });
+  }
+
+  const versions: ChangelogVersion[] = [];
+  for (let i = 0; i < heads.length; i++) {
+    const hit = VERSION_HEAD_RE.exec(heads[i].title);
+    if (!hit) continue;
+    const end = i + 1 < heads.length ? heads[i + 1].index : markdown.length;
+    const body = stripTrailingRule(markdown.slice(heads[i].bodyStart, end).trim());
+    const parts = body.split(/^###[ \t]+/m);
+    const lead = stripTrailingRule((parts.shift() || "").trim());
+    const groups: ChangelogGroup[] = [];
+    for (const part of parts) {
+      const nl = part.indexOf("\n");
+      const title = (nl < 0 ? part : part.slice(0, nl)).trim();
+      if (!title) continue;
+      const md = nl < 0 ? "" : stripTrailingRule(part.slice(nl + 1).trim());
+      groups.push({ title, markdown: md });
+    }
+    versions.push({ version: hit[1], date: (hit[2] || "").trim(), lead, groups });
+  }
+  return versions;
+}
+
+/** 弹窗里的固定文案；由宿主按当前语言传入，纯逻辑模块不碰 i18n */
+export interface ChangelogLabels {
+  title: string;
+  subtitle: string;
+  history: string;
+  latest: string;
+  current: string;
+  archived: string;
+  ok: string;
+  close: string;
+}
+
+/**
+ * 双栏全历史弹窗的 HTML 外壳：
+ * 左栏是完整版本时间线（默认选中当前版本），右栏按 `###` 分组渲染白卡片。
+ * 每一页都先渲染好、用 `hidden` 切换——版本数量是几十级，切换时零重排最省事。
+ */
+export function buildChangelogDialogHtml(
+  markdown: string,
+  currentVersion: string,
+  labels: ChangelogLabels
+): string {
+  const versions = parseChangelogVersions(markdown);
+  if (!versions.length) return "";
+  const cur = (currentVersion || "").trim().replace(/^v/i, "");
+  const found = versions.findIndex((v) => v.version === cur);
+  const active = found < 0 ? 0 : found;
+
+  const rail = versions
+    .map((v, i) => {
+      const on = i === active;
+      return `<button type="button" class="cl-ver${on ? " is-active" : ""}" data-cl-ver="${i}"${
+        on ? ' aria-current="true"' : ""
+      }>
+        <span class="cl-ver-num">v${escapeHtml(v.version)}${
+          i === 0 ? `<span class="cl-new">${escapeHtml(labels.latest)}</span>` : ""
+        }</span>
+        ${v.date ? `<span class="cl-ver-date">${escapeHtml(v.date)}</span>` : ""}
+      </button>`;
+    })
+    .join("");
+
+  const pages = versions
+    .map((v, i) => {
+      const latest = i === 0;
+      const isCurrent = v.version === cur;
+      const lead = v.lead ? `<div class="cl-lead">${renderMarkdownBlock(v.lead, "re-changelog__plain")}</div>` : "";
+      const groups = v.groups
+        .map(
+          (g) =>
+            `<section class="cl-group"><h3>${escapeHtml(g.title)}</h3><div class="cl-group-body">${
+              g.markdown ? renderMarkdownBlock(g.markdown, "re-changelog__plain") : ""
+            }</div></section>`
+        )
+        .join("");
+      return `<section class="cl-page" data-cl-page="${i}"${i === active ? "" : " hidden"}>
+        <div class="cl-ver-head">
+          <h2>v${escapeHtml(v.version)}</h2>
+          ${v.date ? `<time>${escapeHtml(v.date)}</time>` : ""}
+          ${latest ? `<span class="cl-new">${escapeHtml(labels.latest)}</span>` : ""}
+        </div>
+        ${lead}
+        <div class="cl-groups">${groups}</div>
+        <footer class="cl-foot">
+          <span>${escapeHtml(isCurrent ? labels.current : labels.archived)}</span>
+          <button type="button" class="cl-ok" data-cl-ok>${escapeHtml(labels.ok)}</button>
+        </footer>
+      </section>`;
+    })
+    .join("");
+
+  return `<div class="cl-dialog">
+    <header class="cl-head">
+      <div class="cl-script">What's new</div>
+      <h1 class="cl-title">${escapeHtml(labels.title)}</h1>
+      <p class="cl-sub">${escapeHtml(labels.subtitle)}</p>
+      <button type="button" class="cl-close" data-cl-close aria-label="${escapeHtml(labels.close)}">×</button>
+    </header>
+    <div class="cl-body">
+      <nav class="cl-rail" aria-label="${escapeHtml(labels.history)}">
+        <div class="cl-rail-label">${escapeHtml(labels.history)}</div>
+        ${rail}
+      </nav>
+      <main class="cl-main">${pages}</main>
+    </div>
+  </div>`;
+}
+
+/**
+ * 弹窗交互：版本切换 + 关闭 / 知道了。
+ * 只用根节点上的事件委托——弹窗内容整段是 innerHTML 生成的，逐元素绑事件
+ * 在重绘后必丢；委托还顺手避开「按钮里套块级节点」的点击目标问题。
+ */
+export function wireChangelogDialog(root: HTMLElement, onClose: () => void): void {
+  const railButtons = Array.from(root.querySelectorAll<HTMLElement>("[data-cl-ver]"));
+  const pages = Array.from(root.querySelectorAll<HTMLElement>("[data-cl-page]"));
+  const main = root.querySelector<HTMLElement>(".cl-main");
+
+  root.addEventListener("click", (ev) => {
+    const target = ev.target as HTMLElement | null;
+    if (!target) return;
+    if (target.closest("[data-cl-close], [data-cl-ok]")) {
+      onClose();
+      return;
+    }
+    const btn = target.closest<HTMLElement>("[data-cl-ver]");
+    if (!btn) return;
+    const idx = Number(btn.getAttribute("data-cl-ver"));
+    if (!Number.isInteger(idx) || idx < 0) return;
+    railButtons.forEach((b) => {
+      const on = b === btn;
+      b.classList.toggle("is-active", on);
+      if (on) b.setAttribute("aria-current", "true");
+      else b.removeAttribute("aria-current");
+    });
+    pages.forEach((p, i) => {
+      p.hidden = i !== idx;
+    });
+    if (main) main.scrollTop = 0;
+    btn.scrollIntoView({ block: "nearest", inline: "nearest" });
+  });
 }

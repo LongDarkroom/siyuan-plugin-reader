@@ -69,6 +69,12 @@ export class AiTabController {
   open(): void {
     // 手机端 openTab 是官方空实现；阅读器内的全屏面板已经覆盖该场景
     if (isMobile()) return;
+    // 与右栏互斥：同一会话不在两处同时挂载（否则会各跑一条流式、互相覆盖存储）
+    try {
+      this.plugin.closeAiDock?.();
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ai-tab-controller.ts · open · closeAiDock", "debug");
+    }
     if (this.rec?.tab) {
       try {
         this.rec.tab.parent?.switchTab?.(this.rec.tab.headElement);
@@ -110,6 +116,18 @@ export class AiTabController {
     return !!this.rec?.tab;
   }
 
+  /** 收起 AI 页签（右栏打开时调用，保证同一时刻只有一个 AI 面板） */
+  close(): void {
+    const rec = this.rec;
+    if (!rec) return;
+    try {
+      rec.tab?.close?.();
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ai-tab-controller.ts · close", "debug");
+    }
+    this.unmount(rec.tab);
+  }
+
   /**
    * 把选段直接投到已打开的 AI 页签。
    * 页签未挂载、宿主没就绪或锁定的是别的书时返回 false，由调用方回落停靠栏；
@@ -128,6 +146,12 @@ export class AiTabController {
 
   private mount(custom: any): void {
     if (this.rec) return;
+    // 还原布局时右栏和页签可能同时被恢复：谁先挂载谁留下，另一个立即收掉
+    try {
+      this.plugin.closeAiDock?.();
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ai-tab-controller.ts · mount · closeAiDock", "debug");
+    }
     try {
       custom.element.style.display = "flex";
       custom.element.style.flexDirection = "column";

@@ -20,11 +20,12 @@
   import {
     requestAIStream,
     requestAIGenerate,
-    fetchModelList,
     type AiMessage,
   } from "../ai-client.ts";
   import AiComposer from "./AiComposer.svelte";
   import AiMindmap from "./AiMindmap.svelte";
+  import AiSettingsDialog from "../settings/AiSettingsDialog.svelte";
+  import { fontSizesOf } from "../settings/ai-settings-dialog-logic.ts";
   import { renderAssistantMarkdown, blockIdFromTarget } from "./ai-markdown.ts";
   import {
     MINDMAP_QUICK_ASK,
@@ -37,8 +38,6 @@
     loadKnowledgeSource,
     saveKnowledgeSource,
     buildKnowledgePrompt,
-    KNOWLEDGE_MIN_CHARS,
-    KNOWLEDGE_MAX_CHARS,
     type KnowledgeSource,
   } from "./ai-knowledge.ts";
   import {
@@ -62,6 +61,7 @@
     normalizeTocItems,
     pickRangeSection,
     rangeSpan,
+    rangeLabel,
     type AiReadRange,
     type AiTocItem,
   } from "./ai-toc.ts";
@@ -70,14 +70,12 @@
     MIN_PANEL_WIDTH,
     MAX_PANEL_WIDTH,
     MIN_STAGE_WIDTH,
-    MIN_CONTEXT_CHARS,
-    MAX_CONTEXT_CHARS,
-    MAX_HISTORY_TURNS,
     normalizeAiPanelPrefs,
     loadAiPanelPrefs,
     saveAiPanelPrefs,
     newMessageId,
     buildChapterContext,
+    buildGeneralSystemPrompt,
     buildReaderSystemPrompt,
     buildUserTurnContent,
     buildChatRequestMessages,
@@ -91,6 +89,13 @@
     normalizeTurnScope,
     chatDayMarker,
     sameChatDay,
+    formatUsage,
+    classifyAiError,
+    maskApiKeyInText,
+    editResendDraft,
+    editRemovedCount,
+    wantsSendOnEnter,
+    CONTINUE_HINT,
     type AiContextScope,
     type AiTurnScope,
     type AiChatMessage,
@@ -98,6 +103,7 @@
     type AiChatContextNote,
     type AiChatToolTrace,
     type AiChatNoteReceipt,
+    type AiUsageSnapshot,
     type AiPanelPrefs,
     type AiCredentialView,
     type ChapterContext,
@@ -109,6 +115,7 @@
     createSession,
     touchSession,
     removeSession,
+    pruneSessionsByAge,
     upsertSession,
     withActiveSession,
     collectSessionNotes,
@@ -116,10 +123,25 @@
     sessionDayBucket,
     sessionClock,
     titleFromMessages,
+    renameSession,
+    applyAiSessionTitle,
+    setSessionPinned,
+    sortSessionsForHistory,
+    MAX_TOTAL_SESSIONS,
     type AiChatSession,
     type AiSessionState,
-    type SessionDayBucket,
   } from "./ai-session-store.ts";
+  import {
+    buildSessionMarkdown,
+    buildSessionJson,
+    sessionExportFileName,
+  } from "./ai-session-export.ts";
+  import {
+    buildAutoRenamePrompt,
+    cleanAutoTitle,
+    resolveAutoRenameTarget,
+    shouldApplyAutoTitle,
+  } from "../auto-title.ts";
 
   /** 笔记落点解析 / 写入结果（与 ReaderView 注入实现同形） */
   type NoteTargetInfo =
@@ -150,6 +172,8 @@
   export let resizable = true;
   /** 手机全屏覆盖层：加大触控目标、避让安全区、输入字号防 iOS 放大 */
   export let overlay = false;
+  /** 右栏没有活动阅读器时的通用对话：不读正文、不显示阅读上下文 */
+  export let general = false;
 
   /** 读翻译/AI 设置（宿主 → plugin.getAiSettings） */
   export let getAiSettings: (() => any) | undefined = undefined;
@@ -195,8 +219,14 @@
 
   /* ============================ 面板状态 ============================ */
 
-  let tab: "chat" | "notes" | "settings" = "chat";
+  let tab: "chat" | "notes" = "chat";
+  /** 设置改为浮窗：不占 tab，也不挤压对话区 */
+  let settingsOpen = false;
   let prefs: AiPanelPrefs = { ...DEFAULT_AI_PANEL_PREFS };
+  /** 设置窗口负责的显示参数；打开/保存后由 syncCred 一并刷新 */
+  let fontSizes = { message: 12, input: 13 };
+  let sendShortcut: "enter" | "mod+enter" = "enter";
+  let streamThrottleMs = 100;
   let messages: AiChatMessage[] = [];
   let loadedBookId = "";
   /**
@@ -207,11 +237,31 @@
   let chatGen = 0;
   /** 多会话状态：sessions 内是已落盘快照，messages 是当前会话的工作副本 */
   let sessionState: AiSessionState = emptySessionState();
+  /** 历史浮卡：全部/置顶筛选 + 标题/正文搜索 */
   let showHistory = false;
   let historyQuery = "";
+  let historyFilter: "all" | "pinned" = "all";
+  let historyToolsOpen = false;
+  let historyTop = 58;
+  let historyMaxH = 480;
+  let panelEl: HTMLElement | undefined = undefined;
+  let headerEl: HTMLElement | undefined = undefined;
+  let historyEl: HTMLDivElement | undefined = undefined;
+  let historyBtnEl: HTMLButtonElement | undefined = undefined;
+  /** P1：会话操作菜单 / 内联重命名 */
+  let historyMenu = "";
+  let renamingId = "";
+  let renameText = "";
+  let renameEl: HTMLInputElement | undefined = undefined;
   let pendingQuote: AiChatQuote | null = null;
   let notice = "";
   let copiedId = "";
+  /** P1：正在编辑重发的用户消息 id 与草稿 */
+  let editingId = "";
+  let editText = "";
+  let editEl: HTMLTextAreaElement | undefined = undefined;
+  /** P1：错误详情/错误文案的复制反馈 */
+  let copiedErrorId = "";
   /** P4-C：底栏模型快切气泡 */
   let modelMenu = false;
 
@@ -280,7 +330,11 @@
 
   function syncCred(): void {
     try {
-      cred = toAiCredentialView(getAiSettings?.() || null);
+      const s = getAiSettings?.() || null;
+      cred = toAiCredentialView(s);
+      fontSizes = fontSizesOf(s);
+      sendShortcut = s?.sendShortcut === "mod+enter" ? "mod+enter" : "enter";
+      streamThrottleMs = Math.min(500, Math.max(0, Math.round(Number(s?.streamThrottleMs ?? 100))));
     } catch (e) {
       logSwallow(e, "AiPanel.svelte · syncCred", "warn");
     }
@@ -313,6 +367,7 @@
   function resetTransientUi(): void {
     pendingQuote = null;
     notice = "";
+    cancelEdit();
     notePlan = null;
     notePlanError = "";
     mindmapView = null;
@@ -333,13 +388,17 @@
   function loadSessionsFor(id: string): void {
     chatGen++;
     loadedBookId = id;
-    sessionState = ensureSessionState(loadSessionState(storage(), id));
+    const loaded = loadSessionState(storage(), id);
+    const days = Math.round(Number(getAiSettings?.()?.sessionRetentionDays) || 0);
+    const pruned = pruneSessionsByAge(loaded, days);
+    sessionState = ensureSessionState(pruned === loaded ? loaded : saveSessionState(storage(), id, pruned));
     const active = activeSessionOf(sessionState);
     messages = active ? active.messages.slice() : [];
     knowledge = loadKnowledgeSource(storage(), id);
     knowledgeOn = !!knowledge;
     showHistory = false;
     historyQuery = "";
+    historyToolsOpen = false;
     resetTransientUi();
     composer?.clear?.();
   }
@@ -364,7 +423,6 @@
     contextScope = normalizeContextScope(prefs.contextScope);
     loadSessionsFor(bookId);
     syncCred();
-    loadDraft();
     const onWinResize = () => {
       if (resizable) width = clampWidth(width);
     };
@@ -452,7 +510,7 @@
       streamText = tokenBuf;
       streamReasoning = reasonBuf;
       void autoScroll();
-    }, 70);
+    }, Math.max(0, streamThrottleMs));
   }
 
   function flushNow(): void {
@@ -551,12 +609,15 @@
 
   async function send(): Promise<void> {
     if (streaming) return;
+    if (editingId) {
+      notice = t("请先完成或取消正在编辑的消息");
+      return;
+    }
     const question = String(composer?.getText?.() || "").trim();
     if (!question) return;
     syncCred();
     if (!isAiReady(cred)) {
-      tab = "settings";
-      loadDraft();
+      openSettings();
       notice = t("请先在设置里填写接口地址与模型");
       return;
     }
@@ -587,6 +648,7 @@
     if (requestedRange) userMsg.range = requestedRange;
     if (quote) userMsg.quote = quote;
 
+    const firstTurn = messages.length === 0;
     const history = pickHistory(messages, prefs.historyTurns);
     const assistant: AiChatMessage = {
       id: newMessageId(),
@@ -595,7 +657,68 @@
       createdAt: Date.now(),
     };
     messages = [...messages, userMsg, assistant];
+    if (firstTurn) {
+      // 先落本地标题，保证列表立刻有名字；AI 标题随后异步替换
+      persistChat();
+      const sessionId = sessionState.activeId;
+      const baseTitle = sessionState.sessions.find((s) => s.id === sessionId)?.title || "";
+      if (baseTitle) void autoNameSession(sessionId, baseTitle, question, chatGen);
+    }
     await runTurn(userMsg, assistant, history);
+  }
+
+  /**
+   * 首条消息后的异步命名。
+   * 只发一次低 token 请求，失败静默；落盘前四道守卫：
+   *  ① 书本代次没变 ② 会话还在 ③ 标题仍是本地生成 ④ 内容仍是发起时那份
+   * 用户手改过的标题（titleSource=user）永远不覆盖。
+   */
+  async function autoNameSession(
+    sessionId: string,
+    baseTitle: string,
+    message: string,
+    gen: number,
+  ): Promise<void> {
+    let settings: any = null;
+    try {
+      settings = getAiSettings?.() || null;
+    } catch (e) {
+      logSwallow(e, "AiPanel.svelte · autoNameSession · settings", "debug");
+      return;
+    }
+    if (!settings?.autoRenameSession) return;
+    const target = resolveAutoRenameTarget(settings, {
+      baseUrl: cred.baseUrl,
+      apiKey: cred.apiKey,
+      model: cred.model,
+    });
+    if (!target) return;
+    try {
+      const res = await requestAIGenerate({
+        messages: [{ role: "user", content: buildAutoRenamePrompt(settings.autoRenamePrompt, message) }],
+        settings: {
+          ...engineSettings(),
+          baseUrl: target.baseUrl,
+          apiKey: target.apiKey,
+          model: target.model,
+          temperature: 0.2,
+          maxTokens: 256,
+          modelParams: {},
+        },
+        jsonMode: false,
+        timeout: 20000,
+      });
+      const title = cleanAutoTitle(res?.content || "");
+      if (!title || gen !== chatGen) return;
+      const session = sessionState.sessions.find((s) => s.id === sessionId);
+      if (!session || !shouldApplyAutoTitle(session, baseTitle)) return;
+      sessionState = saveSessionState(storage(), loadedBookId || bookId, {
+        ...sessionState,
+        sessions: sessionState.sessions.map((s) => (s.id === sessionId ? applyAiSessionTitle(s, title) : s)),
+      });
+    } catch (e) {
+      logSwallow(e, "AiPanel.svelte · autoNameSession", "debug");
+    }
   }
 
   /** 重新生成：回退到对应的提问，按当时的范围/知识区开关重放同一轮 */
@@ -608,8 +731,7 @@
     if (messages.length > idx + 1 && !confirm(t("重新生成会移除这条之后的消息，继续？"))) return;
     syncCred();
     if (!isAiReady(cred)) {
-      tab = "settings";
-      loadDraft();
+      openSettings();
       notice = t("请先在设置里填写接口地址与模型");
       return;
     }
@@ -638,6 +760,210 @@
     };
     messages = [...messages, userMsg, assistant];
     await runTurn(userMsg, assistant, history);
+  }
+
+  /* ---------- P1：编辑重发 / 失败重试 / 停止继续 ---------- */
+
+  async function startEdit(m: AiChatMessage): Promise<void> {
+    if (streaming || m.role !== "user") return;
+    editingId = m.id;
+    editText = m.content;
+    await tick();
+    editEl?.focus();
+    const end = editEl?.value.length ?? 0;
+    editEl?.setSelectionRange?.(end, end);
+  }
+
+  function cancelEdit(): void {
+    editingId = "";
+    editText = "";
+  }
+
+  /** 切会话/新建前先处理未发送的编辑草稿 */
+  function leaveEditGuard(): boolean {
+    if (!editingId) return true;
+    const original = messages.find((m) => m.id === editingId)?.content || "";
+    if (editText.trim() === original.trim()) {
+      cancelEdit();
+      return true;
+    }
+    if (!confirm(t("编辑中的内容尚未发送，切换会丢弃，继续？"))) return false;
+    cancelEdit();
+    return true;
+  }
+
+  function onEditKeydown(e: KeyboardEvent): void {
+    if (e.isComposing) return;
+    if (e.key === "Escape") {
+      e.preventDefault();
+      cancelEdit();
+      return;
+    }
+    if (!wantsSendOnEnter(e, sendShortcut)) return;
+    e.preventDefault();
+    const m = messages.find((x) => x.id === editingId);
+    if (m) void resendEdited(m);
+  }
+
+  /** 开始一轮前的统一检查与瞬态清理；返回 false 表示已提示、不要发请求 */
+  function beginTurn(): boolean {
+    syncCred();
+    if (!isAiReady(cred)) {
+      openSettings();
+      notice = t("请先在设置里填写接口地址与模型");
+      return false;
+    }
+    notice = "";
+    notePlan = null;
+    notePlanError = "";
+    mindmapView = null;
+    hidePreview();
+    return true;
+  }
+
+  function freshAssistant(): AiChatMessage {
+    return { id: newMessageId(), role: "assistant", content: "", createdAt: Date.now() };
+  }
+
+  /** 编辑重发：截断该消息之后的所有内容，按原引用/范围/知识区开关重放 */
+  async function resendEdited(m: AiChatMessage): Promise<void> {
+    if (streaming) return;
+    const idx = messages.findIndex((x) => x.id === m.id);
+    if (idx < 0) return;
+    const question = editText.trim();
+    if (!question) return;
+    const removed = editRemovedCount(messages, m.id);
+    if (removed > 0 && !confirm(t("重新发送会移除这条之后的 {n} 条消息，继续？", { n: removed }))) return;
+    if (!beginTurn()) return;
+
+    const draft = editResendDraft(m);
+    const userMsg: AiChatMessage = {
+      id: newMessageId(),
+      role: "user",
+      content: question,
+      createdAt: Date.now(),
+    };
+    if (draft.quote) userMsg.quote = draft.quote;
+    if (draft.scope) userMsg.scope = draft.scope;
+    if (draft.range) userMsg.range = draft.range;
+    if (typeof draft.useKnowledge === "boolean") userMsg.useKnowledge = draft.useKnowledge;
+
+    cancelEdit();
+    segmentCache.delete(m.id);
+    messages = messages.slice(0, idx);
+    const history = pickHistory(messages, prefs.historyTurns);
+    const assistant = freshAssistant();
+    messages = [...messages, userMsg, assistant];
+    await runTurn(userMsg, assistant, history);
+  }
+
+  /** 失败卡：四类错误只给行动建议，原文收进「详情」 */
+  function errorInfoOf(m: AiChatMessage): { title: string; hint: string } {
+    const info = classifyAiError(m.errorText || m.content);
+    switch (info.kind) {
+      case "auth":
+        return { title: t("鉴权失败"), hint: t("请检查 API Key 与平台权限后重试") };
+      case "rate":
+        return { title: t("请求过于频繁"), hint: t("请稍后重试，或换用更小的模型") };
+      case "server":
+        return { title: t("服务端异常"), hint: t("请稍后重试；若持续出现请检查接口地址") };
+      case "network":
+        return { title: t("网络或超时"), hint: t("请检查网络与代理设置后重试") };
+      default:
+        return { title: t("请求失败"), hint: t("可以重试；仍失败时请查看错误详情") };
+    }
+  }
+
+  function maskedError(m: AiChatMessage): string {
+    const raw = String(m.errorText || (m.error ? m.content : "") || "");
+    return maskApiKeyInText(raw, cred.apiKey).trim() || t("无错误详情");
+  }
+
+  async function copyError(m: AiChatMessage): Promise<void> {
+    try {
+      if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(maskedError(m));
+      copiedErrorId = m.id;
+      setTimeout(() => {
+        if (copiedErrorId === m.id) copiedErrorId = "";
+      }, 1600);
+    } catch (e) {
+      logSwallow(e, "AiPanel.svelte · copyError", "warn");
+      notice = t("复制失败，请检查剪贴板权限");
+    }
+  }
+
+  async function retryMessage(m: AiChatMessage): Promise<void> {
+    await regenerate(m);
+  }
+
+  /** 停止后继续：保留半截回答作为历史，重新提问并追加继续提示（只进请求，不改气泡） */
+  async function continueMessage(m: AiChatMessage): Promise<void> {
+    if (streaming) return;
+    const idx = messages.findIndex((x) => x.id === m.id);
+    if (idx < 1) return;
+    let prev: AiChatMessage | undefined;
+    for (let i = idx - 1; i >= 0; i--) {
+      if (messages[i].role === "user") {
+        prev = messages[i];
+        break;
+      }
+    }
+    if (!prev) return;
+    if (!beginTurn()) return;
+
+    const base = messages.slice(0, idx + 1);
+    const history = pickHistory(base, prefs.historyTurns, { includeAborted: true });
+    const userMsg: AiChatMessage = {
+      id: newMessageId(),
+      role: "user",
+      content: prev.content,
+      createdAt: Date.now(),
+      continuation: true,
+    };
+    if (prev.quote) userMsg.quote = { ...prev.quote };
+    if (prev.scope) userMsg.scope = prev.scope;
+    if (prev.range) userMsg.range = { ...prev.range };
+    if (typeof prev.useKnowledge === "boolean") userMsg.useKnowledge = prev.useKnowledge;
+    const assistant = freshAssistant();
+    messages = [...base, userMsg, assistant];
+    await runTurn(userMsg, assistant, history);
+  }
+
+  /** 代码块复制按钮：Lute 输出会被 {@html} 整体替换，用观察器在每次重渲染后补挂 */
+  function codeCopy(node: HTMLElement) {
+    const attach = (): void => {
+      node.querySelectorAll("pre").forEach((pre) => {
+        if (pre.querySelector(":scope > .ai-code-copy")) return;
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "ai-code-copy";
+        btn.textContent = t("复制");
+        btn.setAttribute("aria-label", t("复制代码"));
+        btn.addEventListener("click", async (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const code = pre.querySelector("code");
+          const text = code?.textContent || pre.textContent || "";
+          try {
+            if (!navigator.clipboard?.writeText) throw new Error("clipboard unavailable");
+            await navigator.clipboard.writeText(text);
+            btn.textContent = t("已复制");
+          } catch (e) {
+            logSwallow(e, "AiPanel.svelte · codeCopy", "warn");
+            btn.textContent = t("复制失败");
+          }
+          setTimeout(() => {
+            btn.textContent = t("复制");
+          }, 1600);
+        });
+        pre.appendChild(btn);
+      });
+    };
+    attach();
+    const mo = new MutationObserver(attach);
+    mo.observe(node, { childList: true, subtree: true });
+    return { destroy: () => mo.disconnect() };
   }
 
   /** 发送/重新生成共用的一轮：取上下文 → 组装提示词 → 流式 + 工具循环 → 落盘 */
@@ -684,7 +1010,10 @@
       else notice = t("未能读取本章正文，本次回答不含章节上下文");
     };
 
-    if (requestedScope === "range") {
+    if (general) {
+      // 通用模式没有书：不读正文、不带范围，也不提示「未读到本章」
+      scopeUsed = requestedScope;
+    } else if (requestedScope === "range") {
       if (getRange && rangeUsed) {
         try {
           snapshot = await getRange({
@@ -764,16 +1093,20 @@
     let knowledgeTruncated = false;
 
     // 2) 组装请求（宿主可用时追加工具说明，让模型知道能自己翻书）
-    const host = (() => {
-      try {
-        return getReaderToolHost?.() || null;
-      } catch (e) {
-        logSwallow(e, "AiPanel.svelte · send · getReaderToolHost", "warn");
-        return null;
-      }
-    })();
+    const host = general
+      ? null
+      : (() => {
+          try {
+            return getReaderToolHost?.() || null;
+          } catch (e) {
+            logSwallow(e, "AiPanel.svelte · send · getReaderToolHost", "warn");
+            return null;
+          }
+        })();
     const toolDefs = host ? buildReaderToolDefs() : [];
-    let systemPrompt = buildReaderSystemPrompt({
+    let systemPrompt = general
+      ? buildGeneralSystemPrompt()
+      : buildReaderSystemPrompt({
       bookTitle,
       author: bookAuthor,
       chapterTitle,
@@ -787,7 +1120,7 @@
       rangeChapters: scopeUsed === "range" ? rangeChapters : undefined,
     });
     // 2.1) 目录：压成编号清单，让模型知道全书结构（读单章/范围时不必靠猜）
-    if (getToc) {
+    if (!general && getToc) {
       await ensureToc();
       if (tocItems.length >= 2) {
         const tocPrompt = buildTocPrompt(tocItems);
@@ -822,7 +1155,7 @@
         notice = notice ? `${notice}；${msg}` : msg;
       }
     }
-    const userContent = buildUserTurnContent({
+    let userContent = buildUserTurnContent({
       question,
       quote,
       chapter: ctx,
@@ -835,6 +1168,7 @@
       range: scopeUsed === "range" ? rangeUsed || undefined : undefined,
       rangeChapters: scopeUsed === "range" ? rangeChapters : undefined,
     });
+    if (userMsg.continuation) userContent += "\n\n" + CONTINUE_HINT;
     const reqMessages: AiMessage[] = buildChatRequestMessages({
       systemPrompt,
       history,
@@ -851,6 +1185,21 @@
     let toolRounds = 0;
     let toolCallCount = 0;
     let toolNotice = "";
+    /** 工具循环可能多轮，用量按轮累加；服务商不返回时保持 undefined */
+    let usageTotal: AiUsageSnapshot | undefined;
+    const mergeUsage = (u: any): void => {
+      if (!u) return;
+      const prompt = Number(u.promptTokens) || 0;
+      const completion = Number(u.completionTokens) || 0;
+      const total = Number(u.totalTokens) || prompt + completion;
+      if (!prompt && !completion && !total) return;
+      const prev = usageTotal;
+      usageTotal = {
+        promptTokens: (prev?.promptTokens || 0) + prompt || undefined,
+        completionTokens: (prev?.completionTokens || 0) + completion || undefined,
+        totalTokens: (prev?.totalTokens || 0) + total,
+      };
+    };
 
     abortCtrl = new AbortController();
     const signal = abortCtrl.signal;
@@ -882,8 +1231,7 @@
         res = { ok: false, content: "", error: e?.message || String(e) };
       }
       flushNow();
-
-      // 首轮就被拒且错误像「不支持 tools」→ 关掉工具重试一次，至少给普通回答
+      mergeUsage(res?.usage);
       if (
         useTools &&
         res?.ok === false &&
@@ -943,6 +1291,7 @@
     // 4) 收尾：保留已生成的部分内容，错误也落进消息里（可复制/重试）
     const finalText = String(tokenBuf || res?.content || "");
     const done: AiChatMessage = { ...assistant, content: finalText };
+    if (usageTotal) done.usage = usageTotal;
     const reasoning = String(reasonBuf || res?.reasoning || "");
     if (reasoning.trim()) done.reasoning = reasoning;
     if (trace.length) done.tools = trace.slice();
@@ -974,7 +1323,9 @@
     if (res?.aborted) done.aborted = true;
     if (!res?.ok) {
       done.error = true;
-      done.content = finalText || String(res?.error || t("请求失败，请稍后重试"));
+      // 已生成的部分保留在气泡里；错误原文先脱敏再落盘，避免凭据随导出/存储外泄
+      done.errorText = maskApiKeyInText(String(res?.error || ""), cred.apiKey).trim()
+        || t("请求失败，请稍后重试");
     }
     if (toolNotice) notice = notice ? `${notice}；${toolNotice}` : toolNotice;
 
@@ -1001,11 +1352,15 @@
   }
 
   function newChat(): void {
+    if (!leaveEditGuard()) return;
     discardActiveTurn();
     persistChat();
     const active = activeSessionOf(sessionState);
     showHistory = false;
     historyQuery = "";
+    historyMenu = "";
+    historyToolsOpen = false;
+    cancelRename();
     // 当前就是空会话：别再叠一条「新对话」，只清输入
     if (active && !active.messages.length) {
       composer?.clear?.();
@@ -1026,6 +1381,7 @@
   }
 
   function switchSession(id: string): void {
+    if (!leaveEditGuard()) return;
     discardActiveTurn();
     if (id === sessionState.activeId) {
       showHistory = false;
@@ -1037,6 +1393,9 @@
     messages = active ? active.messages.slice() : [];
     showHistory = false;
     historyQuery = "";
+    historyMenu = "";
+    historyToolsOpen = false;
+    cancelRename();
     composer?.clear?.();
     resetTransientUi();
     void tick().then(() => autoScroll(true));
@@ -1070,33 +1429,186 @@
     messages = [];
     showHistory = false;
     historyQuery = "";
+    historyMenu = "";
+    historyToolsOpen = false;
+    cancelRename();
     composer?.clear?.();
     resetTransientUi();
   }
 
-  function historyGroups(): Array<{ bucket: SessionDayBucket; label: string; items: AiChatSession[] }> {
+  /** 平铺列表：置顶优先 + 最近更新；搜索覆盖标题、预览与全部消息正文 */
+  function historyList(): AiChatSession[] {
     const q = historyQuery.trim().toLowerCase();
-    const list = sessionState.sessions
-      .filter((s) => {
+    return sortSessionsForHistory(
+      sessionState.sessions.filter((s) => {
+        if (historyFilter === "pinned" && !s.pinned) return false;
         if (!q) return true;
         const hay = [s.title, sessionPreview(s, 200), ...s.messages.map((m) => m.content)].join("\n").toLowerCase();
         return hay.includes(q);
-      })
-      .slice()
-      .sort((a, b) => b.updatedAt - a.updatedAt);
-    const labels: Record<SessionDayBucket, string> = {
-      today: t("今天"),
-      yesterday: t("昨天"),
-      earlier: t("更早"),
-    };
-    const order: SessionDayBucket[] = ["today", "yesterday", "earlier"];
-    return order
-      .map((bucket) => ({ bucket, label: labels[bucket], items: list.filter((s) => sessionDayBucket(s.updatedAt) === bucket) }))
-      .filter((g) => g.items.length > 0);
+      }),
+    );
+  }
+
+  /** 行内时间：今天/昨天带时分，更早只给月日（列表本身已按时间倒序） */
+  function historyTimeLabel(at: number): string {
+    const bucket = sessionDayBucket(at);
+    const clock = sessionClock(at);
+    if (bucket === "today") return `${t("今天")} ${clock}`;
+    if (bucket === "yesterday") return `${t("昨天")} ${clock}`;
+    try {
+      return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(new Date(at));
+    } catch {
+      return clock;
+    }
+  }
+
+  function measureHistory(): void {
+    if (!showHistory || !panelEl || !headerEl) return;
+    const pr = panelEl.getBoundingClientRect();
+    const hr = headerEl.getBoundingClientRect();
+    historyTop = Math.max(0, Math.round(hr.bottom - pr.top + 6));
+    historyMaxH = Math.max(200, Math.round(pr.height - historyTop - 8));
+  }
+
+  async function toggleHistory(): Promise<void> {
+    if (showHistory) {
+      closeHistory();
+      return;
+    }
+    tab = "chat";
+    showHistory = true;
+    historyMenu = "";
+    historyToolsOpen = false;
+    await tick();
+    measureHistory();
+    historyEl?.focus();
+  }
+
+  function closeHistory(restoreFocus = true): void {
+    if (!showHistory) return;
+    const hadFocus = !!historyEl && typeof document !== "undefined" && historyEl.contains(document.activeElement);
+    showHistory = false;
+    historyMenu = "";
+    historyToolsOpen = false;
+    cancelRename();
+    if (restoreFocus && hadFocus) void tick().then(() => historyBtnEl?.focus());
+  }
+
+  function setHistoryFilter(next: "all" | "pinned"): void {
+    if (historyFilter === next) return;
+    historyFilter = next;
+    historyMenu = "";
+    cancelRename();
+  }
+
+  function onHistoryKey(e: KeyboardEvent): void {
+    if (!showHistory || e.key !== "Escape") return;
+    if (renamingId) {
+      e.preventDefault();
+      cancelRename();
+      return;
+    }
+    if (historyMenu) {
+      e.preventDefault();
+      historyMenu = "";
+      return;
+    }
+    if (historyToolsOpen) {
+      e.preventDefault();
+      historyToolsOpen = false;
+      return;
+    }
+    e.preventDefault();
+    closeHistory();
   }
 
   function sessionTitleOf(s: AiChatSession): string {
     return s.title || titleFromMessages(s.messages) || t("新对话");
+  }
+
+  async function startRename(s: AiChatSession): Promise<void> {
+    historyMenu = "";
+    renamingId = s.id;
+    renameText = sessionTitleOf(s);
+    await tick();
+    renameEl?.focus();
+    renameEl?.select();
+  }
+
+  function cancelRename(): void {
+    renamingId = "";
+    renameText = "";
+  }
+
+  function commitRename(): void {
+    const id = renamingId;
+    const nextTitle = renameText.trim();
+    renamingId = "";
+    renameText = "";
+    if (!id || !nextTitle) return;
+    const target = sessionState.sessions.find((s) => s.id === id);
+    if (!target || target.title === nextTitle) return;
+    sessionState = saveSessionState(storage(), bookId, {
+      ...sessionState,
+      sessions: sessionState.sessions.map((s) => (s.id === id ? renameSession(s, nextTitle) : s)),
+    });
+  }
+
+  function onRenameKey(e: KeyboardEvent): void {
+    e.stopPropagation();
+    if (e.isComposing) return;
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commitRename();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      cancelRename();
+    }
+  }
+
+  function togglePin(s: AiChatSession): void {
+    if (!s.pinned && sessionState.sessions.filter((x) => x.pinned).length >= MAX_TOTAL_SESSIONS) {
+      notice = t("置顶会话已达 {n} 条上限", { n: MAX_TOTAL_SESSIONS });
+      return;
+    }
+    historyMenu = "";
+    sessionState = saveSessionState(storage(), bookId, setSessionPinned(sessionState, s.id, !s.pinned));
+  }
+
+  function downloadText(name: string, text: string, mime: string): void {
+    const blob = new Blob([text], { type: mime });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    a.style.display = "none";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportSession(s: AiChatSession, format: "md" | "json"): void {
+    historyMenu = "";
+    if (!s.messages.length) {
+      notice = t("这条会话还没有消息，没什么可导出的");
+      return;
+    }
+    persistChat();
+    const current = sessionState.sessions.find((x) => x.id === s.id) || s;
+    const meta = { bookTitle, bookId };
+    try {
+      const name = sessionExportFileName(current, format, meta);
+      if (format === "json") {
+        downloadText(name, buildSessionJson(current, meta), "application/json;charset=utf-8");
+      } else {
+        downloadText(name, buildSessionMarkdown(current, meta), "text/markdown;charset=utf-8");
+      }
+      notice = t("已导出 {name}", { name });
+    } catch (e) {
+      logSwallow(e, "AiPanel.svelte · exportSession", "warn");
+      notice = t("导出失败，请重试");
+    }
   }
 
   /* ============================ 对话效率（P4-C） ============================ */
@@ -1143,6 +1655,9 @@
   function onWindowClick(e: MouseEvent): void {
     const el = e.target as HTMLElement | null;
     if (showToc && !el?.closest?.(".ai-ctx-wrap")) showToc = false;
+    if (showHistory && !el?.closest?.(".ai-history, .ai-history-btn")) closeHistory();
+    if (historyToolsOpen && !el?.closest?.(".ai-history-tools")) historyToolsOpen = false;
+    if (historyMenu && !el?.closest?.(".ai-history-menu, .ai-history-more")) historyMenu = "";
     if (!modelMenu) return;
     if (el?.closest?.(".ai-model-pop, .ai-model-pill")) return;
     modelMenu = false;
@@ -1440,8 +1955,7 @@
     if (!answer) return;
     syncCred();
     if (!isAiReady(cred)) {
-      tab = "settings";
-      loadDraft();
+      openSettings();
       notice = t("请先在设置里填写接口地址与模型");
       return;
     }
@@ -1570,100 +2084,23 @@
     mindmapView = { messageId: m.id, root };
   }
 
-  /* ============================ 设置表单 ============================ */
-
-  let cfg = { baseUrl: "", apiKey: "", model: "", models: [] as string[], temperature: 0.3, maxTokens: 2048 };
-  let showKey = false;
-  let saveState: "idle" | "saving" | "saved" | "error" = "idle";
-  let saveError = "";
-  let fetchState: "idle" | "loading" | "done" | "error" = "idle";
-  let fetchError = "";
-
-  function loadDraft(): void {
-    const v = toAiCredentialView(getAiSettings?.() || null);
-    cfg = {
-      baseUrl: v.baseUrl,
-      apiKey: v.apiKey,
-      model: v.model,
-      models: v.models.slice(),
-      temperature: v.temperature,
-      maxTokens: v.maxTokens,
-    };
-    saveState = "idle";
-    saveError = "";
-    fetchState = "idle";
-    fetchError = "";
-  }
+  /* ============================ 设置窗口 ============================ */
 
   function openSettings(): void {
-    if (tab !== "settings") {
-      tab = "settings";
-      loadDraft();
-    }
+    syncCred();
+    settingsOpen = true;
   }
 
-  async function refreshModels(): Promise<void> {
-    fetchState = "loading";
-    fetchError = "";
-    try {
-      const list = await fetchModelList(cfg.baseUrl, cfg.apiKey);
-      cfg = { ...cfg, models: list };
-      fetchState = "done";
-    } catch (e: any) {
-      fetchState = "error";
-      fetchError = e?.message || String(e);
-    }
-  }
-
-  async function saveSettings(): Promise<void> {
-    const baseUrl = String(cfg.baseUrl || "").trim();
-    const model = String(cfg.model || "").trim();
-    if (!baseUrl) {
-      saveState = "error";
-      saveError = t("请填写接口地址");
-      return;
-    }
-    if (!model) {
-      saveState = "error";
-      saveError = t("请填写或选择模型");
-      return;
-    }
-    saveState = "saving";
-    saveError = "";
-    try {
-      const patch = mergeAiCredentials(getAiSettings?.() || null, {
-        baseUrl,
-        apiKey: cfg.apiKey,
-        model,
-        models: cfg.models,
-        temperature: cfg.temperature,
-        maxTokens: cfg.maxTokens,
-      });
-      await saveAiSettings?.(patch);
-      syncCred();
-      persistPrefs();
-      saveState = "saved";
-      setTimeout(() => {
-        if (saveState === "saved") saveState = "idle";
-      }, 2000);
-    } catch (e: any) {
-      saveState = "error";
-      saveError = e?.message || String(e);
-    }
-  }
-
-  function updatePrefs(patch: Partial<AiPanelPrefs>): void {
-    prefs = normalizeAiPanelPrefs({ ...prefs, ...patch });
+  /** 窗口保存偏好后回填面板：宽度、范围、字号与发送键都即时生效 */
+  function applyPrefsFromDialog(next: AiPanelPrefs): void {
+    prefs = normalizeAiPanelPrefs(next);
+    width = clampWidth(prefs.width);
+    contextScope = normalizeContextScope(prefs.contextScope);
     persistPrefs();
+    syncCred();
   }
 
   // 模板表达式走 acorn（纯 JS），不能写 `as HTMLInputElement` 这类 TS 断言，故取值收进脚本。
-  function numOf(e: Event): number {
-    return Number((e.currentTarget as HTMLInputElement).value);
-  }
-  function checkedOf(e: Event): boolean {
-    return (e.currentTarget as HTMLInputElement).checked;
-  }
   function textOf(e: Event): string {
     return (e.currentTarget as HTMLInputElement).value;
   }
@@ -1722,10 +2159,14 @@
   /* ============================ 展示辅助 ============================ */
 
   let title = "";
-  $: title = String(bookTitle || "").trim();
-  $: subline = [String(bookAuthor || "").trim(), String(chapterLabel || "").trim()].filter(Boolean).join(" · ");
+  $: title = general ? t("AI 助手") : String(bookTitle || "").trim();
+  $: subline = general
+    ? t("通用对话")
+    : [String(bookAuthor || "").trim(), String(chapterLabel || "").trim()].filter(Boolean).join(" · ");
   /** 头部封面块：取书名首字，没有书名就用助手图标位 */
-  $: coverChar = title ? title.slice(0, 1) : "✦";
+  $: coverChar = title && !general ? title.slice(0, 1) : "✦";
+  /** 对话里助手的自称：通用模式不再叫「阅读助手」 */
+  $: assistantLabel = general ? t("AI 助手") : t("阅读助手");
   /** 已存笔记（跨会话汇总；新→旧） */
   $: savedNotes = collectSessionNotes(sessionState);
 
@@ -1736,6 +2177,17 @@
     { label: t("解释这段"), text: t("解释我选中的这段话，结合上下文说明它的作用。"), sub: t("需先划词"), icon: "解" },
   ];
 
+  const GENERAL_QUICK_ASKS: Array<{ label: string; text: string; sub: string; icon: string }> = [
+    { label: t("总结要点"), text: t("帮我把这段话的要点总结成三条。"), sub: t("随手可用"), icon: "摘" },
+    { label: t("解释概念"), text: t("用一个通俗的例子解释这个概念。"), sub: t("随口问"), icon: "解" },
+    { label: t("列个提纲"), text: t("帮我列一份清晰的提纲。"), sub: t("通用"), icon: "纲" },
+    { label: t("画成导图"), text: t(MINDMAP_QUICK_ASK), sub: t("结构输出"), icon: "图" },
+  ];
+
+  $: quickAsks = general ? GENERAL_QUICK_ASKS : QUICK_ASKS;
+  // 通用模式没有书，笔记落点/已存笔记都无意义；停留在笔记页会看到空壳
+  $: if (general && tab === "notes") tab = "chat";
+
   function quickAsk(item: { text: string; label: string }): void {
     if (item.label === t("解释这段") && !pendingQuote) {
       notice = t("请先在正文里划词，再点「问 AI」把选段带进来");
@@ -1745,9 +2197,16 @@
   }
 </script>
 
-<svelte:window on:click={onWindowClick} />
+<svelte:window on:click={onWindowClick} on:keydown={onHistoryKey} on:resize={measureHistory} />
 
-<aside class="ai-panel" class:is-overlay={overlay} aria-label={t("阅读助手")}>
+<aside
+  class="ai-panel"
+  bind:this={panelEl}
+  class:paper={prefs.aiSkin === "paper"}
+  class:is-overlay={overlay}
+  style={`--re-ai-font-size:${fontSizes.message}px;--re-ai-input-font-size:${fontSizes.input}px`}
+  aria-label={t("阅读助手")}
+>
   {#if resizable}
     <div
       class="ai-resizer"
@@ -1769,36 +2228,49 @@
     ><span class="ai-resizer-grip" aria-hidden="true"></span></div>
   {/if}
 
-  <header class="ai-hd">
+  <header class="ai-hd" bind:this={headerEl}>
     <div class="ai-cover" aria-hidden="true">{coverChar}</div>
     <div class="ai-hd-main">
       <div class="ai-hd-title" title={title || t("阅读助手")}>{title || t("阅读助手")}</div>
       <div class="ai-hd-sub" title={`${title}${subline ? " · " + subline : ""}`}>
         {#if subline}<span>{subline}</span><span class="ai-hd-dot">·</span>{/if}
-        <span>{t("阅读助手")}</span>
+        <span>{assistantLabel}</span>
       </div>
     </div>
     <div class="ai-hd-actions">
       <button
-        class="ai-icon-btn"
+        bind:this={historyBtnEl}
+        class="ai-icon-btn ai-history-btn"
         class:on={showHistory}
         title={t("历史会话")}
         aria-label={t("历史会话")}
-        on:click={() => {
-          tab = "chat";
-          showHistory = true;
-        }}
+        aria-haspopup="dialog"
+        aria-expanded={showHistory}
+        on:click={() => void toggleHistory()}
       >
-        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M3.1 8a4.9 4.9 0 1 0 1.5-3.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-          <path d="M3.1 2.6v2.3h2.3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
-          <path d="M8 5.4V8l2 1.2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M3 3v5h5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+          <path d="M12 7v5l4 2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
       </button>
       <button class="ai-icon-btn" title={t("新对话")} aria-label={t("新对话")} on:click={newChat}>
-        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-          <path d="M8 3.2v9.6M3.2 8h9.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M12 5.4v13.2M5.4 12h13.2" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
         </svg>
+      </button>
+      <button
+        class="ai-icon-btn"
+        class:on={settingsOpen}
+        title={isAiReady(cred) ? t("设置") : t("尚未配置 AI 模型")}
+        aria-label={t("设置")}
+        on:click={openSettings}
+      >
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M4 6h6.4M14.4 6H20M4 12h3.4M11.4 12H20M4 18h7.4M15.4 18H20" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+          <path d="M12.6 4v4M9.6 10v4M13.6 16v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+        </svg>
+        {#if !isAiReady(cred)}<span class="ai-icon-dot" aria-hidden="true"></span>{/if}
       </button>
       {#if onOpenTab}
         <button
@@ -1807,16 +2279,16 @@
           aria-label={t("在新页签打开")}
           on:click={() => onOpenTab?.()}
         >
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M6.4 3.2H3.4a1 1 0 0 0-1 1v8.4a1 1 0 0 0 1 1h8.4a1 1 0 0 0 1-1v-3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
-            <path d="M9.4 2.6h4v4M13.1 2.9L7.6 8.4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" />
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M18.5 13.5V19a1.5 1.5 0 0 1-1.5 1.5H5A1.5 1.5 0 0 1 3.5 19V6.5A1.5 1.5 0 0 1 5 5h5.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+            <path d="M14 4h6v6M19.7 4.3 12.6 11.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
       {/if}
       {#if onClose}
         <button class="ai-icon-btn" title={t("收起面板")} aria-label={t("收起面板")} on:click={() => onClose?.()}>
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M4 4l8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M6 6l12 12M18 6 6 18" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
           </svg>
         </button>
       {/if}
@@ -1824,61 +2296,162 @@
   </header>
 
   {#if showHistory}
-    <div class="ai-history" role="dialog" aria-label={t("历史会话")}>
+    <div
+      class="ai-history"
+      role="dialog"
+      aria-label={t("历史会话")}
+      tabindex="-1"
+      bind:this={historyEl}
+      style={`top:${historyTop}px;max-height:${historyMaxH}px`}
+    >
       <div class="ai-history-hd">
-        <span class="ai-history-hd-title">{t("历史会话")}</span>
-        <span class="ai-history-hd-count">{sessionState.sessions.length} {t("条会话")}</span>
-        <button class="ai-note-x" aria-label={t("关闭")} on:click={() => (showHistory = false)}>×</button>
+        <div class="ai-history-tabs" role="tablist" aria-label={t("会话筛选")}>
+          <button
+            class="ai-history-tab"
+            class:on={historyFilter === "all"}
+            role="tab"
+            aria-selected={historyFilter === "all"}
+            on:click={() => setHistoryFilter("all")}
+          >{t("全部")}</button>
+          <button
+            class="ai-history-tab"
+            class:on={historyFilter === "pinned"}
+            role="tab"
+            aria-selected={historyFilter === "pinned"}
+            on:click={() => setHistoryFilter("pinned")}
+          >{t("置顶")}</button>
+        </div>
+        <div class="ai-history-tools">
+          <button
+            class="ai-history-tools-btn"
+            title={t("清空全部")}
+            aria-label={t("清空全部")}
+            aria-haspopup="menu"
+            aria-expanded={historyToolsOpen}
+            on:click={() => (historyToolsOpen = !historyToolsOpen)}
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+              <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
+            </svg>
+          </button>
+          {#if historyToolsOpen}
+            <div class="ai-history-tools-menu" role="menu">
+              <button role="menuitem" class="danger" on:click={clearAllSessions}>{t("清空全部")}</button>
+            </div>
+          {/if}
+        </div>
+        <button class="ai-history-new" on:click={newChat}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+          </svg>
+          <span>{t("新建会话")}</span>
+        </button>
       </div>
       <label class="ai-history-search">
-        <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+        <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
           <circle cx="7" cy="7" r="4.2" stroke="currentColor" stroke-width="1.4" />
           <path d="M10.2 10.2L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
         </svg>
         <input
           type="text"
           spellcheck="false"
-          placeholder={t("搜索会话")}
+          aria-label={t("搜索会话标题或对话内容")}
+          placeholder={t("搜索会话标题或对话内容")}
           value={historyQuery}
-          on:input={(e) => (historyQuery = textOf(e))}
+          on:input={(e) => {
+            historyQuery = textOf(e);
+            historyMenu = "";
+          }}
         />
       </label>
       <div class="ai-history-list">
-        {#each historyGroups() as group (group.bucket)}
-          <div class="ai-history-group">{group.label}</div>
-          {#each group.items as s (s.id)}
-            <div class="ai-history-item" class:on={s.id === sessionState.activeId}>
+        {#each historyList() as s (s.id)}
+          <div class="ai-history-item" class:on={s.id === sessionState.activeId}>
+            {#if renamingId === s.id}
+              <div class="ai-history-rename">
+                <input
+                  class="ai-history-rename-input"
+                  bind:this={renameEl}
+                  bind:value={renameText}
+                  maxlength="60"
+                  aria-label={t("会话标题")}
+                  on:keydown={onRenameKey}
+                />
+                <button class="ai-history-rename-ok" aria-label={t("保存")} title={t("保存")} on:click={commitRename}>
+                  <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M3.4 8.3l3 3 6.2-6.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </button>
+                <button class="ai-history-rename-cancel" aria-label={t("取消")} title={t("取消")} on:click={cancelRename}>×</button>
+              </div>
+            {:else}
               <button class="ai-history-main" on:click={() => switchSession(s.id)}>
-                <span class="ai-history-item-title">{sessionTitleOf(s)}</span>
-                <span class="ai-history-item-sub">{sessionPreview(s) || t("还没有消息")}</span>
+                <span class="ai-history-item-title">
+                  {#if s.pinned}<span class="ai-history-pinned" title={t("已置顶")} aria-label={t("已置顶")}>
+                    <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M9.3 2.6l4.1 4.1-1.6 1.6-.5-.5-2.5 2.5.2 2.9-1.1 1.1-3-3-2.4 2.4-.2-1.4 2.4-2.4-3-3 1.1-1.1 2.9.2 2.5-2.5-.5-.5z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+                    </svg>
+                  </span>{/if}
+                  <span class="ai-history-item-text">{sessionTitleOf(s)}</span>
+                  {#if s.titleSource === "ai"}
+                    <span class="ai-history-ai" title={t("AI 自动命名")} aria-label={t("AI 自动命名")}>✦ AI</span>
+                  {/if}
+                </span>
                 <span class="ai-history-item-meta">
-                  <span>{sessionClock(s.updatedAt)}</span>
-                  <span>· {s.messages.length} {t("条消息")}</span>
+                  <span>{historyTimeLabel(s.updatedAt)}</span>
+                  {#if s.messages.length}
+                    <span class="ai-history-meta-dot" aria-hidden="true">·</span>
+                    <span>{s.messages.length} {t("条消息")}</span>
+                  {/if}
                 </span>
               </button>
-              <button
-                class="ai-history-del"
-                title={t("删除会话")}
-                aria-label={t("删除会话")}
-                on:click={() => deleteSession(s.id)}
-              >
-                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                  <path d="M3.5 4.5h9M6.5 4.5V3.4h3v1.1M5 4.5l.5 8h5l.5-8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
-                </svg>
-              </button>
-            </div>
-          {/each}
+              <div class="ai-history-actions">
+                <button
+                  class="ai-history-more"
+                  title={t("会话操作")}
+                  aria-label={t("会话操作")}
+                  aria-haspopup="menu"
+                  aria-expanded={historyMenu === s.id}
+                  on:click={() => (historyMenu = historyMenu === s.id ? "" : s.id)}
+                >⋯</button>
+                <button
+                  class="ai-history-del"
+                  title={t("删除会话")}
+                  aria-label={t("删除会话")}
+                  on:click={() => deleteSession(s.id)}
+                >
+                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                    <path d="M3.5 4.5h9M6.5 4.5V3.4h3v1.1M5 4.5l.5 8h5l.5-8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
+                  </svg>
+                </button>
+              </div>
+              {#if historyMenu === s.id}
+                <div class="ai-history-menu" role="menu">
+                  <button role="menuitem" on:click={() => startRename(s)}>{t("重命名")}</button>
+                  <button role="menuitem" on:click={() => togglePin(s)}>
+                    {s.pinned ? t("取消置顶") : t("置顶")}
+                  </button>
+                  <button
+                    role="menuitem"
+                    disabled={!s.messages.length}
+                    on:click={() => exportSession(s, "md")}
+                  >{t("导出 Markdown")}</button>
+                  <button
+                    role="menuitem"
+                    disabled={!s.messages.length}
+                    on:click={() => exportSession(s, "json")}
+                  >{t("导出 JSON")}</button>
+                  <button role="menuitem" class="danger" on:click={() => deleteSession(s.id)}>{t("删除会话")}</button>
+                </div>
+              {/if}
+            {/if}
+          </div>
         {/each}
-        {#if !historyGroups().length}
+        {#if !historyList().length}
           <div class="ai-history-empty">
-            {historyQuery ? t("没有匹配的会话") : t("还没有历史会话")}
+            {historyQuery ? t("没有匹配的会话") : historyFilter === "pinned" ? t("还没有置顶会话") : t("还没有历史会话")}
           </div>
         {/if}
-      </div>
-      <div class="ai-history-foot">
-        <button class="ai-btn primary" on:click={newChat}>{t("新建对话")}</button>
-        <span class="ai-bar-spacer"></span>
-        <button class="ai-btn" on:click={clearAllSessions}>{t("清空全部")}</button>
       </div>
     </div>
   {/if}
@@ -1891,26 +2464,18 @@
       aria-selected={tab === "chat"}
       on:click={() => (tab = "chat")}
     >{t("对话")}</button>
-    <button
-      class="ai-tab"
-      class:on={tab === "notes"}
-      role="tab"
-      aria-selected={tab === "notes"}
-      on:click={() => (tab = "notes")}
-    >
-      {t("笔记")}
-      {#if savedNotes.length}<span class="ai-tab-badge">{savedNotes.length}</span>{/if}
-    </button>
-    <button
-      class="ai-tab"
-      class:on={tab === "settings"}
-      role="tab"
-      aria-selected={tab === "settings"}
-      on:click={openSettings}
-    >
-      {t("设置")}
-      {#if !isAiReady(cred)}<span class="ai-tab-dot" title={t("尚未配置 AI 模型")}></span>{/if}
-    </button>
+    {#if !general}
+      <button
+        class="ai-tab"
+        class:on={tab === "notes"}
+        role="tab"
+        aria-selected={tab === "notes"}
+        on:click={() => (tab = "notes")}
+      >
+        {t("笔记")}
+        {#if savedNotes.length}<span class="ai-tab-badge">{savedNotes.length}</span>{/if}
+      </button>
+    {/if}
   </div>
 
   {#if tab === "chat"}
@@ -1924,12 +2489,14 @@
 
       {#if !messages.length}
         <div class="ai-empty">
-          <div class="ai-empty-title">{t("就这本书提问")}</div>
+          <div class="ai-empty-title">{general ? t("有什么可以帮你？") : t("就这本书提问")}</div>
           <div class="ai-empty-sub">
-            {t("回答只依据当前章节与你的选段；原文引用可点回正文。")}
+            {general
+              ? t("可以问任何问题；打开一本书后会自动接上当前章节。")
+              : t("回答只依据当前章节与你的选段；原文引用可点回正文。")}
           </div>
           <div class="ai-hints">
-            {#each QUICK_ASKS as item (item.label)}
+            {#each quickAsks as item (item.label)}
               <button class="ai-hint" on:click={() => quickAsk(item)}>
                 <span class="ai-hint-ico" aria-hidden="true">{item.icon}</span>
                 <span class="ai-hint-label">{item.label}</span>
@@ -1952,7 +2519,37 @@
                 <span class="ai-qchip-text">{quoteChipLabel(m.quote)}</span>
               </button>
             {/if}
-            <div class="ai-bubble">{m.content}</div>
+            {#if editingId === m.id}
+              <div class="ai-edit">
+                <textarea
+                  class="ai-edit-input"
+                  bind:this={editEl}
+                  bind:value={editText}
+                  on:keydown={onEditKeydown}
+                  rows="3"
+                  aria-label={t("编辑问题")}
+                ></textarea>
+                <div class="ai-edit-foot">
+                  <span class="ai-edit-hint">
+                    {sendShortcut === "mod+enter"
+                      ? t("⌘/Ctrl + Enter 发送 · Esc 取消")
+                      : t("Enter 发送 · Shift + Enter 换行 · Esc 取消")}
+                  </span>
+                  <button class="ai-link" on:click={cancelEdit}>{t("取消")}</button>
+                  <button
+                    class="ai-btn primary"
+                    disabled={!editText.trim() || streaming}
+                    on:click={() => resendEdited(m)}
+                  >{t("重新发送")}</button>
+                </div>
+              </div>
+            {:else}
+              <div class="ai-bubble">{m.content}</div>
+              <div class="ai-user-foot">
+                <span class="ai-msg-time" title={new Date(m.createdAt).toLocaleString()}>{sessionClock(m.createdAt)}</span>
+                <button class="ai-link" disabled={streaming} on:click={() => startEdit(m)}>{t("编辑")}</button>
+              </div>
+            {/if}
           </div>
         {:else}
           {@const segs = segmentsOf(m)}
@@ -1960,7 +2557,7 @@
           <div class="ai-msg assistant">
             <div class="ai-role">
               <span class="ai-spark small" aria-hidden="true">✦</span>
-              <span>{t("阅读助手")}</span>
+              <span>{assistantLabel}</span>
               {#if streaming && m.id === streamMsgId && !shownContent(m)}
                 <span class="ai-typing">{toolsOf(m).length ? t("正在翻阅原文…") : t("正在思考…")}</span>
               {/if}
@@ -1993,6 +2590,7 @@
                   <div
                     class="ai-md"
                     class:is-error={m.error}
+                    use:codeCopy
                     on:click={onMdClick}
                     on:mouseover={onRefOver}
                     on:mouseout={onRefOut}
@@ -2003,15 +2601,51 @@
               {/each}
             {/if}
 
+            {#if m.error && (!streaming || m.id !== streamMsgId)}
+              {@const err = errorInfoOf(m)}
+              <div class="ai-error-card" role="alert">
+                <div class="ai-error-row">
+                  <span class="ai-error-ico" aria-hidden="true">!</span>
+                  <span class="ai-error-main">
+                    <strong>{err.title}</strong>
+                    <span class="ai-error-hint">{err.hint}</span>
+                  </span>
+                  <span class="ai-error-actions">
+                    <button class="ai-btn primary" disabled={streaming} on:click={() => retryMessage(m)}>
+                      {t("重试")}
+                    </button>
+                    <button class="ai-btn" disabled={streaming} on:click={() => copyError(m)}>
+                      {copiedErrorId === m.id ? t("已复制") : t("复制错误")}
+                    </button>
+                  </span>
+                </div>
+                <details class="ai-error-detail">
+                  <summary>{t("查看错误详情")}</summary>
+                  <pre>{maskedError(m)}</pre>
+                </details>
+              </div>
+            {/if}
+
             {#if !streaming || m.id !== streamMsgId}
               <div class="ai-foot">
                 {#if receipt}
                   <span class="ai-receipt" title={t("本轮随提问附带的章节上下文")}>{receipt}</span>
                 {/if}
+                {#if prefs.showUsage && m.usage}
+                  <span class="ai-usage" title={t("本轮 token 用量")}>{formatUsage(m.usage)}</span>
+                {/if}
                 <span class="ai-msg-time" title={new Date(m.createdAt).toLocaleString()}>{sessionClock(m.createdAt)}</span>
                 {#if m.aborted}<span class="ai-flag">{t("已停止")}</span>{/if}
                 {#if m.error}<span class="ai-flag err">{t("失败")}</span>{/if}
                 <span class="ai-foot-spacer"></span>
+                {#if m.aborted}
+                  <button
+                    class="ai-link on"
+                    disabled={streaming}
+                    title={t("沿用同一提问，接着上次的回答继续")}
+                    on:click={() => continueMessage(m)}
+                  >{t("继续")}</button>
+                {/if}
                 {#if onLocate && quoteOfAssistant(idx)}
                   <button class="ai-link" on:click={() => locateQuote(quoteOfAssistant(idx))}>{t("定位原文")}</button>
                 {/if}
@@ -2120,6 +2754,7 @@
         </div>
       {/if}
 
+      {#if !general}
       <div class="ai-ctx-wrap">
         {#if showToc}
           <div class="ai-toc-pop" role="dialog" aria-label={t("选择章节范围")}>
@@ -2173,32 +2808,34 @@
             </div>
           </div>
         {/if}
-        <div class="ai-ctx-row" role="group" aria-label={t("阅读上下文")}>
-          <button
-            class="ai-ctx-chip"
-            class:on={!readRange && contextScope === "page"}
-            aria-pressed={!readRange && contextScope === "page"}
-            title={t("只发送当前可见页，省 token、更聚焦")}
-            on:click={() => setContextScope("page")}
-          >{t("本页")}</button>
-          <button
-            class="ai-ctx-chip"
-            class:on={!readRange && contextScope === "chapter"}
-            aria-pressed={!readRange && contextScope === "chapter"}
-            title={t("发送当前整章正文")}
-            on:click={() => setContextScope("chapter")}
-          >{t("本章")}</button>
-          {#if getToc}
+        <div class="ai-ctx-row" role="group" aria-label={general ? t("附加资料") : t("阅读上下文")}>
+          {#if !general}
             <button
               class="ai-ctx-chip"
-              class:on={!!readRange}
-              aria-pressed={!!readRange}
-              aria-expanded={showToc}
-              title={readRange
-                ? t("本轮读取 {range}，点击调整", { range: scopeSummary() })
-                : t("从目录选择一段章节，让助手先读再答")}
-              on:click={toggleToc}
-            >{t("目录")}</button>
+              class:on={!readRange && contextScope === "page"}
+              aria-pressed={!readRange && contextScope === "page"}
+              title={t("只发送当前可见页，省 token、更聚焦")}
+              on:click={() => setContextScope("page")}
+            >{t("本页")}</button>
+            <button
+              class="ai-ctx-chip"
+              class:on={!readRange && contextScope === "chapter"}
+              aria-pressed={!readRange && contextScope === "chapter"}
+              title={t("发送当前整章正文")}
+              on:click={() => setContextScope("chapter")}
+            >{t("本章")}</button>
+            {#if getToc}
+              <button
+                class="ai-ctx-chip"
+                class:on={!!readRange}
+                aria-pressed={!!readRange}
+                aria-expanded={showToc}
+                title={readRange
+                  ? t("本轮读取 {range}，点击调整", { range: scopeSummary() })
+                  : t("从目录选择一段章节，让助手先读再答")}
+                on:click={toggleToc}
+              >{t("目录")}</button>
+            {/if}
           {/if}
           <button
             class="ai-ctx-chip ai-ctx-note"
@@ -2218,11 +2855,17 @@
           </button>
         </div>
       </div>
+      {/if}
 
       <AiComposer
         bind:this={composer}
         bind:hasText={composerHasText}
-        placeholder={isAiReady(cred) ? t("就这本书提问…") : t("请先在设置里配置 AI 模型")}
+        {sendShortcut}
+        placeholder={!isAiReady(cred)
+          ? t("请先在设置里配置 AI 模型")
+          : general
+            ? t("输入问题…")
+            : t("就这本书提问…")}
         onSubmit={send}
       />
 
@@ -2258,9 +2901,13 @@
           <span class="ai-model-name">{cred.model || t("未配置模型")}</span>
           <span class="ai-caret" aria-hidden="true">›</span>
         </button>
-        <span class="ai-ctx-hint" title={t("每次提问附带所选范围正文，超出上限自动截断")}>
-          {scopeSummary()} · {prefs.contextChars.toLocaleString()}{t(" 字")}{#if knowledge && knowledgeOn} · {t("知识区")}{/if}
-        </span>
+        {#if !general}
+          <span class="ai-ctx-hint" title={t("每次提问附带所选范围正文，超出上限自动截断")}>
+            {scopeSummary()} · {prefs.contextChars.toLocaleString()}{t(" 字")}{#if knowledge && knowledgeOn} · {t("知识区")}{/if}
+          </span>
+        {:else if knowledge && knowledgeOn}
+          <span class="ai-ctx-hint">{t("知识区")}</span>
+        {/if}
         <span class="ai-bar-spacer"></span>
         {#if streaming}
           <button class="ai-stop" on:click={stop}>{t("停止")}</button>
@@ -2276,178 +2923,6 @@
             <path d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
           </svg>
         </button>
-      </div>
-    </div>
-  {:else if tab === "settings"}
-    <div class="ai-settings">
-      <section class="ai-group">
-        <div class="ai-group-title">{t("模型与凭据")}</div>
-        <div class="ai-group-note">{t("与双语翻译共用同一 AI 平台配置；修改会同步到激活平台。")}</div>
-
-        <label class="ai-field">
-          <span class="ai-field-label">{t("接口地址")}</span>
-          <input
-            class="ai-input"
-            type="text"
-            spellcheck="false"
-            placeholder="https://api.openai.com/v1"
-            bind:value={cfg.baseUrl}
-            on:input={() => { saveState = "idle"; fetchState = "idle"; }}
-          />
-        </label>
-
-        <label class="ai-field">
-          <span class="ai-field-label">{t("API Key")}</span>
-          <div class="ai-input-row">
-            <input
-              class="ai-input"
-              type={showKey ? "text" : "password"}
-              spellcheck="false"
-              autocomplete="off"
-              placeholder={t("本地模型可留空")}
-              value={cfg.apiKey}
-              on:input={(e) => { cfg = { ...cfg, apiKey: textOf(e) }; saveState = "idle"; fetchState = "idle"; }}
-            />
-            <button class="ai-mini" on:click={() => (showKey = !showKey)}>{showKey ? t("隐藏") : t("显示")}</button>
-          </div>
-        </label>
-
-        <label class="ai-field">
-          <span class="ai-field-label">{t("模型")}</span>
-          <div class="ai-input-row">
-            <input
-              class="ai-input"
-              type="text"
-              spellcheck="false"
-              list="ai-model-options"
-              placeholder="gpt-4o-mini"
-              bind:value={cfg.model}
-              on:input={() => { saveState = "idle"; }}
-            />
-            <datalist id="ai-model-options">
-              {#each cfg.models as name (name)}
-                <option value={name}></option>
-              {/each}
-            </datalist>
-            <button class="ai-mini" disabled={fetchState === "loading"} on:click={refreshModels}>
-              {fetchState === "loading" ? t("获取中…") : t("获取模型")}
-            </button>
-          </div>
-          {#if fetchState === "done"}
-            <span class="ai-field-hint ok">{t("已获取 {n} 个模型", { n: cfg.models.length })}</span>
-          {:else if fetchState === "error"}
-            <span class="ai-field-hint err">{fetchError}</span>
-          {/if}
-        </label>
-
-        <label class="ai-field inline">
-          <span class="ai-field-label">{t("温度")}</span>
-          <input class="ai-range" type="range" min="0" max="2" step="0.1" bind:value={cfg.temperature} />
-          <span class="ai-value">{Number(cfg.temperature).toFixed(1)}</span>
-        </label>
-
-        <label class="ai-field inline">
-          <span class="ai-field-label">{t("最大输出")}</span>
-          <input class="ai-input narrow" type="number" min="16" max="32768" step="128" bind:value={cfg.maxTokens} />
-          <span class="ai-field-hint">{t("tokens")}</span>
-        </label>
-      </section>
-
-      <section class="ai-group">
-        <div class="ai-group-title">{t("阅读上下文")}</div>
-
-        <label class="ai-field inline">
-          <span class="ai-field-label">{t("章节预算")}</span>
-          <input
-            class="ai-range"
-            type="range"
-            min={MIN_CONTEXT_CHARS}
-            max={MAX_CONTEXT_CHARS}
-            step="1000"
-            value={prefs.contextChars}
-            on:input={(e) => updatePrefs({ contextChars: numOf(e) })}
-          />
-          <span class="ai-value">{prefs.contextChars.toLocaleString()}</span>
-        </label>
-        <div class="ai-field-hint">{t("每次提问附带当前章节正文，超出即截断并在消息下方标注。")}</div>
-
-        <label class="ai-field inline">
-          <span class="ai-field-label">{t("历史轮数")}</span>
-          <input
-            class="ai-range"
-            type="range"
-            min="0"
-            max={MAX_HISTORY_TURNS}
-            step="1"
-            value={prefs.historyTurns}
-            on:input={(e) => updatePrefs({ historyTurns: numOf(e) })}
-          />
-          <span class="ai-value">{prefs.historyTurns}</span>
-        </label>
-        <div class="ai-field-hint">{t("0 表示每轮都只带本轮问题，不带历史。")}</div>
-
-        <label class="ai-field check">
-          <input
-            type="checkbox"
-            checked={prefs.showReasoning}
-            on:change={(e) => updatePrefs({ showReasoning: checkedOf(e) })}
-          />
-          <span>{t("默认展开思考过程")}</span>
-        </label>
-      </section>
-
-      <section class="ai-group">
-        <div class="ai-group-title">{t("知识区")}</div>
-        <div class="ai-group-note">
-          {t("选一篇思源文档作为背景资料，每次提问自动附带；按本书单独保存。")}
-        </div>
-
-        <div class="ai-source">
-          <div class="ai-source-main">
-            {#if knowledge}
-              <span class="ai-source-title" title={knowledge.docId}>
-                《{knowledge.docTitle || t("未命名笔记")}》
-              </span>
-              {#if knowledge.notebookName}<span class="ai-source-sub">{knowledge.notebookName}</span>{/if}
-            {:else}
-              <span class="ai-source-title muted">{t("未选择知识区")}</span>
-            {/if}
-          </div>
-          <button class="ai-mini" on:click={() => (showKnowledgePicker = true)}>
-            {knowledge ? t("更换") : t("选择文档")}
-          </button>
-          {#if knowledge}
-            <button class="ai-mini" on:click={clearKnowledge}>{t("清除")}</button>
-          {/if}
-        </div>
-
-        {#if knowledge}
-          <label class="ai-field inline">
-            <span class="ai-field-label">{t("知识区预算")}</span>
-            <input
-              class="ai-range"
-              type="range"
-              min={KNOWLEDGE_MIN_CHARS}
-              max={KNOWLEDGE_MAX_CHARS}
-              step="500"
-              value={prefs.knowledgeChars}
-              on:input={(e) => updatePrefs({ knowledgeChars: numOf(e) })}
-            />
-            <span class="ai-value">{prefs.knowledgeChars.toLocaleString()}</span>
-          </label>
-          <div class="ai-field-hint">{t("超出预算会截断，并在回答下方标注实际附带量。")}</div>
-        {/if}
-      </section>
-
-      <div class="ai-save-row">
-        <button class="ai-btn primary" disabled={saveState === "saving"} on:click={saveSettings}>
-          {saveState === "saving" ? t("保存中…") : t("保存设置")}
-        </button>
-        {#if saveState === "saved"}<span class="ai-field-hint ok">{t("已保存")}</span>{/if}
-        {#if saveState === "error"}<span class="ai-field-hint err">{saveError}</span>{/if}
-      </div>
-      <div class="ai-settings-foot">
-        {t("对话记录仅保存在本机（按书籍分档），不会写入思源。")}
       </div>
     </div>
   {:else}
@@ -2511,6 +2986,20 @@
       onClose={() => (showKnowledgePicker = false)}
     />
   {/if}
+
+  {#if settingsOpen}
+    <AiSettingsDialog
+      getSettings={getAiSettings}
+      {prefs}
+      {general}
+      {knowledge}
+      saveSettings={saveAiSettings}
+      savePrefs={applyPrefsFromDialog}
+      onClose={() => (settingsOpen = false)}
+      onPickKnowledge={() => (showKnowledgePicker = true)}
+      onClearKnowledge={clearKnowledge}
+    />
+  {/if}
 </aside>
 
 <style>
@@ -2525,7 +3014,7 @@
     color: var(--b3-theme-on-background, #1f2329);
     border-left: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
     box-sizing: border-box;
-    font-size: var(--re-ai-font-size, 13.5px);
+    font-size: var(--re-ai-font-size, 12px);
     /* 思源给 .layout-tab-container 设了 user-select:none（正文在 iframe 里所以阅读区不受影响），
        自定义页签里的面板会继承成不可选 ⇒ 回答无法划选复制。面板根显式放开，停靠态一并受益。 */
     -webkit-user-select: text;
@@ -2626,6 +3115,7 @@
     flex: none;
   }
   .ai-icon-btn {
+    position: relative;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -2638,9 +3128,41 @@
     cursor: pointer;
     padding: 0;
   }
+  .ai-icon-btn.on {
+    background: var(--re-ai-accent-soft);
+    color: var(--re-ai-accent);
+  }
+  .ai-icon-dot {
+    position: absolute;
+    top: 3px;
+    right: 3px;
+    width: 5px;
+    height: 5px;
+    border-radius: 50%;
+    background: var(--b3-theme-error, #d23f31);
+  }
   .ai-icon-btn:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
     color: var(--b3-theme-on-background, #1f2329);
+  }
+  /* 24 网格细描边 + 轻微透明度，避免小尺寸下显得厚重 */
+  .ai-icon-btn svg {
+    opacity: 0.82;
+  }
+  .ai-icon-btn:hover svg,
+  .ai-icon-btn.on svg {
+    opacity: 1;
+  }
+  /* 思源主题给 svg 设了 fill: currentColor，优先级高于 presentation attribute
+     fill="none"，线性图标会被填成实心块；面板内统一兜底。 */
+  .ai-panel :global(svg[fill="none"]),
+  .ai-panel :global(svg[fill="none"] path),
+  .ai-panel :global(svg[fill="none"] circle),
+  .ai-panel :global(svg[fill="none"] rect),
+  .ai-panel :global(svg[fill="none"] line),
+  .ai-panel :global(svg[fill="none"] polyline),
+  .ai-panel :global(svg[fill="none"] polygon) {
+    fill: none;
   }
 
   /* ---------- Tab ---------- */
@@ -2677,15 +3199,6 @@
     height: 2px;
     border-radius: 1px;
     background: var(--b3-theme-primary, #378add);
-  }
-  .ai-tab-dot {
-    display: inline-block;
-    width: 5px;
-    height: 5px;
-    margin-left: 4px;
-    border-radius: 50%;
-    background: var(--b3-theme-error, #d23f31);
-    vertical-align: 2px;
   }
 
   /* ---------- 消息流 ---------- */
@@ -2794,6 +3307,64 @@
     white-space: pre-wrap;
     word-break: break-word;
     line-height: 1.65;
+  }
+  /* P1：用户消息的操作行只在悬停/聚焦时出现，避免常驻占位 */
+  .ai-user-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding-right: 2px;
+    font-size: 11px;
+    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .ai-msg.user:hover .ai-user-foot,
+  .ai-msg.user:focus-within .ai-user-foot {
+    opacity: 1;
+  }
+  @media (hover: none) {
+    .ai-user-foot {
+      opacity: 1;
+    }
+  }
+  /* P1：编辑重发 */
+  .ai-edit {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    padding: 8px 9px;
+    border: 1px solid var(--b3-theme-primary, #378add);
+    border-radius: 11px;
+    background: var(--b3-theme-surface, #f2f3f5);
+  }
+  .ai-edit-input {
+    width: 100%;
+    min-height: 64px;
+    max-height: 220px;
+    padding: 0;
+    border: none;
+    outline: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: 1.65;
+    resize: vertical;
+  }
+  .ai-edit-foot {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .ai-edit-hint {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 10.5px;
+    color: var(--b3-theme-on-surface-light, #9aa0a6);
   }
   .ai-qchip,
   .ai-pending-main {
@@ -2956,12 +3527,38 @@
     font-family: var(--b3-font-family-code, monospace);
   }
   .ai-md :global(pre) {
+    position: relative;
     margin: 8px 0;
     padding: 9px 11px;
     border-radius: 8px;
     background: var(--b3-theme-surface, rgba(0, 0, 0, 0.04));
     overflow-x: auto;
     font-size: 12px;
+  }
+  /* P1：代码块复制按钮由 JS 注入，不能进 Lute 输出 */
+  .ai-md :global(.ai-code-copy) {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    padding: 2px 7px;
+    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12));
+    border-radius: 5px;
+    background: var(--b3-theme-background, #fff);
+    color: var(--b3-theme-on-surface, #6b7280);
+    font-size: 10.5px;
+    line-height: 1.5;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .ai-md :global(pre:hover .ai-code-copy),
+  .ai-md :global(.ai-code-copy:focus-visible) {
+    opacity: 1;
+  }
+  @media (hover: none) {
+    .ai-md :global(.ai-code-copy) {
+      opacity: 1;
+    }
   }
   .ai-md :global(pre code) {
     padding: 0;
@@ -2998,6 +3595,11 @@
     flex: none;
     font-variant-numeric: tabular-nums;
     opacity: 0.8;
+  }
+  .ai-usage {
+    flex: none;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.75;
   }
   /* P4-C：跨天分隔线（首条也显示，便于确认会话从哪天开始） */
   .ai-day {
@@ -3044,6 +3646,74 @@
   .ai-link:disabled {
     opacity: 0.55;
     cursor: default;
+  }
+  /* P1：失败卡 —— 只给行动建议，原始错误收进详情 */
+  .ai-error-card {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 9px 10px;
+    border: 1px solid rgba(210, 63, 49, 0.28);
+    border-radius: 9px;
+    background: rgba(210, 63, 49, 0.055);
+  }
+  .ai-error-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .ai-error-ico {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: var(--b3-theme-error, #d23f31);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1;
+  }
+  .ai-error-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 150px;
+  }
+  .ai-error-main strong {
+    font-size: 12.5px;
+    color: var(--b3-theme-on-background, #1f2329);
+  }
+  .ai-error-hint {
+    font-size: 11.5px;
+    line-height: 1.5;
+    color: var(--b3-theme-on-surface, #6b7280);
+  }
+  .ai-error-actions {
+    display: flex;
+    flex: none;
+    gap: 6px;
+  }
+  .ai-error-detail summary {
+    font-size: 11px;
+    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    cursor: pointer;
+  }
+  .ai-error-detail pre {
+    margin: 6px 0 0;
+    padding: 7px 8px;
+    max-height: 160px;
+    overflow: auto;
+    border-radius: 6px;
+    background: var(--b3-theme-surface, rgba(0, 0, 0, 0.05));
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
   }
   .ai-note-badge {
     padding: 0 5px;
@@ -3562,146 +4232,14 @@
     padding: 12px 12px 20px;
     overscroll-behavior: contain;
   }
-  .ai-group {
-    margin-bottom: 18px;
-  }
-  .ai-group-title {
-    font-size: 12px;
-    font-weight: 600;
-    margin-bottom: 4px;
-  }
-  .ai-group-note,
   .ai-field-hint {
     font-size: 11px;
     line-height: 1.5;
     color: var(--b3-theme-on-surface-light, #9aa0a6);
   }
-  .ai-group-note {
-    margin-bottom: 10px;
-  }
-  .ai-source {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    margin-bottom: 8px;
-  }
-  .ai-source-main {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-  }
-  .ai-source-title {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 12px;
-  }
-  .ai-source-title.muted {
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
-  }
-  .ai-source-sub {
-    flex: none;
-    font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
-  }
-  .ai-field {
-    display: block;
-    margin-bottom: 12px;
-  }
-  .ai-field-label {
-    display: block;
-    margin-bottom: 4px;
-    font-size: 11.5px;
-    color: var(--b3-theme-on-surface, #6b7280);
-  }
-  .ai-field.inline {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .ai-field.inline .ai-field-label {
-    flex: none;
-    width: 62px;
-    margin-bottom: 0;
-  }
-  .ai-field.check {
-    display: flex;
-    align-items: center;
-    gap: 7px;
-    font-size: 12px;
-  }
-  .ai-input-row {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .ai-input {
-    flex: 1;
-    min-width: 0;
-    width: 100%;
-    padding: 6px 8px;
-    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.14));
-    border-radius: 6px;
-    background: var(--b3-theme-background, #fff);
-    color: var(--b3-theme-on-background, #1f2329);
-    font-size: 12px;
-    outline: none;
-    box-sizing: border-box;
-  }
-  .ai-input:focus {
-    border-color: var(--b3-theme-primary, #378add);
-  }
-  .ai-input.narrow {
-    flex: none;
-    width: 96px;
-  }
-  .ai-mini {
-    flex: none;
-    padding: 5px 8px;
-    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.14));
-    border-radius: 6px;
-    background: transparent;
-    color: var(--b3-theme-on-surface, #6b7280);
-    font-size: 11px;
-    cursor: pointer;
-    white-space: nowrap;
-  }
-  .ai-mini:hover:not(:disabled) {
-    border-color: var(--b3-theme-primary, #378add);
-    color: var(--b3-theme-on-background, #1f2329);
-  }
-  .ai-mini:disabled {
-    opacity: 0.5;
-    cursor: default;
-  }
-  .ai-range {
-    flex: 1;
-    min-width: 0;
-    accent-color: var(--b3-theme-primary, #378add);
-  }
-  .ai-value {
-    flex: none;
-    min-width: 52px;
-    text-align: right;
-    font-size: 11.5px;
-    color: var(--b3-theme-on-surface, #6b7280);
-    font-variant-numeric: tabular-nums;
-  }
-  .ai-field-hint.ok {
-    color: var(--b3-theme-success, #4caf50);
-  }
   .ai-field-hint.err {
     color: var(--b3-theme-error, #d23f31);
     word-break: break-word;
-  }
-  .ai-save-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-top: 4px;
   }
   .ai-btn {
     padding: 6px 14px;
@@ -3720,12 +4258,6 @@
   .ai-btn:disabled {
     opacity: 0.6;
     cursor: default;
-  }
-  .ai-settings-foot {
-    margin-top: 16px;
-    font-size: 10.5px;
-    line-height: 1.6;
-    color: var(--b3-theme-on-surface-light, #b0b4ba);
   }
 
   /* ---------- P3：思维导图卡片 ---------- */
@@ -3822,6 +4354,31 @@
     --re-ai-accent-soft: var(--b3-theme-primary-lightest, #eaf0ff);
     background: var(--re-ai-panel);
     box-shadow: -10px 0 30px rgba(20, 26, 36, 0.05);
+  }
+
+  /* ---------- 纸感皮肤：暖黄强调 + 细线 + 极淡网点 ---------- */
+  .ai-panel.paper {
+    --re-ai-line: #e6e0d2;
+    --re-ai-panel: #f7f4ec;
+    --re-ai-card: #fffdf8;
+    --re-ai-ink: #211f1a;
+    --re-ai-muted: #6f6a5f;
+    --re-ai-faint: #9a9488;
+    --re-ai-accent: #a97b00;
+    --re-ai-accent-soft: #f7e7ae;
+    background-image: radial-gradient(circle at 1px 1px, rgba(80, 70, 40, 0.045) 1px, transparent 0);
+    background-size: 12px 12px;
+  }
+
+  :global(html[data-theme-mode="dark"]) .ai-panel.paper {
+    --re-ai-line: #35302a;
+    --re-ai-panel: #17150f;
+    --re-ai-card: #201d16;
+    --re-ai-ink: #ece7db;
+    --re-ai-muted: #a9a293;
+    --re-ai-faint: #7f786a;
+    --re-ai-accent: #d9b23c;
+    --re-ai-accent-soft: #3a3115;
   }
 
   .ai-thread::-webkit-scrollbar,
@@ -3924,83 +4481,202 @@
     background: var(--re-ai-accent-soft);
   }
 
-  /* ---------- 历史会话（面板内覆盖层） ---------- */
+  /* ---------- 历史会话：Copilot 式浮卡（不遮对话，无蒙层） ---------- */
   .ai-history {
     position: absolute;
-    inset: 0;
+    left: 8px;
+    right: 8px;
     z-index: 30;
     display: flex;
     flex-direction: column;
+    width: auto;
+    max-width: 420px;
+    margin: 0 auto;
     min-height: 0;
     /* 必须实底：Neo 等主题的 background-light 带 alpha，半透明会让对话内容透出来 */
     background: var(--b3-theme-background, #fff);
     color: var(--re-ai-ink);
-    box-shadow: -8px 0 24px rgba(20, 26, 36, 0.08);
+    border: 1px solid var(--re-ai-line);
+    border-radius: 16px;
+    box-shadow: 0 18px 48px rgba(20, 26, 36, 0.2), 0 2px 8px rgba(20, 26, 36, 0.08);
+    outline: none;
+    animation: ai-history-in 0.16s ease-out;
+  }
+  @keyframes ai-history-in {
+    from {
+      opacity: 0;
+      transform: translateY(-6px) scale(0.985);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
   }
   .ai-history-hd {
-    display: flex;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
     align-items: center;
     gap: 8px;
-    padding: 14px 14px 10px;
+    padding: 10px 12px;
   }
-  .ai-history-hd-title {
-    font-size: 14px;
-    font-weight: 650;
+  .ai-history-tabs {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    min-width: 0;
   }
-  .ai-history-hd-count {
-    color: var(--re-ai-faint);
-    font-size: 11px;
+  .ai-history-tab {
+    height: 28px;
+    padding: 0 10px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--re-ai-muted);
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .ai-history-tab:hover {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    color: var(--re-ai-ink);
+  }
+  .ai-history-tab.on {
+    background: var(--re-ai-accent-soft);
+    color: var(--re-ai-accent);
+  }
+  .ai-history-tools {
+    position: relative;
+    justify-self: center;
+  }
+  .ai-history-tools-btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--re-ai-muted);
+    cursor: pointer;
+  }
+  .ai-history-tools-btn:hover,
+  .ai-history-tools-btn[aria-expanded="true"] {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    color: var(--re-ai-ink);
+  }
+  .ai-history-tools-menu {
+    position: absolute;
+    top: 34px;
+    left: 50%;
+    z-index: 40;
+    min-width: 132px;
+    padding: 4px;
+    border: 1px solid var(--re-ai-line);
+    border-radius: 10px;
+    background: var(--b3-theme-background, #fff);
+    box-shadow: 0 10px 30px rgba(20, 26, 36, 0.18);
+    transform: translateX(-50%);
+  }
+  .ai-history-tools-menu button {
+    display: block;
+    width: 100%;
+    padding: 7px 9px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--re-ai-ink);
+    font-size: 12px;
+    text-align: left;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .ai-history-tools-menu button:hover {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+  .ai-history-tools-menu button.danger {
+    color: var(--b3-theme-error, #d23f31);
+  }
+  .ai-history-new {
+    justify-self: end;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    height: 30px;
+    padding: 0 11px;
+    border: 0;
+    border-radius: 9px;
+    background: var(--re-ai-accent);
+    color: #fff;
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .ai-history-new:hover {
+    filter: brightness(1.06);
   }
   .ai-history-search {
     display: flex;
     align-items: center;
-    gap: 7px;
-    height: 34px;
-    margin: 0 14px 8px;
-    padding: 0 10px;
-    border: 1px solid var(--re-ai-line);
-    border-radius: 9px;
-    background: var(--re-ai-card);
+    gap: 8px;
+    height: 40px;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--re-ai-line);
+    background: transparent;
     color: var(--re-ai-faint);
+  }
+  .ai-history-search svg {
+    flex: none;
+    opacity: 0.8;
   }
   .ai-history-search input {
     flex: 1;
     min-width: 0;
+    height: 100%;
     border: 0;
     outline: 0;
     background: transparent;
     color: var(--re-ai-ink);
     font-size: 12.5px;
   }
+  .ai-history-search input::placeholder {
+    color: var(--re-ai-faint);
+  }
   .ai-history-list {
     flex: 1;
     min-height: 0;
     overflow-y: auto;
-    padding: 2px 8px 10px;
-  }
-  .ai-history-group {
-    padding: 10px 8px 5px;
-    font-size: 10.5px;
-    color: var(--re-ai-faint);
+    padding: 8px 8px 10px;
   }
   .ai-history-item {
+    position: relative;
     display: flex;
-    align-items: stretch;
+    align-items: center;
+    margin-bottom: 4px;
     border-radius: 10px;
+    background: transparent;
+    box-shadow: inset 0 0 0 0 transparent;
+    transition: background 0.12s ease;
   }
   .ai-history-item:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.04));
   }
   .ai-history-item.on {
     background: var(--re-ai-accent-soft);
+    background: color-mix(in srgb, var(--re-ai-accent) 14%, var(--b3-theme-background, #fff));
+    box-shadow: inset 0 0 0 1.5px var(--re-ai-accent);
   }
   .ai-history-main {
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
-    gap: 3px;
-    padding: 9px 10px;
+    gap: 5px;
+    padding: 11px 4px 11px 12px;
     border: 0;
     background: transparent;
     text-align: left;
@@ -4008,59 +4684,187 @@
     cursor: pointer;
   }
   .ai-history-item-title {
-    font-size: 12.5px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 13px;
     font-weight: 600;
     color: var(--re-ai-ink);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .ai-history-item-sub {
-    font-size: 11.5px;
-    color: var(--re-ai-muted);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+  .ai-history-item.on .ai-history-item-text {
+    color: var(--re-ai-accent);
   }
   .ai-history-item-meta {
     display: flex;
-    gap: 4px;
-    font-size: 10.5px;
+    align-items: center;
+    gap: 6px;
+    font-size: 11.5px;
     color: var(--re-ai-faint);
   }
-  .ai-history-del {
+  .ai-history-meta-dot {
+    opacity: 0.6;
+  }
+  .ai-history-actions {
     flex: none;
-    width: 32px;
+    display: flex;
+    align-items: center;
+    padding-right: 6px;
+  }
+  .ai-history-more,
+  .ai-history-del {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
     border: 0;
+    border-radius: 8px;
     background: transparent;
     color: var(--re-ai-faint);
     cursor: pointer;
     opacity: 0;
-    border-radius: 0 10px 10px 0;
+    transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
   }
-  .ai-history-item:hover .ai-history-del,
+  .ai-history-more {
+    font-size: 15px;
+    line-height: 1;
+  }
+  .ai-history-item:hover .ai-history-more,
+  .ai-history-item:hover .ai-history-del {
+    opacity: 1;
+  }
   .ai-history-item.on .ai-history-del {
     opacity: 1;
+  }
+  .ai-history-more[aria-expanded="true"] {
+    opacity: 1;
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    color: var(--re-ai-ink);
+  }
+  .ai-history-more:hover {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    color: var(--re-ai-ink);
   }
   .ai-history-del:hover {
     color: var(--b3-theme-error, #d23f31);
     background: var(--b3-theme-error-light, rgba(210, 63, 49, 0.08));
   }
+  /* P1：置顶标记 / 更多菜单 / 内联重命名 */
+  .ai-history-pinned {
+    flex: none;
+    display: inline-flex;
+    color: var(--re-ai-accent);
+  }
+  .ai-history-item-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* AI 命名标记：只给确实由模型改过标题的会话 */
+  .ai-history-ai {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 4px;
+    border-radius: 4px;
+    font-size: 9.5px;
+    font-weight: 600;
+    line-height: 1.2;
+    letter-spacing: 0.02em;
+    color: var(--re-ai-accent);
+    background: color-mix(in srgb, var(--re-ai-accent) 10%, transparent);
+  }
+  .ai-history-menu {
+    position: absolute;
+    top: 40px;
+    right: 8px;
+    z-index: 20;
+    min-width: 152px;
+    padding: 4px;
+    border: 1px solid var(--re-ai-line);
+    border-radius: 9px;
+    background: var(--b3-theme-background, #fff);
+    box-shadow: 0 8px 24px rgba(20, 26, 36, 0.16);
+  }
+  .ai-history-menu button {
+    display: block;
+    width: 100%;
+    padding: 7px 9px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--re-ai-ink);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ai-history-menu button:hover {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+  .ai-history-menu button.danger {
+    color: var(--b3-theme-error, #d23f31);
+  }
+  .ai-history-menu button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .ai-history-rename {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    padding: 6px 8px;
+  }
+  .ai-history-rename-input {
+    flex: 1;
+    min-width: 0;
+    height: 28px;
+    padding: 0 7px;
+    border: 1px solid var(--re-ai-accent);
+    border-radius: 6px;
+    outline: none;
+    background: var(--b3-theme-background, #fff);
+    color: var(--re-ai-ink);
+    font-size: 12px;
+  }
+  .ai-history-rename-ok,
+  .ai-history-rename-cancel {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: 1px solid var(--re-ai-line);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--re-ai-muted);
+    cursor: pointer;
+  }
+  .ai-history-rename-ok:hover {
+    color: var(--re-ai-accent);
+    border-color: var(--re-ai-accent);
+  }
+  .ai-history-rename-cancel:hover {
+    color: var(--b3-theme-error, #d23f31);
+  }
+  @media (hover: none) {
+    .ai-history-more,
+    .ai-history-del {
+      opacity: 1;
+    }
+  }
   .ai-history-empty {
-    padding: 32px 16px;
+    padding: 36px 16px;
     text-align: center;
     color: var(--re-ai-faint);
     font-size: 12px;
-  }
-  .ai-history-foot {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 10px 14px;
-    border-top: 1px solid var(--re-ai-line);
-  }
-  .ai-history-foot .ai-btn {
-    height: 32px;
   }
 
   /* ---------- 消息流：两端对齐，宽面板下也保持可读行宽 ---------- */

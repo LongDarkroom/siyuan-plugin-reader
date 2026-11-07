@@ -57,6 +57,15 @@ export interface AnnEditorOptions {
   toolbar?: any[];
   /** 空态变化回调（用于「占位符样式」切换）；参数 true = 内容为空 */
   onEmptyChange?: (empty: boolean) => void;
+  /**
+   * 原生浮动工具栏是否按**视口**定位（2026-11-06）。
+   *
+   * 思源默认把浮动栏夹在「最近的 .protyle 元素」的上下边之间：批注小卡片里
+   * 那个容器只有两百来像素高，浮动栏会被压进卡片内、甚至跑到卡片外看不见。
+   * 置 true 后给 toolbar.element / subElement 打 `data-position-boundary="viewport"`，
+   * 思源改用量口尺寸夹取 → 浮动栏始终贴在选区上方的可视区域内。
+   */
+  toolbarViewportBoundary?: boolean;
   /** 挂载失败时是否回退 contenteditable（默认 true） */
   fallback?: boolean;
   /**
@@ -151,6 +160,7 @@ export class AnnEditor {
         });
         this.protyle = p;
         this.attempts = 0;
+        this.applyToolbarBoundary();
 
         const wysiwyg = p.protyle?.wysiwyg?.element as HTMLElement | null;
         if (wysiwyg) {
@@ -208,6 +218,19 @@ export class AnnEditor {
       }
     };
     requestAnimationFrame(attempt);
+  }
+
+  /** 原生浮动栏改按视口夹取（父容器太矮时默认口径会把它塞进卡片内） */
+  private applyToolbarBoundary(): void {
+    if (!this.opts.toolbarViewportBoundary) return;
+    const toolbar = this.protyle?.protyle?.toolbar;
+    for (const node of [toolbar?.element, toolbar?.subElement]) {
+      try {
+        (node as HTMLElement | null)?.setAttribute("data-position-boundary", "viewport");
+      } catch (__swallowErr) {
+        logSwallow(__swallowErr, "ann-editor.ts · applyToolbarBoundary", "debug");
+      }
+    }
   }
 
   /** 占位段落是否「无内容」：无文字且无块引用才算空（避免误删用户输入） */

@@ -33,6 +33,7 @@ import {
 import { initReaderBridge, disposeReaderBridge } from "./ai/reader-bridge.ts";
 // 2026-11-05 AI 页签：把阅读助手提升为思源原生页签（默认跟随活动阅读器）
 import { AiTabController } from "./ai/ai-tab-controller.ts";
+import { AiDockController } from "./ai/ai-dock-controller.ts";
 import { installConsoleFilter } from "./core/console-filter.ts";
 import { logSwallow } from "./core/safe.ts";
 import { getLogger } from "./core/logger.ts";
@@ -45,11 +46,11 @@ import { DEFAULT_REWORD_TTS, type RewordTtsSettings } from "./reader/reader-tts.
 import {
   PLUGIN_VERSION,
   VERSION_SLOT,
+  buildChangelogDialogHtml,
   changelogDecision,
   changelogPath,
   fetchPluginFile,
-  renderChangelogHtml,
-  sliceVersionSection,
+  wireChangelogDialog,
 } from "./core/changelog.ts";
 // 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
 // `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签入口整条不可用。
@@ -75,6 +76,8 @@ export class ReaderPlugin extends Plugin {
   private readerDock!: ReaderDockController;
   /** AI 页签控制器（onload 同步注册；阅读器内点「在新页签打开」经 openAiTab 呼出） */
   private aiTabs!: AiTabController;
+  /** AI 右栏控制器（思源右侧停靠栏，桌面常驻入口） */
+  private aiDock!: AiDockController;
   /** 词典管理（含导入接口） */
   private dictManager!: DictManager;
   /** 翻译宿主（引擎链装配 + 按书缓存 + AI 末端） */
@@ -139,6 +142,14 @@ export class ReaderPlugin extends Plugin {
       this.aiTabs.register();
     } catch (e) {
       getLogger().warn("[RE 阅读器] AI 页签注册失败", { error: e });
+    }
+
+    /* AI 右栏：与页签同一批同步注册；桌面入口统一走这里 */
+    try {
+      this.aiDock = new AiDockController(this, () => this.readerDock?.tabController ?? null);
+      this.aiDock.register();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] AI 右栏注册失败", { error: e });
     }
 
     /* 阅读页签：ReaderTabController 在其构造函数内自行 addTab（同步） */
@@ -275,28 +286,38 @@ export class ReaderPlugin extends Plugin {
   }
 
   /**
-   * 版本更新弹窗。四条口径（对标 Excali Studio，用户拍板）：
+   * 版本更新弹窗。口径（用户拍板）：
    *   ① 首装不弹，只静默记版本号（用户装插件时不需要被弹窗迎接）；
-   *   ② 只弹当前版本那一段（CHANGELOG.md 里 `## v<当前版本>`）；
+   *   ② 弹双栏全历史：左栏列出 CHANGELOG.md 的全部版本，默认选当前版本；
    *   ③ 不设「不再提示」——版本号已经先记进独立槽，× 掉就不会重启再弹；
-   *   ④ 读不到日志 / 该版本没写日志 / 渲染器缺失，一律静默。
+   *   ④ 读不到日志 / 渲染器缺失，一律静默。
    */
   private async maybeShowChangelog(): Promise<void> {
     try {
       const action = changelogDecision(await this.loadData(VERSION_SLOT), PLUGIN_VERSION);
       if (action === "unknown-version" || action === "up-to-date") return;
-      // 先回写再弹：弹窗被用户划掉、或者这一段的日志其实是空的，
-      // 都不该下次重启再来一遍
+      // 先回写再弹：弹窗被用户划掉也不该下次重启再来一遍
       await this.saveData(VERSION_SLOT, PLUGIN_VERSION);
       if (action !== "show") return;
-      const section = sliceVersionSection(await fetchPluginFile(changelogPath(this.name)), PLUGIN_VERSION);
-      if (!section) return;
+      const html = buildChangelogDialogHtml(await fetchPluginFile(changelogPath(this.name)), PLUGIN_VERSION, {
+        title: t("版本更新"),
+        subtitle: t("每一次更新优化了什么、解决了什么问题，都记在这里。"),
+        history: t("历史版本"),
+        latest: t("最新"),
+        current: t("当前已是最新版本"),
+        archived: t("历史版本记录"),
+        ok: t("知道了"),
+        close: t("关闭"),
+      });
+      if (!html) return;
       const dialog = new Dialog({
         title: `${t("更新日志")} v${PLUGIN_VERSION}`,
-        width: "min(640px, 92vw)",
-        content: `<div class="re-changelog b3-typography">${renderChangelogHtml(section)}</div>`,
+        width: "min(920px, 94vw)",
+        hideCloseIcon: true,
+        content: html,
       });
       dialog.element.classList.add("re-changelog-dialog");
+      wireChangelogDialog(dialog.element, () => dialog.destroy());
     } catch (e) {
       getLogger().warn("[RE 阅读器] 更新日志读取失败", { error: e });
     }
@@ -426,7 +447,29 @@ export class ReaderPlugin extends Plugin {
   }
 
   /**
-   * 打开 AI 页签（阅读器右侧助手的「在新页签打开」按钮）。
+   * 打开右侧 AI 停靠栏（阅读器顶栏按钮 / 更多菜单的唯一桌面入口）。
+   *
+   * 右栏默认跟随活动阅读器；没有书时 AiTabView 自动切到通用对话。
+   */
+  openAiDock(_bookId?: string): void {
+    try {
+      this.aiDock?.open();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 打开 AI 右栏失败", { error: e });
+    }
+  }
+
+  /** 收起右侧 AI 停靠栏（AI 页签打开时调用） */
+  closeAiDock(): void {
+    try {
+      this.aiDock?.close();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 收起 AI 右栏失败", { error: e });
+    }
+  }
+
+  /**
+   * 打开 AI 页签（右栏面板的「在新页签打开」）。
    *
    * 默认跟随活动阅读器 —— 用户点哪本书的助手，那本书的阅读窗口就是活动的，
    * 因此不需要在这里预锁定；要钉住某一本时用页签头的「锁定本书」。
@@ -439,20 +482,32 @@ export class ReaderPlugin extends Plugin {
     }
   }
 
+  /** 收起 AI 页签（右栏打开时调用，保证同一时刻只有一个 AI 面板） */
+  closeAiTab(): void {
+    try {
+      this.aiTabs?.close();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 收起 AI 页签失败", { error: e });
+    }
+  }
+
   /**
-   * 划词「问 AI」：优先把选段投进已打开的 AI 页签。
-   *
-   * 返回 false 表示页签没开 / 宿主未就绪 / 页签锁定的是别的书，
-   * 阅读器据此回落到右侧停靠栏（手机端没有页签，也会走这条回落）。
+   * 划词「问 AI」：已打开的页签优先（可能在锁定别的书，投不进就换右栏），
+   * 否则打开右栏并投递选段。手机端由 ReaderView 走全屏浮层。
    */
-  askAiInTab(
+  askAiInDock(
     bookId: string,
     quote: { text: string; sectionIndex?: number; chapterTitle?: string }
   ): boolean {
     try {
-      return !!this.aiTabs?.deliverQuote?.(bookId, quote);
+      if (this.aiTabs?.deliverQuote?.(bookId, quote)) return true;
     } catch (e) {
       getLogger().warn("[RE 阅读器] 向 AI 页签投递选段失败", { error: e });
+    }
+    try {
+      return !!this.aiDock?.deliverQuote?.(bookId, quote);
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 向 AI 右栏投递选段失败", { error: e });
       return false;
     }
   }
@@ -789,6 +844,12 @@ export class ReaderPlugin extends Plugin {
       this.aiTabs?.dispose();
     } catch (e) {
       getLogger().warn("[RE 阅读器] 卸载时关闭 AI 页签失败", { error: e });
+    }
+    // 2026-11-06：右栏面板同样轮询活动阅读器，必须在阅读器销毁前摘掉
+    try {
+      this.aiDock?.dispose();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 卸载时关闭 AI 右栏失败", { error: e });
     }
     try {
       this.readerDock?.dispose();

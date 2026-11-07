@@ -38,14 +38,29 @@
   export let openShelf: (() => void) | undefined = undefined;
   /** 把锁定状态同步到页签头按钮（按钮 DOM 归控制器所有） */
   export let onPinState: ((state: PinState) => void) | undefined = undefined;
+  /** 同一个壳承载两种形态：思源原生页签 / 右侧停靠栏 */
+  export let surface: "tab" | "dock" = "tab";
+  /** 停靠形态：收起按钮与「在新页签打开」由控制器注入 */
+  export let onClose: (() => void) | undefined = undefined;
+  export let onOpenTab: (() => void) | undefined = undefined;
 
   let target: AiTabTarget = resolveAiTabTarget();
   let pinned: AiTabPin = { bookId: "", title: "" };
   let host: any = null;
+  let general = false;
   let lastComp: any = null;
   let lastSig = "";
+  let lastGeneral = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let panelComp: any = null;
+
+  /** 没有活动阅读器时的通用对话宿主：不读正文，只保留对话本身 */
+  const GENERAL_HOST = {
+    bookId: "",
+    bookTitle: "",
+    bookAuthor: "",
+    chapterLabel: "",
+  };
 
   function storage(): Storage | null {
     try {
@@ -119,14 +134,22 @@
         logSwallow(e, "AiTabView.svelte · getAiPanelHost", "warn");
       }
     }
+    // 右栏是常驻入口：没有书时也必须是可对话的面板，而不是「请先开书」空态。
+    // 页签保持不变——页签本来就是围绕一本书打开的，空态更有信息量。
+    const nextGeneral = !nextHost && surface === "dock";
+    if (nextGeneral) nextHost = GENERAL_HOST;
     const sig = nextHost
-      ? `${nextHost.bookId}|${nextHost.bookTitle}|${nextHost.bookAuthor}|${nextHost.chapterLabel}`
+      ? nextGeneral
+        ? "general"
+        : `${nextHost.bookId}|${nextHost.bookTitle}|${nextHost.bookAuthor}|${nextHost.chapterLabel}`
       : "";
     // 只在「换了实例 / 书名章节变了」时更新，避免每 800ms 触发子组件无意义刷新
-    if (comp !== lastComp || sig !== lastSig) {
+    if (comp !== lastComp || sig !== lastSig || nextGeneral !== lastGeneral) {
       lastComp = comp;
       lastSig = sig;
+      lastGeneral = nextGeneral;
       host = nextHost;
+      general = nextGeneral;
     }
     syncPinState();
   }
@@ -143,8 +166,14 @@
     return true;
   }
 
+  /** 让停在右栏的输入框拿到焦点（点 dock 图标再次打开时用） */
+  export function focusComposer(): void {
+    panelComp?.focusComposer?.();
+  }
+
   /** 页签头按钮：跟随态 → 锁定当前书；锁定态 → 恢复跟随 */
   export function togglePin(): void {
+    if (surface === "dock") return;
     if (pinned.bookId) {
       pinned = { bookId: "", title: "" };
     } else {
@@ -176,7 +205,8 @@
 
   $: emptyKind = host ? "" : target.pinnedClosed ? "closed" : target.bookId ? "opening" : "none";
   onMount(() => {
-    pinned = loadAiTabPin(storage());
+    // 锁定只属于页签：右栏是常驻入口，不该被上一次的页签锁定带入某本书
+    if (surface !== "dock") pinned = loadAiTabPin(storage());
     refresh();
     // 活动阅读器由「窗口焦点 / 页签切换」驱动，没有统一事件；
     // 轻量轮询（800ms）比在每个 ReaderView 里埋监听更稳，也覆盖浏览器失焦。
@@ -201,8 +231,11 @@
       bookTitle={host.bookTitle}
       bookAuthor={host.bookAuthor}
       chapterLabel={host.chapterLabel}
+      general={general}
       resizable={false}
       overlay={false}
+      onClose={surface === "dock" ? onClose : undefined}
+      onOpenTab={surface === "dock" ? onOpenTab : undefined}
       getAiSettings={getAiSettings}
       saveAiSettings={saveAiSettings}
       getChapter={host.getChapter}

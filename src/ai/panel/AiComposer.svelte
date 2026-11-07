@@ -7,6 +7,8 @@
   export let disabled = false;
   /** 是否有内容（双向绑定给父组件控制发送按钮） */
   export let hasText = false;
+  /** 发送键：enter = Enter 发送（Shift+Enter 换行）；mod+enter = ⌘/Ctrl+Enter 发送 */
+  export let sendShortcut: "enter" | "mod+enter" = "enter";
   /** Enter 提交（Shift+Enter 换行） */
   export let onSubmit: (() => void) | undefined = undefined;
 
@@ -43,10 +45,15 @@
   function onKeydown(e: KeyboardEvent): void {
     // 中文输入法组合期：Enter 是选词，不是发送
     if (composing || e.isComposing || (e as any).keyCode === 229) return;
-    if (e.key === "Enter" && !e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
-      e.preventDefault();
-      if (!disabled) onSubmit?.();
-    }
+    if (e.key !== "Enter") return;
+    const mod = e.metaKey || e.ctrlKey;
+    const wantsSend =
+      sendShortcut === "mod+enter"
+        ? mod && !e.shiftKey && !e.altKey
+        : !mod && !e.shiftKey && !e.altKey;
+    if (!wantsSend) return;
+    e.preventDefault();
+    if (!disabled) onSubmit?.();
   }
 
   function onPaste(e: ClipboardEvent): void {
@@ -139,7 +146,7 @@
     outline: none;
     background: transparent;
     color: var(--b3-theme-on-background, #1f2329);
-    font-size: var(--re-ai-font-size, 13.5px);
+    font-size: var(--re-ai-input-font-size, 13px);
     line-height: 1.65;
     white-space: pre-wrap;
     word-break: break-word;

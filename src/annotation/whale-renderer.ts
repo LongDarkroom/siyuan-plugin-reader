@@ -117,9 +117,28 @@ export function highlightInText(text: string, sel: string): string {
  *    以继承标题层级 / 列表缩进 / 引用边框 / 块引用等完整思源排版样式；
  *  - 统一走 renderAnnotationText(note)，由思源 Lute 渲染（含块引用还原、==高亮==、#标签等）；
  *  - 无 Lute 的兜底路径回退 sanitizeHtml（旧行为）。
+ *
+ * 「标注与摘录」列表每次刷新都会重建整个数组，模板里的 {@html} 会对每一条重跑
+ * 三段 Lute 转换 —— 一本书几百条批注时，一次保存就是几百次解析。按正文原文做有界记忆化。
  */
+const NOTE_HTML_CACHE_MAX = 300;
+const noteHtmlCache = new Map<string, string>();
+
 export function renderAnnotationHTML(note: string | undefined): string {
-  return renderAnnotationText(note, "note");
+  const key = (note || "").trim();
+  if (!key) return "";
+  const hit = noteHtmlCache.get(key);
+  if (hit !== undefined) return hit;
+  const html = renderAnnotationText(key, "note");
+  // 只在 Lute 可用时缓存：否则会把「无 Lute 的纯文本兜底」固化，插件晚就绪后仍是平文
+  if (html && getLute()) {
+    if (noteHtmlCache.size >= NOTE_HTML_CACHE_MAX) {
+      const oldest = noteHtmlCache.keys().next();
+      if (!oldest.done) noteHtmlCache.delete(oldest.value);
+    }
+    noteHtmlCache.set(key, html);
+  }
+  return html;
 }
 
 /**

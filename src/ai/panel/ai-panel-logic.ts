@@ -34,6 +34,17 @@ export interface AiPanelPrefs {
   showReasoning: boolean;
   /** 默认上下文范围：本页 / 本章（P4，发送时可临时切换） */
   contextScope: AiContextScope;
+  /** 面板皮肤：auto 跟随思源主题；paper 使用纸感视觉 */
+  aiSkin: AiSkin;
+  /** 助手消息底部是否显示本轮 token 用量 */
+  showUsage: boolean;
+}
+
+export const AI_SKINS = ["auto", "paper"] as const;
+export type AiSkin = (typeof AI_SKINS)[number];
+
+export function normalizeAiSkin(v: unknown, fallback: AiSkin = "auto"): AiSkin {
+  return v === "paper" || v === "auto" ? v : fallback;
 }
 
 export const AI_CONTEXT_SCOPES = ["page", "chapter", "range"] as const;
@@ -63,6 +74,8 @@ export const DEFAULT_AI_PANEL_PREFS: AiPanelPrefs = {
   historyTurns: 6,
   showReasoning: true,
   contextScope: "chapter",
+  aiSkin: "auto",
+  showUsage: true,
 };
 
 /** 宽度下限：再窄输入框与正文都没法看；上限给到正文仍保留 ~420px 的最大值 */
@@ -96,6 +109,8 @@ export function normalizeAiPanelPrefs(raw: any): AiPanelPrefs {
     historyTurns: clampInt(r.historyTurns, 0, MAX_HISTORY_TURNS, DEFAULT_AI_PANEL_PREFS.historyTurns),
     showReasoning: typeof r.showReasoning === "boolean" ? r.showReasoning : DEFAULT_AI_PANEL_PREFS.showReasoning,
     contextScope: normalizeContextScope(r.contextScope),
+    aiSkin: normalizeAiSkin(r.aiSkin),
+    showUsage: typeof r.showUsage === "boolean" ? r.showUsage : DEFAULT_AI_PANEL_PREFS.showUsage,
   };
 }
 
@@ -179,8 +194,34 @@ export interface AiChatMessage {
   /** 已写入思源的笔记回执（写入成功后置位，重开面板仍显示） */
   note?: AiChatNoteReceipt;
   reasoning?: string;
+  /** 本轮 token 用量（服务商不返回时缺省；落盘保留，重开仍可查看） */
+  usage?: AiUsageSnapshot;
   error?: boolean;
   aborted?: boolean;
+  /** 失败原文（展示在错误卡详情里；content 保留已生成内容） */
+  errorText?: string;
+  /** 停止后「继续」：界面仍显示原问题，请求时追加继续提示 */
+  continuation?: boolean;
+}
+
+/** 与 ai-client 的 AiUsage 同形；单独声明避免纯逻辑层依赖网络模块 */
+export interface AiUsageSnapshot {
+  promptTokens?: number;
+  completionTokens?: number;
+  totalTokens?: number;
+}
+
+function normalizeUsage(raw: any): AiUsageSnapshot | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const num = (v: any) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : undefined;
+  };
+  const prompt = num(raw.promptTokens);
+  const completion = num(raw.completionTokens);
+  const total = num(raw.totalTokens) ?? (prompt || completion ? (prompt || 0) + (completion || 0) : undefined);
+  if (prompt === undefined && completion === undefined && total === undefined) return undefined;
+  return { promptTokens: prompt, completionTokens: completion, totalTokens: total };
 }
 
 let msgSeq = 0;
@@ -282,7 +323,8 @@ export function normalizeChatMessages(raw: any, limit = MAX_PERSISTED_MESSAGES):
     const content = str(m.content);
     const quote = normalizeQuote(m.quote);
     const tools = normalizeToolTraces(m.tools);
-    if (!content.trim() && !quote && !tools) continue;
+    // 失败/停止的占位消息可能没有正文，必须保留，否则重开面板后错误卡与「继续」入口消失
+    if (!content.trim() && !quote && !tools && m.error !== true && m.aborted !== true) continue;
     const msg: AiChatMessage = {
       id: typeof m.id === "string" && m.id ? m.id : newMessageId(),
       role: m.role,
@@ -300,8 +342,13 @@ export function normalizeChatMessages(raw: any, limit = MAX_PERSISTED_MESSAGES):
     const note = normalizeNoteReceipt(m.note);
     if (note) msg.note = note;
     if (typeof m.reasoning === "string" && m.reasoning.trim()) msg.reasoning = str(m.reasoning, 20000);
+    const usage = normalizeUsage(m.usage);
+    if (usage) msg.usage = usage;
     if (m.error === true) msg.error = true;
     if (m.aborted === true) msg.aborted = true;
+    const errorText = str(m.errorText, 4000).trim();
+    if (errorText) msg.errorText = errorText;
+    if (m.continuation === true) msg.continuation = true;
     out.push(msg);
   }
   return out.slice(-Math.max(1, limit));
@@ -415,6 +462,22 @@ const READER_SYSTEM_PROMPT = `你是嵌入在「RE 阅读器」里的阅读助�
 
 ${MINDMAP_SYNTAX_HINT}`;
 
+const GENERAL_SYSTEM_PROMPT = `你是嵌入在思源笔记右栏里的通用 AI 助手，没有绑定任何一本书。
+
+【工作方式】
+- 回答用户提出的任何问题；没有书本原文时，不要假装读过某本书或引用不存在的段落。
+- 用户明确问某本书的内容、而你手上没有原文时，直接说明没有该书原文，并请用户打开这本书或粘贴相关片段。
+- 回答保持精炼：先给结论，再给必要的解释。
+- 用户用中文提问就用中文回答，用其他语言提问就用对应语言回答。
+- 输出 Markdown：可用有序/无序列表、表格、行内代码、公式、加粗。不要输出 HTML。
+
+${MINDMAP_SYNTAX_HINT}`;
+
+/** 右栏在没有活动阅读器时的通用助手提示词 */
+export function buildGeneralSystemPrompt(): string {
+  return GENERAL_SYSTEM_PROMPT;
+}
+
 /** 组装系统提示词（阅读器身份 + 书/章元信息 + 本书前提） */
 export function buildReaderSystemPrompt(input: ReaderPromptInput = {}): string {
   const lines = [READER_SYSTEM_PROMPT];
@@ -500,12 +563,87 @@ export interface EngineChatMessage {
   content: string;
 }
 
-/** 取最近 N 条成功的对话（错误/中断回复不进上下文，避免模型学坏） */
-export function pickHistory(messages: AiChatMessage[], turns: number): EngineChatMessage[] {
+/** 取最近 N 条成功的对话（错误回复不进上下文；「继续」时可保留中断的半截回答） */
+export function pickHistory(
+  messages: AiChatMessage[],
+  turns: number,
+  opts?: { includeAborted?: boolean },
+): EngineChatMessage[] {
   const max = Math.max(0, Math.round(Number(turns) || 0));
   if (!max) return [];
-  const usable = messages.filter((m) => !m.error && !m.aborted && m.content.trim());
+  const usable = messages.filter(
+    (m) => !m.error && (opts?.includeAborted || !m.aborted) && m.content.trim(),
+  );
   return usable.slice(-max).map((m) => ({ role: m.role, content: m.content }));
+}
+
+/* ============================ P1 对话抗错 ============================ */
+
+/** 停止后「继续」追加给模型的话术（不进入气泡，只进请求） */
+export const CONTINUE_HINT = "请接着上次未完成的回答继续，不要重复已经写过的内容。";
+
+export type AiErrorKind = "network" | "auth" | "rate" | "server" | "unknown";
+
+export interface AiErrorInfo {
+  kind: AiErrorKind;
+  /** 能从文案里认出的 HTTP 状态码 */
+  status?: number;
+}
+
+/** 错误粗分四类：网络/超时、鉴权、限流、服务端；只认状态码与关键词，不解析堆栈 */
+export function classifyAiError(raw: unknown): AiErrorInfo {
+  const text = String(raw ?? "");
+  const m = text.match(/\bHTTP\s*(\d{3})\b/i) || text.match(/\b(401|403|429|5\d\d)\b/);
+  const status = Number(m?.[1] || 0) || undefined;
+  if (status === 401 || status === 403) return { kind: "auth", status };
+  if (status === 429) return { kind: "rate", status };
+  if (status && status >= 500) return { kind: "server", status };
+  if (/超时|timeout|timed out|ETIMEDOUT|AbortError/i.test(text)) return { kind: "network" };
+  if (/网络|network|fetch failed|failed to fetch|ECONN|ENOTFOUND|CORS|直连失败|代理兜底失败/i.test(text)) {
+    return { kind: "network", status };
+  }
+  return { kind: "unknown", status };
+}
+
+/** 复制/展示错误时抹掉凭据：已知 Key 全文替换 + 常见前缀与 Bearer 令牌 */
+export function maskApiKeyInText(text: unknown, apiKey?: unknown): string {
+  let out = String(text ?? "");
+  const key = String(apiKey ?? "").trim();
+  if (key.length >= 8) out = out.split(key).join("***");
+  return out
+    .replace(/\b(sk|ak|pk)-[A-Za-z0-9_-]{6,}/g, "$1-***")
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1***");
+}
+
+export interface AiEditResendDraft {
+  content: string;
+  quote?: AiChatQuote;
+  scope?: AiTurnScope;
+  range?: AiReadRange;
+  useKnowledge?: boolean;
+}
+
+/** 编辑重发：取出原消息的提问与上下文开关；引用范围不允许在编辑态修改 */
+export function editResendDraft(message: AiChatMessage): AiEditResendDraft {
+  const out: AiEditResendDraft = { content: String(message?.content || "") };
+  if (message?.quote) out.quote = { ...message.quote };
+  if (message?.scope) out.scope = message.scope;
+  if (message?.range) out.range = { ...message.range };
+  if (typeof message?.useKnowledge === "boolean") out.useKnowledge = message.useKnowledge;
+  return out;
+}
+
+/** 重发会截断这条用户消息之后的多少条（含助手回答） */
+export function editRemovedCount(messages: AiChatMessage[], messageId: string): number {
+  const idx = (messages || []).findIndex((m) => m.id === messageId);
+  return idx >= 0 ? Math.max(0, messages.length - idx - 1) : 0;
+}
+
+/** 输入法/快捷键里判断「这次回车是否该发送」；供编辑器与输入框共用 */
+export function wantsSendOnEnter(e: { key: string; shiftKey?: boolean; metaKey?: boolean; ctrlKey?: boolean }, mode: "enter" | "mod+enter"): boolean {
+  if (e.key !== "Enter") return false;
+  if (mode === "mod+enter") return !!(e.metaKey || e.ctrlKey);
+  return !e.shiftKey;
 }
 
 /** 组装发给模型的完整 messages（system + 历史 + 本轮） */
@@ -630,6 +768,18 @@ export function mergeAiCredentials(settings: any, patch: AiCredentialPatch): Rec
 }
 
 /* ============================ 展示辅助 ============================ */
+
+/** 助手消息 footer 的用量摘要：1,284 tokens · ↑ 912 ↓ 372（缺项自动省略） */
+export function formatUsage(usage: AiUsageSnapshot | null | undefined): string {
+  if (!usage) return "";
+  const total = usage.totalTokens ?? (usage.promptTokens || 0) + (usage.completionTokens || 0);
+  if (!total) return "";
+  const parts = [`${total.toLocaleString("en-US")} tokens`];
+  const arrows: string[] = [];
+  if (usage.promptTokens) arrows.push(`↑ ${usage.promptTokens.toLocaleString("en-US")}`);
+  if (usage.completionTokens) arrows.push(`↓ ${usage.completionTokens.toLocaleString("en-US")}`);
+  return arrows.length ? `${parts[0]} · ${arrows.join(" ")}` : parts[0];
+}
 
 /** 引用 chip 文案：章节 + 选段前 24 字 */
 export function quoteChipLabel(q: AiChatQuote | null | undefined): string {

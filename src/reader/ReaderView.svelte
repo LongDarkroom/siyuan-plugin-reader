@@ -105,7 +105,7 @@ import { getLogger } from "../core/logger.ts";
   // 2026-11-05 P0：AI 阅读助手面板（右停靠）。章节读取与原文定位仍走本组件导出的
   // getChapterSnapshot / locateQuoteInSection，面板只做对话与渲染。
   import AiPanel from "../ai/panel/AiPanel.svelte";
-  import { DEFAULT_AI_PANEL_PREFS, type AiChatQuote } from "../ai/panel/ai-panel-logic.ts";
+  import { type AiChatQuote } from "../ai/panel/ai-panel-logic.ts";
   import {
     MIN_RANGE_CHAPTER_CHARS,
     buildRangeContext,
@@ -243,7 +243,9 @@ import { getLogger } from "../core/logger.ts";
   //   源与生成方式见 scripts/gen-sel-icons.mjs，头注释解释了为何不能运行时读目录。
   import { SEL_ICONS } from "./sel-icons.generated.ts";
   // 标注/批注区分：isEmptyNoteContent(rec) → 无笔记=纯标注（进编辑工具栏），有笔记=批注（进查看卡片）
-  import { classifyAnnotation } from "../annotation/whale-renderer";
+  // renderAnnotationHTML：note 现在存的是 Kramdown（Protyle 序列化），列表必须渲染成富文本，
+  // 否则会看到 `**粗体**`、`==高亮==` 这些记号原文。
+  import { classifyAnnotation, renderAnnotationHTML } from "../annotation/whale-renderer";
   import {
     WHALE_COLORS,
     ANNOTATION_STYLES,
@@ -429,10 +431,10 @@ import { getLogger } from "../core/logger.ts";
   export let mobileOverlay: boolean = false;
   /** 独立 Tab 模式：标题联动（书名 · 章节） */
   export let onTitleChange: ((title: string) => void) | undefined = undefined;
-  /** 2026-11-05 AI 页签：把右侧助手提升为思源页签（手机端无页签，不提供） */
-  export let onOpenAiTab: ((bookId: string) => void) | undefined = undefined;
-  /** 2026-11-06 划词「问 AI」：优先投到已打开的 AI 页签；返回 false 则回落停靠栏 */
-  export let onAskAiInTab:
+  /** 2026-11-06 AI 入口：桌面统一走思源右侧停靠栏（手机端没有右栏，沿用全屏浮层） */
+  export let onOpenAiDock: ((bookId: string) => void) | undefined = undefined;
+  /** 划词「问 AI」：优先投到已打开的 AI 页签，否则打开右栏并带入选段 */
+  export let onAskAiInDock:
     | ((bookId: string, quote: AiChatQuote) => boolean)
     | undefined = undefined;
   /** 翻译选中文本并直接发送到 AI 精读面板（委托 plugin.translateToAi） */
@@ -647,21 +649,87 @@ import { getLogger } from "../core/logger.ts";
   $: if (showToc && !tocWasOpen) {
     tocWasOpen = true;
     expandTocAncestors();
-    void tick().then(scrollTocToActive);
+    tocBackVisible = false;
+    // 打开即定位（微信读书同款）：长目录用瞬时滚动，中途不要闪出「回到当前」胶囊
+    void tick().then(() => scrollTocToActive(false));
   } else if (!showToc && tocWasOpen) {
     tocWasOpen = false;
+    tocBackVisible = false;
+    if (tocScrollRaf) {
+      cancelAnimationFrame(tocScrollRaf);
+      tocScrollRaf = 0;
+    }
   }
-  function scrollTocToActive(): void {
+  function scrollTocToActive(smooth = false): void {
     const list = tocListEl;
     if (!list) return;
     const active = list.querySelector<HTMLElement>(".reader-toc-active");
-    if (!active) return;
+    if (!active) {
+      // 当前章被折叠藏起来了 —— 胶囊是回到它的唯一入口
+      tocBackVisible = true;
+      return;
+    }
     const target =
       active.getBoundingClientRect().top -
         list.getBoundingClientRect().top +
         list.scrollTop -
         (list.clientHeight / 2 - active.offsetHeight / 2);
-    list.scrollTo({ top: target, behavior: "smooth" });
+    list.scrollTo({ top: target, behavior: smooth ? "smooth" : "auto" });
+    tocBackVisible = false;
+    requestAnimationFrame(updateTocBackPill);
+  }
+
+  /**
+   * 2026-11-06 微信读书式目录：「回到当前」只在当前行滚出目录视口时浮出。
+   * 判定用 popover 实时的可视矩形 —— 标题是 sticky 的，当前行钻到标题底下也算看不见。
+   * 当前行被折叠藏起来时 DOM 里查不到，此时胶囊必须出现（否则用户没有回去的路）。
+   */
+  function updateTocBackPill(): void {
+    const list = tocListEl;
+    if (!list || !showToc) {
+      tocBackVisible = false;
+      return;
+    }
+    const active = list.querySelector<HTMLElement>(".reader-toc-active");
+    if (!active) {
+      tocBackVisible = true;
+      return;
+    }
+    const listRect = list.getBoundingClientRect();
+    const title = list.querySelector<HTMLElement>(".reader-popover-title");
+    const topEdge = (title?.getBoundingClientRect().bottom ?? listRect.top) + 2;
+    const r = active.getBoundingClientRect();
+    tocBackVisible = r.top < topEdge - 1 || r.bottom > listRect.bottom - 2;
+  }
+
+  let tocScrollRaf = 0;
+  function onTocScroll(): void {
+    if (tocScrollRaf) return;
+    tocScrollRaf = requestAnimationFrame(() => {
+      tocScrollRaf = 0;
+      updateTocBackPill();
+    });
+  }
+
+  /** 胶囊：展开当前章祖先 → 滚回当前行 → 闪一下，给用户一个明确落点。 */
+  function backToTocCurrent(): void {
+    expandTocAncestors();
+    void tick().then(() => {
+      scrollTocToActive(true);
+      flashTocActive();
+    });
+  }
+
+  function flashTocActive(): void {
+    if (tocFlashTimer) clearTimeout(tocFlashTimer);
+    tocFlash = false;
+    void tick().then(() => {
+      tocFlash = true;
+      tocFlashTimer = setTimeout(() => {
+        tocFlash = false;
+        tocFlashTimer = null;
+      }, 720);
+    });
   }
 
   /* ================= 图片查看器（lightbox，2026-10-15 P0） =================
@@ -1109,6 +1177,10 @@ import { getLogger } from "../core/logger.ts";
   let tocCollapsed = new Set<number>();
   $: tocTree = buildTocTree(tocItems);
   $: tocVisibleRows = visibleRows(tocTree, tocCollapsed);
+  // 阅读位置/折叠态变化后重新评估「回到当前」胶囊（只改一个布尔值，不会自激）
+  $: if (showToc && activeHref && tocVisibleRows) {
+    void tick().then(updateTocBackPill);
+  }
 
   /** 点 caret：切换该节点子树的展开态。必须 stopPropagation，否则同时触发跳转。 */
   function toggleTocNode(id: number): void {
@@ -1162,6 +1234,16 @@ import { getLogger } from "../core/logger.ts";
    */
   const VISITED_MAX = 2000;
   let tocReadCount = 0;
+
+  /**
+   * 目录行尾元信息（2026-11-06，微信读书式）
+   * - PDF：大纲自带 1-based 页码（href = "pdf-page-N"），如实显示；
+   * - EPUB：没有稳定页码，只显示**章节起点百分比**（sections 体积累加），不伪造页码。
+   */
+  let tocPctByHref = new Map<string, number>();
+  let tocBackVisible = false;
+  let tocFlash = false;
+  let tocFlashTimer: any = null;
 
   /**
    * 把访问集序列化为落盘数组（2026-10-09）
@@ -1488,6 +1570,7 @@ import { getLogger } from "../core/logger.ts";
    * 全本都匹配不到时 marks 为空 → 不渲染刻度（安全降级，不改变现有外观）。
    */
   function computeChapterMarks() {
+    tocPctByHref = new Map();
     try {
       const sections = view?.book?.sections;
       if (!Array.isArray(sections) || sections.length < 2 || !tocItems.length) {
@@ -1508,16 +1591,28 @@ import { getLogger } from "../core/logger.ts";
         cum.push(acc);
         acc += Number(sec?.size) || 0;
       }
+      // 先建 section id → 下标表，再做目录映射：长书 3000+ 条目录 × 数百 section
+      // 的 findIndex 是平方级，打开目录会明显卡顿。
+      const indexByPath = new Map<string, number>();
+      sections.forEach((sec: any, i: number) => {
+        const id = String(sec?.id || "");
+        if (!id) return;
+        if (!indexByPath.has(id)) indexByPath.set(id, i);
+        const base = id.split("#")[0];
+        if (base && !indexByPath.has(base)) indexByPath.set(base, i);
+      });
       const seen = new Set<number>();
       const marks: { left: number; title: string }[] = [];
       for (const item of tocItems) {
-        const path = String(item?.href || "").split("#")[0];
+        const href = String(item?.href || "");
+        const path = href.split("#")[0];
         if (!path) continue;
-        const idx = sections.findIndex(
-          (s: any) => s?.id === path || String(s?.id || "").split("#")[0] === path
-        );
-        if (idx <= 0) continue; // 第 0 章起点就是 0%，无需刻度
+        const idx = indexByPath.get(path);
+        if (idx === undefined) continue;
         const left = Math.round((cum[idx] / total) * 1000) / 10;
+        // 目录行尾的章节起点百分比（与进度条刻度同源，口径一致）
+        if (href) tocPctByHref.set(href, left);
+        if (idx <= 0) continue; // 第 0 章起点就是 0%，无需刻度
         if (left <= 0.2 || left >= 99.8) continue;
         if (seen.has(left)) continue;
         seen.add(left);
@@ -1533,11 +1628,36 @@ import { getLogger } from "../core/logger.ts";
           : marks;
     } catch {
       chapterMarks = [];
+      tocPctByHref = new Map();
     }
+  }
+
+  /** "pdf-page-N" → N；解析不出返回 0（大纲节点仍保留，只是没有页码）。 */
+  function tocPageOfHref(href: string): number {
+    const m = /^pdf-page-(\d+)$/.exec(href || "");
+    return m ? Number(m[1]) : 0;
+  }
+
+  /**
+   * 目录行尾元信息（微信读书式）。
+   * PDF 显示大纲页码；EPUB 只在部/章两级显示章节起点百分比，更深层留空避免噪音。
+   * 空格位必须保留：行是 flex，列宽固定才不会有「翻页时标题左右跳」。
+   */
+  function tocRowMeta(item: { href: string; level: number }): string {
+    if (isPdfBook()) {
+      const page = tocPageOfHref(item.href);
+      return page > 0 ? String(page) : "";
+    }
+    if (item.level > 1) return "";
+    const pct = tocPctByHref.get(item.href);
+    if (pct === undefined) return "";
+    return pct % 1 === 0 ? `${pct.toFixed(0)}%` : `${pct.toFixed(1)}%`;
   }
 
   onDestroy(() => {
     if (hoverHideTimer) clearTimeout(hoverHideTimer);
+    if (tocFlashTimer) clearTimeout(tocFlashTimer);
+    if (tocScrollRaf) cancelAnimationFrame(tocScrollRaf);
     // 2026-10-25 角落自动翻页：销毁即取消（含计时器与 L 动画态）
     cornerMachine.cancel();
   });
@@ -3885,6 +4005,8 @@ import { getLogger } from "../core/logger.ts";
   function onGlobalKey(e: KeyboardEvent) {
     // 非激活 Tab 容器 display:none → offsetParent 为 null，不响应
     if (container?.offsetParent === null) return;
+    // AI 设置窗口 portal 到 body，不受 container 约束；开着时把快捷键留给窗口
+    if (typeof document !== "undefined" && document.querySelector(".ai-set-dialog")) return;
     // 跳过输入控件（保留 input / textarea / contenteditable 原生行为）
     const t = e.target as HTMLElement | null;
     if (t && t !== document.body && (
@@ -4443,7 +4565,7 @@ import { getLogger } from "../core/logger.ts";
     }
     showAiPanel = true;
     showMoreMenu = false;
-    // 停靠栏与浮层抽屉互斥：打开时收起抽屉，避免正文被两侧同时挤压
+    // 浮层与抽屉互斥：打开时收起抽屉，避免正文被两侧同时挤压
     showToc = false;
     showMarks = false;
     showSearch = false;
@@ -4452,23 +4574,28 @@ import { getLogger } from "../core/logger.ts";
     void tick().then(() => aiPanelComp?.focusComposer?.());
   }
 
-  function onMoreAi() {
+  /**
+   * 顶栏 AI 按钮 / 更多菜单：桌面选中并打开右侧停靠栏的 AI 图标；
+   * 手机没有右栏，走原有全屏浮层。
+   */
+  function onTopbarAi(): void {
     showMoreMenu = false;
-    if (!showAiPanel) toggleAiPanel();
+    if (aiOverlay) {
+      toggleAiPanel();
+      return;
+    }
+    retractChromeForAi();
+    onOpenAiDock?.(bookId);
   }
 
-  /** 「在新页签打开」：页签已在右侧分屏，停靠栏要一起收起，避免同一会话占两处 */
-  function openAiTab() {
-    if (!onOpenAiTab) return;
-    showAiPanel = false;
-    onOpenAiTab(bookId);
+  function onMoreAi() {
+    onTopbarAi();
   }
 
   /**
    * 划词「问 AI」：把选段送到用户眼前的助手。
    *
-   * 停靠栏已开着就以它为准；否则先试已打开的 AI 页签（手机端没有页签，
-   * aiOverlay 为真时跳过）；页签没开/锁定别的书/宿主未就绪时再回落到停靠栏。
+   * 桌面交给插件：已打开的 AI 页签优先，否则打开右栏；手机走全屏浮层。
    * 章节号取当前章 —— 选段跨章续接的极端场景下定位会失败，面板会给出提示。
    */
   function onSelAskAi() {
@@ -4480,16 +4607,12 @@ import { getLogger } from "../core/logger.ts";
       sectionIndex: currentSectionIndex,
       chapterTitle: resolveChapterTitle(currentSectionIndex) || chapterLabel || undefined,
     };
-    if (!showAiPanel && !aiOverlay && onAskAiInTab?.(bookId, quote)) return;
-    if (!showAiPanel) {
-      showAiPanel = true;
-      showToc = false;
-      showMarks = false;
-      showSearch = false;
-      showSettings = false;
+    if (!aiOverlay) {
       retractChromeForAi();
-      void tick().then(() => aiPanelComp?.focusComposer?.());
+      onAskAiInDock?.(bookId, quote);
+      return;
     }
+    if (!showAiPanel) toggleAiPanel();
     void tick().then(() => aiPanelComp?.addQuote?.(quote));
   }
 
@@ -4904,19 +5027,11 @@ import { getLogger } from "../core/logger.ts";
   // ⋯ 溢出菜单（紧凑顶栏专属）
   let showMoreMenu = false;
 
-  /* 2026-11-05 P0：AI 阅读助手（右侧停靠）。
-   * 与左侧抽屉不同，它是**常驻停靠栏**：正文让位（margin-right），不做遮罩；
-   * 手机/大手机断点改为全屏覆盖（宽度已无处可让）。宽度由面板自己拖拽并落盘
-   * （localStorage: reword-reader-ai-prefs），这里只持有布局镜像。 */
+  /* 2026-11-06 AI 阅读助手：桌面已全部交给思源右侧停靠栏，阅读器内不再停靠；
+   * 手机/大手机没有右栏，保留全屏覆盖层。 */
   let showAiPanel = false;
-  let aiPanelWidth = DEFAULT_AI_PANEL_PREFS.width;
   let aiPanelComp: any = undefined;
   $: aiOverlay = viewportBp === "phone" || viewportBp === "largePhone";
-  /* 互斥：桌面停靠栏会被右侧浮层（搜索/设置/目录）挡住，打开浮层时先收起助手。
-     手机是覆盖层，浮层本来就在它后面，不需要这条。 */
-  $: if (showAiPanel && !aiOverlay && (showSearch || showSettings || showToc || showMarks)) {
-    showAiPanel = false;
-  }
 
   /**
    * 是否 PDF 书籍。
@@ -6939,6 +7054,8 @@ import { getLogger } from "../core/logger.ts";
         // 场景 B：点空白/普通文本 → 立即关闭工具栏 + 收起抽屉 + 收起两栏
         closeAllPopovers();
         collapseChrome();
+        // 点空白关闭前先把卡内未落库的内容写回（Protyle 失焦保存有 180ms 防抖，别让这段丢了）
+        if (noteEditor.visible) flushNoteEditBeforeClose();
         if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null };
       }
       // 脚注是独立瞬时浮层，与标注/工具栏无耦合：在 foliate 阅读区任意点击都视为「点击外部」，
@@ -6951,6 +7068,7 @@ import { getLogger } from "../core/logger.ts";
     closeAllPopovers();
     collapseChrome();
     if (selToolbar.visible) closeSelToolbar();
+    if (noteEditor.visible) flushNoteEditBeforeClose();
     if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null };
   }
 
@@ -7263,6 +7381,17 @@ import { getLogger } from "../core/logger.ts";
     place: "below",
   };
   let noteEditorEl: HTMLElement | null = null;
+  /** 卡片左上角（容器坐标）。2026-11-06 起由 JS 按实测尺寸算，
+   *  CSS 不再用 transform 定位（见 layoutNoteCard 的根因说明）。 */
+  let noteCardBox = { left: 0, top: 0, ready: false };
+  let noteCardRO: ResizeObserver | null = null;
+  let noteLayoutSeq = 0;
+  let noteProtyle: AnnEditor | null = null;
+  let noteProtyleEmpty = true;
+  let noteKeyHandler: ((e: KeyboardEvent) => void) | null = null;
+  /** 键盘监听的挂载点（= Protyle 宿主；卡根元素在 action 执行时可能还没 bind） */
+  let noteKeyTarget: HTMLElement | null = null;
+  let noteFocusSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   /* ============================================================
    * 自绘 Tooltip（2026-11-05）
@@ -7435,20 +7564,55 @@ import { getLogger } from "../core/logger.ts";
    *
    * ⚠️ 仅在「有 id 且内容真的变了」时才写 —— 否则点一下输入框再点走
    *   也会触发一次无谓的擦除重绘（视觉会闪一下）。
+   *
+   * 2026-11-06：触发点从 textarea:blur 改为.onNoteFocusOut（延迟 180ms），
+   * 保存也改为「就地保存不关卡片」—— 点原生格式栏会先让焦点离开编辑器，
+   * 若仍按旧逻辑关卡片，一次加粗就把整个弹窗关掉了。
    */
   async function onNoteAutoSave() {
     if (!isNoteViewer || !noteEditor.id) return;
-    const noteVal = noteEditor.note || "";
+    const noteVal = readNoteValue();
     const stored = annStore?.get(noteEditor.id);
-    if (stored && (stored.note || "") === noteVal) return;
-    await onNoteSave();
+    if (stored && (stored.note || "") === noteVal) {
+      if (noteEditor.note !== noteVal) noteEditor = { ...noteEditor, note: noteVal };
+      return;
+    }
+    await saveNoteInPlace(noteEditor.id, noteVal);
   }
 
-  /** textarea 键盘：⌘/Ctrl+↵ 保存；Esc 交给全局处理（它会调 closeAllPopovers） */
+  /**
+   * 查看态就地保存：落库 + 重绘，但**不关卡片**。
+   * 旧实现直接走 onNoteSave（会关卡片）—— 挂上原生工具栏后，点一次「加粗」
+   * 就会把卡片关掉；顺带修掉「改完笔记点一下颜色，卡片消失」的老问题。
+   */
+  async function saveNoteInPlace(id: string, noteVal: string) {
+    if (!annStore) { try { annStore = getAnnotationStore(); } catch { annStore = null; } }
+    if (!annStore) return;
+    const value = noteVal.trim();
+    // 期间可能已切到另一条标注 / 卡片已关，避免把 A 的内容写进 B
+    if (!noteEditor.visible || noteEditor.id !== id) return;
+    const { cfi, style, color, group } = noteEditor;
+    const stored = annStore.get(id);
+    if (stored && (stored.note || "") === value) {
+      if (noteEditor.note !== value) noteEditor = { ...noteEditor, note: value };
+      return;
+    }
+    annStore.upsert({ id, style, color, note: value, group, type: value ? "annotate" : "highlight" });
+    if (!isPdfBook() && cfi) {
+      await eraseAnnotationVisual(cfi);
+      await addReaderAnnotation({ id, cfi, color, style, note: value });
+      annByValue.set(cfi, { id, cfi, color });
+    }
+    if (noteEditor.visible && noteEditor.id === id) noteEditor = { ...noteEditor, note: value };
+  }
+
+  /** 卡内键盘：⌘/Ctrl+↵ 保存；Esc 交给全局处理（它会调 closeAllPopovers）
+   *  2026-11-06：查看态不再是「只读」，按 ⌘/↵ 就地存（不关卡）。 */
   function onNoteKeydown(e: KeyboardEvent) {
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
       e.preventDefault();
-      if (!isNoteViewer) void onNoteSave();
+      if (isNoteViewer) void onNoteAutoSave();
+      else void onNoteSave();
       return;
     }
     if (e.key === "Escape") {
@@ -7456,6 +7620,7 @@ import { getLogger } from "../core/logger.ts";
       // 这里只需把折叠气泡也收掉，并把事件**冒泡上去**（不要拦）。
       closeNoteFolds();
       e.stopPropagation();
+      flushNoteEditBeforeClose();
       closeAllPopovers();
     }
   }
@@ -7994,9 +8159,10 @@ import { getLogger } from "../core/logger.ts";
       const dy = Math.max(0, navBottom - t) + Math.max(0, b - bottomTop);
       return dx * h + dy * w;
     };
-    /** 由 (方向, 锚点) 推出占位矩形 —— 必须与 CSS 的 transform 语义严格一致：
+    /** 由 (方向, 锚点) 推出占位矩形 —— 划词工具栏靠 CSS transform 落位，必须严格一致：
      *  above → translate(-50%,-100%)；below → translate(-50%,0)
-     *  left  → translate(-100%,-50%)；right → translate(0,-50%) */
+     *  left  → translate(-100%,-50%)；right → translate(0,-50%)
+     *  批注卡片 2026-11-06 起改由 layoutNoteCard() 用 left/top 复刻同一套几何。 */
     const boxOf = (place: ToolbarPlace, ax: number, ay: number) => {
       let l = 0, t = 0;
       if (place === "above") { l = ax - w / 2; t = ay - h; }
@@ -8795,11 +8961,10 @@ import { getLogger } from "../core/logger.ts";
     const time = fmtTime(stored?.updatedAt || stored?.createdAt);
     const labels = resolveLabels(stored?.labels);
     // 统一用 positionPopupNear（锚定 + 四向避让 + 水平/垂直夹紧）。
-    // ⚠️ 高度值2026-10-08 从 200 下调到 170：取消/保存并入工具条、快捷键提示行删除，
-    //    卡片矮了约 30px。positionPopupNear 拿这个数做四向避让判定 ——
-    //    不跟着改的话，它以为下方还塞不下，会把卡片放到错误方位。
+    // ⚠️ 高度估算只影响「放哪一方向」的预判，最终位置由 layoutNoteCard() 按实测高度重锚。
+    //    2026-11-06：正文从 textarea 换成 Protyle 后最小高度 86px ⇒ 170 → 190。
     const pos = rect
-      ? positionPopupNear(rect, NOTE_CARD_W, 170)
+      ? positionPopupNear(rect, NOTE_CARD_W, 190)
       : { x: (readerViewEl?.clientWidth ?? window.innerWidth) / 2, y: 80, place: "below" as ToolbarPlace };
     const annStyle = ANNOTATION_STYLES[style] || { label: t("直线") };
     noteEditor = {
@@ -8809,6 +8974,7 @@ import { getLogger } from "../core/logger.ts";
       styleLabel: t(annStyle.label),
       place: pos.place,
     };
+    void beginNoteCardLayout();
   }
 
   /** 根据标注记录填充并弹「查看浮层」（view 态，保留兼容 C 跳转兜底） */
@@ -8913,6 +9079,7 @@ import { getLogger } from "../core/logger.ts";
       labels: [], styleLabel: t(annStyle.label),
       place: pos.place,
     };
+    void beginNoteCardLayout();
   }
 
   /** C 跳转：按 cfi 反查标注记录并弹查看浮层（无矩形则顶部居中） */
@@ -8945,9 +9112,187 @@ import { getLogger } from "../core/logger.ts";
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · dispatchAnnotationChanged", "debug"); }
   }
 
-  // 自动聚焦批注输入框（create/edit 态 textarea 渲染后聚焦，readest 批注即打字）
-  function focusNoteInput(node: HTMLTextAreaElement) {
-    node.focus();
+  /* ============================================================
+   * 批注卡片：定位 + 富文本编辑器（2026-11-06）
+   * ------------------------------------------------------------
+   * 卡内笔记从 `<textarea>` 换成思源 lite Protyle（AnnEditor 封装），
+   * 选中文字直接弹思源原生浮动栏（零常驻按钮）。
+   *
+   * 🔴 为什么必须连带改定位：思源原生浮动栏 `.protyle-toolbar` 是
+   *   `position: fixed`，任何 **transform / backdrop-filter 祖先**都会成为它的
+   *   包含块 ⇒ 工具栏会按卡片而不是视口算坐标，飞到屏幕外。
+   *   ⇒ 卡片去掉 CSS transform（毛玻璃挪到 ::before），left/top 改由
+   *   layoutNoteCard() 按实测尺寸算；内容变高时 ResizeObserver 重锚。
+   * ============================================================ */
+
+  /** 卡片与选区之间的间距（原 CSS margin-top:10px 的显式化） */
+  const NOTE_CARD_GAP = 10;
+
+  /**
+   * 卡内原生工具栏的保留项：只留最常用的行内格式。
+   * 刻意排除 text（文字颜色）/ a（链接）/ block-ref —— 它们会再开一个
+   * `.protyle-util` 二级浮层，400px 卡片里没地方放；
+   * 也排除 block-type / format-painter 等 lite 模式本就会被过滤的项。
+   */
+  const NOTE_PROTYLE_TOOLBAR = ["strong", "em", "u", "s", "mark", "|", "code", "clear"];
+
+  /** 按实测尺寸把「锚点 + 四向」换算成卡片 left/top，并夹进内容区。 */
+  function layoutNoteCard() {
+    if (!noteEditor.visible || !noteEditorEl) return;
+    const w = noteEditorEl.offsetWidth || NOTE_CARD_W;
+    const h = noteEditorEl.offsetHeight || 190;
+    let left: number;
+    let top: number;
+    switch (noteEditor.place) {
+      case "above": left = noteEditor.x - w / 2; top = noteEditor.y - h - NOTE_CARD_GAP; break;
+      case "left": left = noteEditor.x - w; top = noteEditor.y - h / 2; break;
+      case "right": left = noteEditor.x; top = noteEditor.y - h / 2; break;
+      default: left = noteEditor.x - w / 2; top = noteEditor.y + NOTE_CARD_GAP;
+    }
+    // 夹进内容区（排除 Dock / 顶栏 / 底栏）：内容边界是视口坐标，卡片是容器坐标
+    const b = getContentBounds();
+    const off = getReaderViewOffset();
+    const pad = 8;
+    const minLeft = b.left - off.left + pad;
+    const maxLeft = b.right - off.left - pad - w;
+    const minTop = b.top - off.top + pad;
+    const maxTop = b.bottom - off.top - pad - h;
+    left = Math.min(Math.max(left, minLeft), Math.max(minLeft, maxLeft));
+    top = Math.min(Math.max(top, minTop), Math.max(minTop, maxTop));
+    if (!noteCardBox.ready || noteCardBox.left !== left || noteCardBox.top !== top) {
+      noteCardBox = { left, top, ready: true };
+    }
+  }
+
+  function stopNoteCardObserver() {
+    try { noteCardRO?.disconnect(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · stopNoteCardObserver", "debug"); }
+    noteCardRO = null;
+  }
+
+  /** 卡片打开后：先给预估落点（防首帧跳 0,0），下一帧按实测尺寸重锚并持续观察。 */
+  async function beginNoteCardLayout() {
+    noteLayoutSeq++;
+    const seq = noteLayoutSeq;
+    stopNoteCardObserver();
+    noteCardBox = {
+      left: Math.max(0, noteEditor.x - NOTE_CARD_W / 2),
+      top: Math.max(0, noteEditor.y + NOTE_CARD_GAP),
+      ready: false,
+    };
+    for (let attempt = 0; attempt < 4 && !noteEditorEl; attempt++) {
+      await tick();
+      if (seq !== noteLayoutSeq || !noteEditor.visible) return;
+      if (!noteEditorEl) await new Promise<void>((r) => requestAnimationFrame(() => r()));
+    }
+    if (seq !== noteLayoutSeq || !noteEditor.visible) return;
+    if (!noteEditorEl) {
+      // 兜底：宁可显示在预估位置，也不能因为量不到尺寸一直隐身
+      noteCardBox = { ...noteCardBox, ready: true };
+      return;
+    }
+    layoutNoteCard();
+    try {
+      noteCardRO = new ResizeObserver(() => layoutNoteCard());
+      noteCardRO.observe(noteEditorEl);
+    } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · beginNoteCardLayout", "debug"); }
+  }
+
+  /** 读卡内真实内容（Protyle → Kramdown）；编辑器未就绪时回落到状态值。 */
+  function readNoteValue(): string {
+    if (noteProtyle) {
+      try {
+        const md = noteProtyle.read();
+        if (typeof md === "string") return md.trim();
+      } catch (e) {
+        getLogger().warn("[REword-Reader] 卡内编辑器读取失败，回落状态值", { error: e });
+      }
+    }
+    return (noteEditor.note || "").trim();
+  }
+
+  function teardownNoteProtyle() {
+    if (noteKeyHandler) {
+      try { noteKeyTarget?.removeEventListener("keydown", noteKeyHandler, true); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
+      noteKeyHandler = null;
+    }
+    noteKeyTarget = null;
+    try { noteProtyle?.destroy?.(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
+    noteProtyle = null;
+    noteProtyleEmpty = true;
+  }
+
+  /**
+   * Svelte action：卡内富文本宿主的生命周期。
+   * 用 action 而不是在四个打开点手写 mount/destroy —— 关卡片、切换标注、
+   * 组件卸载都由 Svelte 统一触发，漏一次就是 Protyle 泄漏 + 键盘监听残留。
+   * 参数传 `noteEditor.id ?? "create"`：卡片不卸载但换了标注视时能重挂。
+   */
+  function noteProtyleHost(node: HTMLElement, key: string) {
+    let mountedKey = key;
+    const mountNow = () => {
+      teardownNoteProtyle();
+      const initial = noteEditor.note || "";
+      noteProtyle = new AnnEditor(node, {
+        app: (window as any).siyuan?.ws?.app,
+        initial,
+        toolbar: NOTE_PROTYLE_TOOLBAR,
+        // 小卡片里必须按视口定位原生浮动栏，否则它被限制在 ~200px 高的卡片内
+        toolbarViewportBoundary: true,
+        onEmptyChange: (empty) => { noteProtyleEmpty = empty; },
+      });
+      noteProtyle.mount();
+      noteProtyleEmpty = !initial.trim();
+      // 捕获阶段接键盘：Protyle 自己会消费 Escape/回车，冒泡到卡片时可能已被拦。
+      noteKeyHandler = (e: KeyboardEvent) => onNoteKeydown(e);
+      noteKeyTarget = node;
+      node.addEventListener("keydown", noteKeyHandler, true);
+    };
+    mountNow();
+    return {
+      update(next: string) {
+        if (next === mountedKey) return;
+        mountedKey = next;
+        mountNow();
+      },
+      destroy() { teardownNoteProtyle(); },
+    };
+  }
+
+  function cancelNoteFocusSave() {
+    if (noteFocusSaveTimer != null) {
+      clearTimeout(noteFocusSaveTimer);
+      noteFocusSaveTimer = null;
+    }
+  }
+
+  /**
+   * 卡内焦点离开 → 延迟自动保存（仅查看态）。
+   * 必须延迟：点原生浮动栏时焦点会先落到 body，等 setInlineMark 落地后再读，
+   * 否则会把「加粗前」的内容存进去。这段时间里焦点若回到卡内则取消。
+   */
+  function onNoteFocusOut(e: FocusEvent) {
+    if (!isNoteViewer || !noteEditor.id) return;
+    const next = e.relatedTarget as Node | null;
+    if (next && noteEditorEl?.contains(next)) return;
+    cancelNoteFocusSave();
+    const id = noteEditor.id;
+    noteFocusSaveTimer = setTimeout(() => {
+      noteFocusSaveTimer = null;
+      if (!isNoteViewer || !noteEditor.visible || noteEditor.id !== id) return;
+      const active = document.activeElement;
+      if (active && noteEditorEl?.contains(active)) return;
+      void onNoteAutoSave();
+    }, 180);
+  }
+
+  /**
+   * 关闭卡片前先把查看态的改动落库。
+   * focusout 的自动保存是延迟的，点外部会赶在它之前把卡片 DOM 拆掉 ⇒ 必须显式 flush。
+   */
+  function flushNoteEditBeforeClose() {
+    cancelNoteFocusSave();
+    if (!isNoteViewer || !noteEditor.visible || !noteEditor.id) return;
+    void onNoteAutoSave();
   }
 
   /* ============================================================
@@ -9334,7 +9679,7 @@ import { getLogger } from "../core/logger.ts";
       getState: () => getReaderAiState(),
       getChapter: (opts: { sectionIndex?: number; fromPara?: number; maxChars?: number }) => getChapterSnapshot(opts),
       getRange: (opts: { fromSection?: number; toSection?: number; maxChars?: number }) => getChapterRangeSnapshot(opts),
-      listToc: () => getBookToc(),
+      listToc: async () => getBookToc(),
       locate: (opts: { quote: string; sectionIndex?: number }) => locateAiQuote(opts),
       listAnnotations: async (opts: { origin?: string }) => listAiAnnotations(opts),
     };
@@ -9978,6 +10323,7 @@ import { getLogger } from "../core/logger.ts";
     // 场景 B：点空白/普通文本 → 立即收起（同步，无延迟）
     closeAllPopovers();
     if (selToolbar.visible) closeSelToolbar();
+    if (noteEditor.visible) flushNoteEditBeforeClose();
     if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null };
   }
   // 2026-09-05（性能）：selectionchange 在拖动/输入光标移动时会高频触发，
@@ -10008,13 +10354,15 @@ import { getLogger } from "../core/logger.ts";
     // 否则拖拽中的 selectionchange/mouseup 会用旧锚点重弹工具栏、与手柄抢更新导致抖动。
     if (selHandleDragging) return;
     // 批注窗口编辑/新建模式打开时，忽略选区变化：
-    // 否则在 textarea 输入时光标移动触发主 document 的 selectionchange，
+    // 否则在卡内输入时光标移动触发主 document 的 selectionchange，
     // 残留的 foliate 选区会被 readReaderSelection 读到 → 误弹划词工具栏。
-    // 注意：仅屏蔽 edit/create（有 textarea 输入），不屏蔽 view（只读查看卡无输入）。
+    // 2026-11-06：查看态的卡也含编辑器（Protyle），但只在**焦点真的在卡内**时屏蔽 ——
+    // 否则用户只是想读着卡里内容、顺手在正文划词，工具栏就弹不出来了。
     if (selReadTimer) { clearTimeout(selReadTimer); selReadTimer = null; }
-    if (noteEditor.visible && (noteEditor.mode === "edit" || noteEditor.mode === "create")) {
-      // 本状态忽略选区（textarea 输入保护），直接早退
-      return;
+    if (noteEditor.visible) {
+      if (noteEditor.mode === "edit" || noteEditor.mode === "create") return;
+      const active = document.activeElement as HTMLElement | null;
+      if (active && noteEditorEl?.contains(active)) return;
     }
     const sel = readReaderSelection();
     if (sel) { setSelFrom(sel); return; }
@@ -10377,7 +10725,9 @@ import { getLogger } from "../core/logger.ts";
     // → 视为伪 relocate，跳过收起（标注脏重绘照常）。真滚动/翻页（有 scroll 事件）不受影响。
     const siyuanShiftMode = (window as any)?.siyuan?.shiftIsPressed === true;
     const scrollDt = performance.now() - lastContentScrollMs;
-    const typingInNote = !!(document.activeElement as HTMLElement | null)?.classList?.contains("reader-note-input");
+    // 2026-11-06：卡内改成 Protyle（内层是 contenteditable 的 div），
+    // 旧判据查的是 textarea 的类名，换成「焦点是否落在批注卡里」才继续成立。
+    const typingInNote = !!(document.activeElement as HTMLElement | null)?.closest?.(".reader-note-editor");
     if (siyuanShiftMode || (scrollDt > 800 && typingInNote)) {
       if (annotationsDirty) {
         redrawBookAnnotations();
@@ -10400,6 +10750,7 @@ import { getLogger } from "../core/logger.ts";
         selDragReplay = null;
         replay();
       }
+      if (noteEditor.visible) flushNoteEditBeforeClose();
       if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null, place: "below" };
       if (showFootnote) closeFootnote();
       if (dictPopup.visible) dictPopup = { ...dictPopup, visible: false };
@@ -10413,6 +10764,7 @@ import { getLogger } from "../core/logger.ts";
     if (selToolbar.visible) closeSelToolbar();
     // 2026-10-14 P2：翻页/位置变化时手柄立即消失（工具栏走 140ms 收起动画，手柄钉在旧坐标会脱节）。
     if (selHandles.visible) selHandles = { ...selHandles, visible: false };
+    if (noteEditor.visible) flushNoteEditBeforeClose();
     if (noteEditor.visible) noteEditor = { ...noteEditor, visible: false, mode: "create", id: null, place: "below" };
     if (showFootnote) closeFootnote();
     if (dictPopup.visible) dictPopup = { ...dictPopup, visible: false };
@@ -11399,6 +11751,7 @@ import { getLogger } from "../core/logger.ts";
       styleLabel: t(annStyle.label),
       place: pos.place,
     };
+    void beginNoteCardLayout();
   }
 
   // edit 态「批注」按钮：直接在已有标注上写/改笔记（Readest 式，不再中转只读预览卡）。
@@ -11463,6 +11816,7 @@ import { getLogger } from "../core/logger.ts";
       styleLabel: t("直线"),
       place,
     };
+    void beginNoteCardLayout();
   }
 
   // ⚠️ 2026-10-08 删除了 `onViewerEdit()`。
@@ -11508,6 +11862,7 @@ import { getLogger } from "../core/logger.ts";
   async function onViewerCopy() {
     const text = (noteEditor.text || "").trim();
     if (!text) return;
+    flushNoteEditBeforeClose();
     closeNoteEditor();
     if (await writeClipboard(text)) toast(t("已复制"));
   }
@@ -11515,7 +11870,7 @@ import { getLogger } from "../core/logger.ts";
   // 查看气泡「导出」：将「原文 + 笔记」组合为 Markdown 复制到剪贴板（轻量导出，后续可接思源文档）
   async function onViewerExport() {
     const text = (noteEditor.text || "").trim();
-    const note = (noteEditor.note || "").trim();
+    const note = readNoteValue();
     const md = [text ? `> ${text}` : "", note ? note : ""].filter(Boolean).join("\n\n");
     if (!md) { toast(t("无内容可导出")); return; }
     if (await writeClipboard(md)) toast(t("已导出批注到剪贴板"));
@@ -11568,11 +11923,12 @@ import { getLogger } from "../core/logger.ts";
 
   // 统一批注浮层保存（create 新增 type='annotate'；edit 更新已有记录 id 存在）
   async function onNoteSave() {
-    const { cfi, text, style, color, note, group, id } = noteEditor;
+    const { cfi, text, style, color, group, id } = noteEditor;
     if (!cfi || !text) { toast(t("请先选中文本")); return; }
     lastStyle = style; lastColor = color; lastGroup = group; // 同步偏好，供「高亮」复用
     setLastAnnotationGroup(group); // 分组也跨会话记住（与颜色/线型同一份配置）
-    const noteVal = note?.trim() || "";
+    // 从卡内 Protyle 现读 —— noteEditor.note 只做快照，输入中的内容还没同步回去
+    const noteVal = readNoteValue();
     if (id) {
       // 更新已有标注：upsert(id) 就地更新 note/样式/颜色/类型
       if (!annStore) { try { annStore = getAnnotationStore(); } catch { annStore = null; } }
@@ -11642,7 +11998,7 @@ import { getLogger } from "../core/logger.ts";
       // （resolveNavigation → overlayer.remove → 按新值重绘），单次调用即完成换色。
       // 旧写法先 eraseAnnotationVisual（两次全 overlay 遍历 + 可能触发核选项）再 add，
       // 两步之间必有一帧高亮消失——用户看到的就是「点完颜色，标注段闪一下」。
-      await addReaderAnnotation({ id: noteEditor.id, cfi, color, style: noteEditor.style, note: noteEditor.note || "" });
+      await addReaderAnnotation({ id: noteEditor.id, cfi, color, style: noteEditor.style, note: readNoteValue() });
       annByValue.set(cfi, { id: noteEditor.id, cfi, color });
     }
     noteEditor = { ...noteEditor, color };
@@ -11658,7 +12014,7 @@ import { getLogger } from "../core/logger.ts";
     if (annStore) annStore.upsert({ id: noteEditor.id, style });
     if (cfi) {
       // 2026-10-13 P0-1：同 applyViewerColor——单次 addAnnotation 原子替换，不先擦后画。
-      await addReaderAnnotation({ id: noteEditor.id, cfi, color: noteEditor.color, style, note: noteEditor.note || "" });
+      await addReaderAnnotation({ id: noteEditor.id, cfi, color: noteEditor.color, style, note: readNoteValue() });
       annByValue.set(cfi, { id: noteEditor.id, cfi, color: noteEditor.color });
     }
     noteEditor = { ...noteEditor, style };
@@ -13286,8 +13642,7 @@ import { getLogger } from "../core/logger.ts";
   class:re-large-phone={viewportBp === "largePhone"}
   class:re-tablet={viewportBp === "tablet"}
   class:sidebar-docked={anyDockPanel()}
-  class:ai-docked={showAiPanel && !aiOverlay}
-  style="--re-sidebar-w:{sidebarWidth}px;--re-ai-w:{aiPanelWidth}px"
+  style="--re-sidebar-w:{sidebarWidth}px"
 >
   <!-- 2026-11-06 微信读书式上下栏：顶栏永远是浮层（脱离文档流、浮在正文上方）。
        · reader-toolbar-floating —— 固定类名，不再有「常驻/悬浮」两档
@@ -13372,10 +13727,10 @@ import { getLogger } from "../core/logger.ts";
         <!-- 图书与 PDF 共用：阅读助手 + 设置 + 搜索 -->
         <button
           class="reader-btn reader-ai-btn reader-chrome-btn"
-          title={t("阅读助手（AI，读当前章节）")}
+          title={aiOverlay ? t("阅读助手（AI，读当前章节）") : t("阅读助手（在右栏打开）")}
           aria-label={t("阅读助手")}
-          class:reader-btn-active={showAiPanel}
-          on:click={toggleAiPanel}
+          class:reader-btn-active={aiOverlay && showAiPanel}
+          on:click={onTopbarAi}
         ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.sparkles}</svg></button>
         <button
           class="reader-btn reader-settings-btn reader-chrome-btn"
@@ -13459,7 +13814,7 @@ import { getLogger } from "../core/logger.ts";
   {/if}
 
   {#if showToc}
-    <div class="reader-popover reader-toc" bind:this={tocListEl} style="--tail-left:{tailLeft}px" on:wheel|stopPropagation>
+    <div class="reader-popover reader-toc" bind:this={tocListEl} style="--tail-left:{tailLeft}px" on:wheel|stopPropagation on:scroll={onTocScroll}>
       <div class="reader-popover-title">
         {t("目录")}
         <button
@@ -13474,9 +13829,12 @@ import { getLogger } from "../core/logger.ts";
       </div>
       <div class="reader-toc-list">
         {#each tocVisibleRows as row (row.node.id)}
+          {@const isCurrent = row.node.href !== "" && row.node.href === activeHref}
           <button
             class="reader-toc-item"
-            class:reader-toc-active={row.node.href !== "" && row.node.href === activeHref}
+            class:reader-toc-active={isCurrent}
+            class:reader-toc-flash={tocFlash && isCurrent}
+            aria-current={isCurrent ? "location" : undefined}
             style="padding-left:{row.depth * 12 + 4}px"
             on:click={() => goToc(row.node.href)}
           >
@@ -13494,14 +13852,36 @@ import { getLogger } from "../core/logger.ts";
                 ><span class="reader-toc-caret-ico">{@html SEL_ICONS.chevronDown}</span></span>
               {/if}
             </span>
-            {#if visitedHrefs.has(row.node.href)}
-              <span class="reader-toc-check">✓</span>
-            {/if}
+            <!-- 状态槽恒定占位（零位移）：当前行 = 书图标，已读行 = 勾。
+                 行尾同样固定 48px：页码/百分比出现或变成「当前读到」时标题不左右跳。 -->
+            <span class="reader-toc-state" aria-hidden="true">
+              {#if isCurrent}
+                <svg class="reader-toc-state-ico reader-toc-state-book" viewBox="0 0 24 24">{@html ICONS.bookOpen}</svg>
+              {:else if visitedHrefs.has(row.node.href)}
+                <svg class="reader-toc-state-ico reader-toc-state-check" viewBox="0 0 24 24">{@html ICONS.check}</svg>
+              {/if}
+            </span>
             <span class="reader-toc-label">{row.node.title}</span>
+            <span class="reader-toc-meta" class:reader-toc-meta-current={isCurrent}>
+              {isCurrent ? t("当前读到") : tocRowMeta(row.node)}
+            </span>
           </button>
         {:else}
           <div class="reader-toc-empty">{t("本书没有目录")}</div>
         {/each}
+      </div>
+      <!-- 「回到当前」：绝对浮出会吃掉布局，这里用 0 高 sticky 壳 + 上移自身的胶囊，
+           滚动容器里不占任何行高；只在当前行离开视口时淡入。 -->
+      <div class="reader-toc-back-wrap" class:on={tocBackVisible}>
+        <button
+          class="reader-toc-back"
+          title={t("回到当前阅读位置")}
+          aria-label={t("回到当前阅读位置")}
+          on:click={backToTocCurrent}
+        >
+          <svg class="reader-toc-back-ico" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.bookOpen}</svg>
+          <span>{t("回到当前")}</span>
+        </button>
       </div>
     </div>
   {/if}
@@ -13693,7 +14073,7 @@ import { getLogger } from "../core/logger.ts";
       {/if}
       <button class="reader-more-item" role="menuitem" on:click={onMoreAi}>
         <span>✦ {t("阅读助手")}</span>
-        <span class="reader-more-item-state">{showAiPanel ? t("开") : t("关")}</span>
+        {#if aiOverlay}<span class="reader-more-item-state">{showAiPanel ? t("开") : t("关")}</span>{/if}
       </button>
       <button class="reader-more-item" role="menuitem" on:click={onMoreSettings}>
         <span>⚙ {t("设置")}</span>
@@ -13756,7 +14136,22 @@ import { getLogger } from "../core/logger.ts";
             <div class="reader-annot-item" class:reader-annot-item-ink={it.kind === "ink"}>
               <span class="reader-annot-dot" style="background:{it.color || '#62a2ff'}"></span>
               <span class="reader-annot-kind" title={annotKindLabel(it)}>{annotGlyph(it)}</span>
-              <button class="reader-annot-main" title={t("跳转到{kind}所在位置", { kind: annotKindLabel(it) })} on:click={() => jumpAnnot(it)}>
+              <!-- 整行可点 = 跳转。用 role=button 的 div 而不是 <button>：
+                   批注正文现在渲染 Lute 富文本（<p>/<ul>/<table>），
+                   块级元素塞进 button 是非法嵌套，浏览器表现也不稳定。 -->
+              <div
+                class="reader-annot-main"
+                role="button"
+                tabindex="0"
+                title={t("跳转到{kind}所在位置", { kind: annotKindLabel(it) })}
+                on:click={() => jumpAnnot(it)}
+                on:keydown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    void jumpAnnot(it);
+                  }
+                }}
+              >
                 <span class="reader-annot-text">
                   {#if it.kind === "ink"}
                     <span class="reader-annot-ink-tag">✎ {it.sentence}</span>
@@ -13766,9 +14161,9 @@ import { getLogger } from "../core/logger.ts";
                   {/if}
                 </span>
                 {#if it.kind !== "ink" && String(it.note || "").trim()}
-                  <span class="reader-annot-note">{String(it.note || "").trim()}</span>
+                  <div class="reader-annot-note b3-typography">{@html renderAnnotationHTML(it.note)}</div>
                 {/if}
-              </button>
+              </div>
               <button
                 class="reader-mini-btn"
                 title={it.kind === "ink" ? t("删除这条墨迹") : t("删除这条摘录")}
@@ -14214,9 +14609,11 @@ import { getLogger } from "../core/logger.ts";
       class:place-below={noteEditor.place==='below'}
       class:place-left={noteEditor.place==='left'}
       class:place-right={noteEditor.place==='right'}
+      class:measuring={!noteCardBox.ready}
       bind:this={noteEditorEl}
-      style="left:{noteEditor.x}px;top:{noteEditor.y}px"
+      style="left:{noteCardBox.left}px;top:{noteCardBox.top}px"
       on:click={onNoteCardClick}
+      on:focusout={onNoteFocusOut}
     >
       <!-- 行 1 · 原文引用 + 时间（单行省略，不撑高卡片） -->
       <div class="reader-note-row-top">
@@ -14330,16 +14727,17 @@ import { getLogger } from "../core/logger.ts";
         {/if}
       </div>
 
-      <!-- 行 3 · 笔记正文（有笔记才显示；纯高亮态没有笔记 => 这一行不出现） -->
+      <!-- 行 3 · 笔记正文（有笔记才显示；纯高亮态没有笔记 => 这一行不出现）
+           2026-11-06：textarea → 思源 lite Protyle（AnnEditor），选中文字即弹原生浮动栏。
+           宿主本身不写 keydown：键盘在捕获阶段挂到卡片上（Protyle 会先消费 Escape/回车）。 -->
       {#if noteEditor.mode !== "highlight"}
-        <textarea
-          class="reader-note-input"
+        <div
+          class="reader-note-protyle"
           class:viewer={isNoteViewer}
-          placeholder={t("写点批注…")}
-          bind:value={noteEditor.note}
-          on:blur={onNoteAutoSave}
-          on:keydown={onNoteKeydown}
-          use:focusNoteInput></textarea>
+          class:empty={noteProtyleEmpty}
+          data-placeholder={t("写点批注…")}
+          use:noteProtyleHost={noteEditor.id ?? "create"}
+        ></div>
       {/if}
     </div>
   {/if}
@@ -14423,23 +14821,18 @@ import { getLogger } from "../core/logger.ts";
   <!-- 2026-11-05 P0：AI 阅读助手（右侧停靠 / 手机全屏）。
        刻意放在 .reader-floating-layer **外面**：那层标了 aria-hidden="true"，
        只装瞬时浮层；对话面板是可长期停留、可键盘操作的实体内容。
-       宽度由面板内部拖拽并落盘（bind:width → 本组件只做布局镜像）。 -->
-  {#if showAiPanel}
-    <div
-      class="reader-ai-dock"
-      class:reader-ai-dock--overlay={aiOverlay}
-      style={aiOverlay ? "" : `width:${aiPanelWidth}px`}
-    >
+       2026-11-06：桌面已改用思源右栏，这里只剩手机全屏覆盖层。 -->
+  {#if showAiPanel && aiOverlay}
+    <div class="reader-ai-dock reader-ai-dock--overlay">
       <AiPanel
         bind:this={aiPanelComp}
-        bind:width={aiPanelWidth}
         open={showAiPanel}
         bookId={bookId}
         bookTitle={meta?.title || title}
         bookAuthor={meta?.author || ""}
         chapterLabel={chapterLabel}
-        resizable={!aiOverlay}
-        overlay={aiOverlay}
+        resizable={false}
+        overlay={true}
         getAiSettings={getAiSettings}
         saveAiSettings={onSaveAiSettings}
         getChapter={getChapterSnapshot}
@@ -14452,7 +14845,6 @@ import { getLogger } from "../core/logger.ts";
         writeNotePlan={writeAiNotePlan}
         getPrimer={() => primerStore?.get?.(bookId) || ""}
         onLocate={onAiLocate}
-        onOpenTab={aiOverlay ? undefined : openAiTab}
         onClose={() => (showAiPanel = false)}
       />
     </div>
@@ -15501,13 +15893,16 @@ import { getLogger } from "../core/logger.ts";
     position: absolute;
     left: 0;
     top: 0;
-    transform: translate(-50%, 0);
+    /* 🔴🔴 这里**不能出现 transform / filter / backdrop-filter / contain**。
+       卡内是思源原生 Protyle，它的浮动格式栏 `.protyle-toolbar` 是 position:fixed：
+       任何会建立包含块的祖先都会把工具栏的坐标系从「视口」改成「这张卡片」，
+       表现为选中文字后格式栏飞到屏幕外 / 贴到卡片边上。
+       ⇒ left/top 由 JS 的 layoutNoteCard() 按实测尺寸算；毛玻璃下沉到 ::before。 */
     z-index: 4; /* 高于底部工具栏 */
     --note-card-w: 400px;
     width: var(--note-card-w);
     box-sizing: border-box;
     max-width: calc(100% - 16px); /* 相对容器（reader-view）而非视口，避免侧栏展开时溢出 */
-    margin-top: 10px; /* 与选区拉开间距 */
     padding: 12px 14px;
     display: flex;
     flex-direction: column;
@@ -15516,33 +15911,25 @@ import { getLogger } from "../core/logger.ts";
        白天 = 主题 surface 94% + 毛玻璃、深色字；夜间 = 恒深色 + 白字。
        （color-mix 失效时的兜底已下沉到 .reader-view 的令牌定义处。） */
     background: var(--rwd-pop-bg);
-    -webkit-backdrop-filter: blur(20px) saturate(1.3);
-    backdrop-filter: blur(20px) saturate(1.3);
     border: 1px solid var(--rwd-pop-border);
     border-radius: 14px;
     box-shadow: var(--rwd-pop-shadow);
     color: var(--rwd-pop-fg);
     pointer-events: auto;
   }
-  /* 2026-08-25 底部空间不足时翻转到选区上方：transform 翻转 Y 轴 + 间距改到底部 */
-  .reader-note-editor.place-above {
-    transform: translate(-50%, -100%);
-    margin-top: 0;
-    margin-bottom: 10px;
+  /* 毛玻璃单独一层：只放 backdrop-filter（它会建立 fixed 包含块，必须离开卡片根元素） */
+  .reader-note-editor::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    -webkit-backdrop-filter: blur(20px) saturate(1.3);
+    backdrop-filter: blur(20px) saturate(1.3);
+    pointer-events: none;
   }
-  /* 2026-08-29 四向避让：below=默认（translate(-50%,0)）；left/right=垂直居中于选区 */
-  .reader-note-editor.place-below {
-    transform: translate(-50%, 0);
-    margin-top: 10px;
-  }
-  .reader-note-editor.place-left {
-    transform: translate(-100%, -50%);
-    margin-top: 0;
-  }
-  .reader-note-editor.place-right {
-    transform: translate(0, -50%);
-    margin-top: 0;
-  }
+  /* 首帧量尺寸前隐身，避免卡片先在预估位置闪一下再跳 */
+  .reader-note-editor.measuring { visibility: hidden; }
   /* 小三角指向选中文本，颜色与卡片底同源（--rwd-pop-bg），
      否则白天/夜间两套底色下都会出现「三角与卡片不同色」的错位。 */
   .reader-note-editor::after {
@@ -15807,37 +16194,85 @@ import { getLogger } from "../core/logger.ts";
     color: #e5484d;
   }
 
-  /* 行 3 · 笔记正文 */
-  .reader-note-input {
-    /* 🔴 box-sizing 必须显式写 —— 旧定义里有这行，重写时漏了。
-       缺失的后果：`width:100%` + padding 8/10 + border 1 各左右共 +22px
-       ⇒ textarea 比容器宽，右边缘**戳出卡片外**（真机报障「输入框超出弹窗」）。 */
+  /* 行 3 · 笔记正文（2026-11-06 起是思源 lite Protyle）
+     ⚠️ 这里只做「外壳」：底色/描边/圆角/滚动都归宿主，Protyle 内部一律透明，
+        否则会叠出第二层底色（真机表现为卡片里嵌了个白盒子）。
+     🔴 宿主上的 position: relative **不会**影响 Protyle 浮动栏 —— 它只对
+        absolute 后代生效，而 .protyle-toolbar 是 fixed（见卡片根元素那条注释）。 */
+  .reader-note-protyle {
+    position: relative;
     box-sizing: border-box;
     width: 100%;
-    min-height: 62px;
-    max-height: 130px;
-    resize: vertical;
-    padding: 8px 10px;
+    min-height: 86px;
+    max-height: 220px;
+    overflow-y: auto;
+    padding: 6px 10px;
     border-radius: 10px;
     border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
     background: var(--b3-theme-background-light, rgba(0, 0, 0, 0.03));
     color: inherit;
-    font: inherit;
     font-size: 13px;
     line-height: 1.65;
-    display: block; /* textarea 默认 inline-block，父级 flex 下会带 baseline 间隙 */
   }
-  .reader-note-input::placeholder { color: var(--b3-theme-on-surface-light, #888); }
-  .reader-note-input:focus {
-    outline: none;
+  .reader-note-protyle:focus-within {
     border-color: var(--b3-primary, #378add);
     background: var(--b3-theme-background, #fff);
   }
-  /* 查看态的正文区：也是 textarea（可编辑），但去掉聚焦高亮 ——
-     用户不该觉得「进入了编辑模式」，改完自动保存就生效 */
-  .reader-note-input.viewer:focus {
+  /* 查看态的正文区：同样可编辑，但不亮聚焦描边 —— 用户不该觉得「进入了编辑模式」 */
+  .reader-note-protyle.viewer:focus-within {
     border-color: var(--b3-border-color, rgba(0, 0, 0, 0.1));
     background: var(--b3-theme-background-light, rgba(0, 0, 0, 0.03));
+  }
+  /* 空态占位：Protyle 自己不会给空文档画 placeholder，这里叠一层 */
+  .reader-note-protyle.empty::before {
+    content: attr(data-placeholder);
+    position: absolute;
+    top: 6px;
+    left: 10px;
+    right: 10px;
+    color: var(--b3-theme-on-surface-light, #888);
+    font-size: 13px;
+    line-height: 1.65;
+    pointer-events: none;
+  }
+  /* Protyle 内部：清掉思源默认的 min-height / 底色 / 内边距，滚动交给宿主 */
+  .reader-note-protyle :global(.protyle) {
+    min-height: 0;
+    height: auto;
+    background: transparent;
+  }
+  .reader-note-protyle :global(.protyle-content) {
+    overflow: visible;
+    scrollbar-gutter: auto;
+  }
+  /* 2026-11-06 修复「批注文字缩在框里」：
+     思源 base.css 给整页文档编辑区叠了三层留白 ——
+       .protyle-wysiwyg { padding: 16px 16px 16px 24px }
+       .protyle-wysiwyg [data-node-id] { padding: 4px; margin: 2px 0; line-height: 1.625 }
+     它们在整页文档里合适，但套进 400px 批注卡片后会与外壳的 6/10px 相加：
+     实测文字距框左 39px、距上 30px，看起来「悬在框中间」而不是从左上开始。
+     思源自己的嵌入编辑器也是同样的清零口径（base.css 中 .mindmap-view__content、
+     .agent-chat__composer-host 两条先例），所以留白统一归外壳：
+     左右贴到 .reader-note-protyle 的 10px 内边；首尾块的纵向边界清零，
+     但保留块间 4px padding + 2px margin 的段间距。 */
+  .reader-note-protyle :global(.protyle-wysiwyg) {
+    padding: 0;
+    font-size: inherit;
+    line-height: inherit;
+  }
+  .reader-note-protyle :global(.protyle-wysiwyg > [data-node-id]) {
+    padding-left: 0;
+    padding-right: 0;
+    /* 基础规则写死的 1.625 会盖掉外壳的 1.65，占位符与正文行高才对不齐 */
+    line-height: inherit;
+  }
+  .reader-note-protyle :global(.protyle-wysiwyg > [data-node-id]:first-child) {
+    margin-top: 0;
+    padding-top: 0;
+  }
+  .reader-note-protyle :global(.protyle-wysiwyg > [data-node-id]:last-child) {
+    margin-bottom: 0;
+    padding-bottom: 0;
   }
 
   /*⚠️ 2026-10-08 删除了原「行 4 · 动作区」的全部样式：
@@ -16566,11 +17001,10 @@ import { getLogger } from "../core/logger.ts";
   }
 
   /* ================================================================
-   * 2026-11-05 P0：AI 阅读助手右停靠
+   * 2026-11-06：AI 助手的手机全屏覆盖层
    * ================================================================
-   * 与左侧「固定目录」同一套几何范式：absolute 停靠 + 正文 margin 让位；
-   * 顶/底浮层条同步收右边界（否则会压在面板上）。
-   * 手机/大手机断点由 .reader-ai-dock--overlay 全屏覆盖，此时不做让位。 */
+   * 桌面已交给思源右侧停靠栏，阅读器内不再停靠/让位；
+   * 这里只覆盖手机与大手机断点。 */
   .reader-ai-dock {
     position: absolute;
     top: 0;
@@ -16589,23 +17023,6 @@ import { getLogger } from "../core/logger.ts";
     width: 100%;
     z-index: 40;
     box-shadow: none;
-  }
-  .reader-view.ai-docked .reader-stage {
-    margin-right: var(--re-ai-w, 420px);
-  }
-  .reader-view.ai-docked .reader-toolbar-floating {
-    right: calc(var(--re-ai-w, 420px) + 8px);
-  }
-  .reader-view.ai-docked .reader-bottom-bar {
-    right: calc(var(--re-ai-w, 420px) + 8px);
-  }
-  /* 圆点跟着正文区中线走，而不是整宽中线 */
-  .reader-view.ai-docked .reader-top-handle {
-    left: calc((100% - var(--re-ai-w, 420px)) / 2);
-  }
-  /* 左目录 + 右助手同时打开：中线 = 两侧让位后的剩余区域中点 */
-  .reader-view.ai-docked.sidebar-docked .reader-top-handle {
-    left: calc(50% + (var(--re-sidebar-w, 280px) - var(--re-ai-w, 420px)) / 2);
   }
   /* 拖宽把手（停靠栏右缘） */
   .reader-side-resizer {
@@ -16761,6 +17178,47 @@ import { getLogger } from "../core/logger.ts";
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* 状态槽与行尾元信息都定宽：当前行从「页码」变成「当前读到」、
+     或已读勾出现/消失时，标题左沿与折行位置都不动（零位移）。
+     16px 槽按最长态（书图标）预留；48px 列容得下 4 位页码与「当前读到」。 */
+  .reader-toc-state {
+    flex: 0 0 16px;
+    width: 16px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--b3-theme-on-surface-light, #888);
+  }
+  .reader-toc-state-ico {
+    width: 12px;
+    height: 12px;
+    display: block;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .reader-toc-state-book {
+    color: var(--b3-theme-primary, #378add);
+  }
+  .reader-toc-state-check {
+    opacity: 0.62;
+  }
+  .reader-toc-meta {
+    flex: 0 0 48px;
+    width: 48px;
+    overflow: hidden;
+    color: var(--b3-theme-on-surface-light, #888);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .reader-toc-meta-current {
+    font-size: 10.5px;
+    font-weight: 600;
+  }
   /* ================= 图片查看器（lightbox），2026-10-15 P0 =================
      层级/遮罩对齐 .reword-pt-overlay 全屏先例（fixed inset 0 + z-index 60）：
      高于本组件一切浮层，仍不越过思源原生 UI（口径见 .reader-popover 注释）。 */
@@ -16893,12 +17351,72 @@ import { getLogger } from "../core/logger.ts";
   .reader-toc-active:hover {
     background: var(--b3-theme-primary-lightest, rgba(53, 117, 240, 0.16));
     color: var(--b3-theme-primary, #378add);
+    /* 微信读书式：左缘 3px 主色条，扫一眼就能定位「当前读到」 */
+    box-shadow: inset 3px 0 0 var(--b3-theme-primary, #378add);
   }
-  .reader-toc-check {
+  .reader-toc-active .reader-toc-label {
+    font-weight: 600;
+  }
+  .reader-toc-active .reader-toc-meta {
     color: var(--b3-theme-primary, #378add);
-    margin-right: 5px;
-    font-size: 11px;
-    flex-shrink: 0;
+  }
+  /* 从「回到当前」滚回来时闪一下：从更实的蓝落到当前行底色 */
+  .reader-toc-flash {
+    animation: reader-toc-flash 0.72s ease-out;
+  }
+  @keyframes reader-toc-flash {
+    0% { background: color-mix(in srgb, var(--b3-theme-primary, #3575f0) 22%, transparent); }
+    100% { background: var(--b3-theme-primary-lightest, rgba(53, 117, 240, 0.16)); }
+  }
+  /* 「回到当前」：0 高 sticky 壳不占任何行高，胶囊自身向上错位浮在底部。
+     显隐只切 opacity/pointer-events，不触发重排（长目录滚动时刻不跳）。 */
+  .reader-toc-back-wrap {
+    position: sticky;
+    bottom: 0;
+    z-index: 3;
+    height: 0;
+    flex: 0 0 auto;
+    display: flex;
+    align-items: flex-start;
+    justify-content: flex-end;
+    pointer-events: none;
+  }
+  .reader-toc-back {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-right: 2px;
+    padding: 6px 10px;
+    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.15));
+    border-radius: 999px;
+    background: var(--b3-theme-background, #fff);
+    color: var(--b3-theme-primary, #378add);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(calc(-100% - 8px));
+    transition: opacity 0.16s ease, transform 0.16s ease;
+    box-shadow: 0 4px 14px rgba(20, 24, 31, 0.14);
+  }
+  .reader-toc-back-wrap.on .reader-toc-back {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .reader-toc-back-ico {
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  @media (pointer: coarse) {
+    .reader-toc-back {
+      padding: 9px 12px;
+    }
   }
   .reader-toc-count {
     font-size: 11px;
@@ -16970,7 +17488,12 @@ import { getLogger } from "../core/logger.ts";
     cursor: pointer;
     text-align: left;
     padding: 6px 4px;
+    font: inherit; /* .reader-annot-main 已从 <button> 改为 role=button 的 div */
     color: var(--b3-theme-on-background, #333);
+  }
+  .reader-annot-main:focus-visible {
+    outline: 2px solid var(--b3-theme-primary, #378add);
+    outline-offset: -2px;
   }
   .reader-bm-label {
     font-size: 13px;
@@ -17011,14 +17534,29 @@ import { getLogger } from "../core/logger.ts";
     -webkit-box-orient: vertical;
     overflow: hidden;
   }
+  /* 批注正文：现在渲染的是 Lute 富文本（可能含 <p>/<ul>/<mark>），
+     所以用 max-height 截断而不是 -webkit-line-clamp（后者对块级子元素无效）。 */
   .reader-annot-note {
+    display: block;
     font-size: 11px;
+    line-height: 1.5;
     color: var(--b3-theme-on-surface-light, #888);
-    display: -webkit-box;
-    -webkit-line-clamp: 2;
-    -webkit-box-orient: vertical;
+    max-height: 3em;
     overflow: hidden;
+    pointer-events: none; /* 整块可点 = 跳转，内部富文本不抢点击 */
+    word-break: break-word;
   }
+  /* b3-typography 给块级元素带了大段外边距，会把 3 行截断挤成半行空白 */
+  .reader-annot-note :global(*) { margin-block: 0; }
+  .reader-annot-note :global(ul),
+  .reader-annot-note :global(ol) { padding-inline-start: 1.4em; }
+  .reader-annot-note :global(blockquote) {
+    margin: 0;
+    padding-inline-start: 8px;
+    border-inline-start: 2px solid var(--b3-border-color, rgba(0, 0, 0, 0.15));
+  }
+  .reader-annot-note :global(pre) { margin: 0; overflow: hidden; }
+  .reader-annot-note :global(img) { max-width: 100%; height: auto; }
 
   .reader-search {
     /* 2026-10-23 修复：搜索面板原本硬编码在左下角（bottom/left），

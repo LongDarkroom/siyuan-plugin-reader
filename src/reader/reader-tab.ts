@@ -161,10 +161,10 @@ export class ReaderTabController {
         self.plugin?.checkTranslationCacheHits?.(bookId, texts) ?? Promise.resolve(new Array(texts.length).fill(false)),
       isTranslationConfigured: () => !!self.plugin?.isTranslationConfigured?.(),
       getAiSettings: () => (self.plugin as any)?.getAiSettings?.() ?? null,
-      // 2026-11-05：右侧助手 → 思源页签（手机端无页签，ReaderView 也会按 aiOverlay 隐藏入口）
-      onOpenAiTab: (bid: string) => (self.plugin as any)?.openAiTab?.(bid),
-      // 2026-11-06：划词「问 AI」优先投到已打开的 AI 页签，投不到由 ReaderView 回落停靠栏
-      onAskAiInTab: (bid: string, quote: any) => (self.plugin as any)?.askAiInTab?.(bid, quote) ?? false,
+      // 2026-11-06：桌面 AI 入口 → 思源右侧停靠栏（手机端 ReaderView 走全屏浮层）
+      onOpenAiDock: (bid: string) => (self.plugin as any)?.openAiDock?.(bid),
+      // 2026-11-06：划词「问 AI」优先投到已打开的 AI 页签，否则打开右栏并带入选段
+      onAskAiInDock: (bid: string, quote: any) => (self.plugin as any)?.askAiInDock?.(bid, quote) ?? false,
       onSaveTencentLock: (chars: number) => (self.plugin as any)?.saveTencentCharsLock?.(chars) ?? Promise.resolve(),
       onSaveAiSettings: (partial: any) => (self.plugin as any)?.updateAiSettings?.(partial) ?? Promise.resolve(),
       onAddToVocab: (w: string) => self.plugin?.getVocabStore?.()?.addWord?.(w),
