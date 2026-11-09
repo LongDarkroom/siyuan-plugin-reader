@@ -46,6 +46,8 @@ INCLUDE_FILES = [
     # 在非弱设备（桌面）上解析 PDF 元数据/封面时 worker 加载失败。
     "pdf.worker.mjs",
     "LICENSE",       # 许可证：集市校验要求仓库根目录与发布包均含许可证文件
+    # AGPL-3.0-or-later：分发时必须随包附第三方许可声明（js-mdict 为 AGPL，PDF.js 为 Apache-2.0 等）
+    "THIRD-PARTY-NOTICES.md",
     # "appreciate.jpg",  # 可选：赞赏码图片，自行放入仓库根目录后再取消注释以随包分发
 ]
 # 直接平铺到 zip 根的【白名单目录】

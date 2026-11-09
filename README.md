@@ -106,6 +106,12 @@ src/
 └── index.less            全局样式
 ```
 
-## 许可
+## 开源许可
 
-MIT
+本插件源码以 **GNU Affero General Public License v3.0 或任何更新版本**发布（SPDX：`AGPL-3.0-or-later`），许可证全文见仓库 `LICENSE`。
+
+    Copyright (C) 2026 LongDarkroom
+
+通俗地说：可以自由使用、修改、再分发（包括商用），但分发修改版或通过网络向用户提供修改版时，必须以同样的许可证开源并给出对应源码，不能做成闭源分支。已经发布过的历史 MIT 版本仍按 MIT 授权，本次改证只适用于今后的版本。
+
+改证也有合规原因：查词引擎 `js-mdict` 本身是 AGPL-3.0，且已构建进 `index.js` 随包分发，整包因此必须按 AGPL 授权。随包分发的其他第三方组件（foliate-js、PDF.js、zip.js、fflate、Svelte 等）仍按各自许可证授权，声明与全文见 `THIRD-PARTY-NOTICES.md`（随发布包分发）。
