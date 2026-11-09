@@ -173,6 +173,8 @@ export class AiTabController {
           saveAiSettings: (patch: any) => this.plugin.updateAiSettings?.(patch) ?? Promise.resolve(),
           openShelf: () => this.plugin.openShelfTab?.(),
           onPinState: (state: PinState) => head.sync(state),
+          // 2026-11-08 P0：会话真源 → petal（localStorage 只作热缓存）
+          sessionIO: this.plugin.getAiSessionIO?.() ?? undefined,
         },
       });
       this.rec = {
@@ -225,6 +227,8 @@ export class AiTabController {
       getActiveReader: () => tabs()?.getActiveReader?.() ?? null,
       getReaderComp: (bookId: string) => tabs()?.getReaderComp?.(bookId) ?? null,
       listOpenBooks: () => tabs()?.listOpenBooks?.() ?? [],
+      // dock 空态「最近聊过的书」需要可读书名；会话索引只存 bookId
+      getBookMeta: (bookId: string) => tabs()?.getBookMeta?.(bookId) ?? null,
       openBookTab: (bookId: string, title?: string) => tabs()?.openBookTab?.(bookId, title),
     };
   }

@@ -626,6 +626,10 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
 
   let acc = "";
   let reason = "";
+  /** 是否收到过合法 SSE data 帧：200 但返回普通 JSON 时用它触发非流式回退 */
+  let sawSse = false;
+  /** 原始响应体（仅在没有 SSE 帧时用于解析非流式 JSON） */
+  let rawBody = "";
   let model: string | undefined;
   let usage: AiUsage | undefined;
   let truncated = false;
@@ -666,6 +670,7 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
   const processLine = (line: string) => {
     const t = line.trim();
     if (!t.startsWith("data:")) return;
+    sawSse = true;
     const payload = t.slice(5).trim();
     if (!payload || payload === "[DONE]") return;
     try {
@@ -724,7 +729,9 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      const chunk = decoder.decode(value, { stream: true });
+      buf += chunk;
+      rawBody += chunk;
       const parts = buf.split("\n");
       buf = parts.pop() ?? "";
       for (const raw of parts) processLine(raw);
@@ -733,6 +740,28 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
     if (buf) processLine(buf);
 
     if (opts.signal?.aborted) return doneResult(true);
+
+    // 服务端忽略 stream:true 而返回 HTTP 200 + 普通 JSON（或纯文本错误页）时，
+    // 上面所有行都不带 data: 前缀会被静默丢弃，最终变成「空气泡、无错误、无法重试」。
+    // 这里就地解析一次完整 JSON；解析不出正文则明确报错，让错误卡与重试入口出现。
+    if (!sawSse && !acc && !toolAcc.size) {
+      const extracted = extractContentFromBody(rawBody);
+      const text = String(extracted.content || "").trim();
+      if (text && text !== rawBody.trim()) {
+        acc = text;
+        if (extracted.reasoning) reason = extracted.reasoning;
+        opts.onToken?.(text);
+        if (extracted.reasoning) opts.onReasoning?.(extracted.reasoning);
+        const u = extractUsageFromBody(rawBody);
+        if (u) usage = u;
+        return doneResult();
+      }
+      return {
+        ok: false,
+        content: "",
+        error: T("接口未返回 SSE 数据流（HTTP 200），请检查地址是否支持流式或改用代理模式"),
+      };
+    }
     return doneResult();
   } catch (e: any) {
     // 用户主动中断：保留已生成的部分内容
@@ -768,34 +797,54 @@ async function runBufferMode(opts: AiStreamOptions): Promise<AiStreamResult> {
   const settings = opts.settings;
   const url = buildChatUrl(settings.baseUrl);
   if (!url) return { ok: false, content: "", error: T("AI baseUrl 为空或无法解析为 chat 端点") };
-  try {
-    const gen = await requestAIGenerate(
-      {
-        messages: opts.messages,
-        settings,
-        jsonMode: opts.jsonMode ?? settings.jsonMode,
-        timeout: opts.timeout,
-        tools: opts.tools,
-        toolChoice: opts.toolChoice,
-      },
-      forwardProxyFetch
-    );
-    if (opts.onToken) {
-      await playBufferTypewriter(gen.content, opts.onToken, opts.signal);
+
+  const signal = opts.signal;
+  // 内核代理是一次性缓冲请求，拿不到可中断的 ReadableStream；用户点「停止」时
+  // 用 AbortSignal 抢先返回，保证 UI 立刻解锁、已播出的片段照常保留，
+  // 而不是等 HTTP 跑完再把全文回填成一个「已停止」的回答。
+  const aborted: AiStreamResult = { ok: true, content: "", aborted: true, buffered: true };
+  if (signal?.aborted) return aborted;
+
+  const work = (async (): Promise<AiStreamResult> => {
+    try {
+      const gen = await requestAIGenerate(
+        {
+          messages: opts.messages,
+          settings,
+          jsonMode: opts.jsonMode ?? settings.jsonMode,
+          timeout: opts.timeout,
+          signal,
+          tools: opts.tools,
+          toolChoice: opts.toolChoice,
+        },
+        forwardProxyFetch
+      );
+      if (opts.onToken) await playBufferTypewriter(gen.content, opts.onToken, signal);
+      if (signal?.aborted) return aborted;
+      return {
+        ok: true,
+        content: gen.content,
+        model: gen.model,
+        reasoning: gen.reasoning,
+        truncated: false,
+        usage: gen.usage,
+        buffered: true,
+        ...(gen.toolCalls?.length ? { toolCalls: gen.toolCalls } : {}),
+      };
+    } catch (e2: any) {
+      return { ok: false, content: "", error: e2?.message || String(e2) };
     }
-    return {
-      ok: true,
-      content: gen.content,
-      model: gen.model,
-      reasoning: gen.reasoning,
-      truncated: false,
-      usage: gen.usage,
-      buffered: true,
-      ...(gen.toolCalls?.length ? { toolCalls: gen.toolCalls } : {}),
-    };
-  } catch (e2: any) {
-    return { ok: false, content: "", error: e2?.message || String(e2) };
-  }
+  })();
+
+  if (!signal) return work;
+  return new Promise<AiStreamResult>((resolve) => {
+    const onAbort = () => resolve(aborted);
+    signal.addEventListener("abort", onAbort, { once: true });
+    void work.then((r) => {
+      signal.removeEventListener("abort", onAbort);
+      resolve(r);
+    });
+  });
 }
 
 /** 把正文切成「句/行」粒度的块（保留标点与换行），超长块再按 ~80 字符细分；整体不超过 ~150 块以限制总时长 */
@@ -833,6 +882,8 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
 
 /** 缓冲模式打字机：逐块回调 onToken，块间小延迟模拟渐进输出；受 signal 中断控制 */
 async function playBufferTypewriter(text: string, onToken: (c: string) => void, signal?: AbortSignal): Promise<void> {
+  // 单块文本原本走短路直接 onToken(text)，停止后后台请求返回时会把全文又吐回来
+  if (signal?.aborted) return;
   const chunks = splitTypewriterChunks(text);
   if (chunks.length <= 1) {
     onToken(text);

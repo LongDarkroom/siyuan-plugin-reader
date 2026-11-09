@@ -5,6 +5,8 @@
  *  ① 识别回答里的 ```mindmap 围栏，把正文切成「Markdown / 导图」片段；
  *  ② 把 Markdown 大纲（标题 + 嵌套列表）解析成节点树；
  *  ③ 把节点树排成 SVG 坐标（含折叠与标签换行），组件只负责画。
+ * 另有两块给组件用的数学：视口（缩放/平移/适应，公式对齐思源内核导图）
+ * 与「复制成思源思维导图块」的 kramdown 序列化。
  *
  * 导图语法刻意选 Markdown 本身：模型不必学新 DSL，列表缩进就是层级；
  * 节点里出现思源块引用 `((id "文本"))` / `[文本](siyuan://blocks/id)` 时，
@@ -139,6 +141,8 @@ function collectRows(src: string, opts: MindmapParseOptions): RawRow[] {
   > = [];
   for (const raw of lines) {
     if (!raw.trim()) continue;
+    // 块尾 IAL（{: …}）不是节点：复制成导图再粘回来时不能多出一个幽灵节点
+    if (/^\s*\{:.*\}\s*$/.test(raw)) continue;
     const line = raw.replace(/^\s*(?:>\s*)+/, "");
     const h = headingOf(line);
     if (h) {
@@ -294,6 +298,35 @@ export function splitMindmapSegments(md: string, opts: MindmapParseOptions = {})
   return merged;
 }
 
+/* ============================ 文字度量 ============================ */
+
+export type MindmapMeasurer = (text: string) => number;
+
+const LABEL_FONT = 12;
+/**
+ * 宽字符（占满一个字框）：中日韩、全角标点，外加箭头/带圈数字/几何符号——
+ * 这些在导图标签里很常见（「船上闲聊 → 决定远航」），按半宽算会让盒宽偏小。
+ */
+const WIDE_RE = /[\u1100-\u115f\u2e80-\u9fff\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef\u2190-\u21ff\u2460-\u24ff\u25a0-\u25ff\u2b00-\u2bff\u3000-\u303f]/;
+
+const num = (value: unknown, fallback = 0): number => {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+};
+
+/**
+ * 无 DOM（单测/SSR）时的估算：宽字符按 1em，其余 0.55em。
+ * 浏览器里组件会传 canvas.measureText 的真实度量进来——盒宽由文字实测决定，
+ * 估算只会让盒子略宽或略窄，不再出现「文字出框」。
+ */
+export const heuristicMindmapWidth: MindmapMeasurer = (text) => {
+  let total = 0;
+  for (const ch of Array.from(String(text || ""))) {
+    total += WIDE_RE.test(ch) ? LABEL_FONT : LABEL_FONT * 0.55;
+  }
+  return total;
+};
+
 /* ============================ 布局 ============================ */
 
 export interface MindmapLayoutNode {
@@ -327,35 +360,53 @@ export interface MindmapLayout {
 export interface MindmapLayoutOptions {
   /** 已折叠的节点 id */
   collapsed?: string[];
-  nodeWidth?: number;
   gapX?: number;
   gapY?: number;
   padding?: number;
   /** 每个节点最多显示几行文字（1–2） */
   maxLines?: number;
+  /** 文字宽度实测；缺省用 heuristicMindmapWidth */
+  measure?: MindmapMeasurer;
+  /** 换行预算：单行最大宽度（默认 190px ≈ 15 个汉字） */
+  labelMaxWidth?: number;
+  /** 盒宽上下限（默认 96–260） */
+  minNodeWidth?: number;
+  maxNodeWidth?: number;
+  /** 盒内左右内边距合计（默认 20） */
+  labelPadX?: number;
+  /** 折叠徽标「−/＋」预留宽度（默认 26） */
+  badgeWidth?: number;
 }
 
-const NODE_W = 156;
-const GAP_X = 44;
+const GAP_X = 40;
 const GAP_Y = 10;
-const PADDING = 12;
+const PADDING = 14;
+const LABEL_MAX_WIDTH = 190;
+const MIN_NODE_W = 96;
+const MAX_NODE_W = 260;
+const LABEL_PAD_X = 20;
+const BADGE_W = 26;
 
 /**
- * 标签换行：CJK 记 1 个单位，西文/数字约 0.55。
- * 超过两行就截断加省略号（导图节点不是正文，完整文字放在 title）。
+ * 标签换行：逐字累加实测宽度，超过 `maxWidth` 换行；超过 `maxLines` 截断加省略号。
+ * 省略号记在行内，盒宽按产出的行实测 → 盒永远比文字宽，不会出框。
  */
-export function wrapMindmapLabel(text: string, maxUnits = 15, maxLines = 2): string[] {
+export function wrapMindmapLabel(
+  text: string,
+  maxWidth = LABEL_MAX_WIDTH,
+  maxLines = 2,
+  measure: MindmapMeasurer = heuristicMindmapWidth,
+): string[] {
   const chars = Array.from(String(text || "").trim());
-  const limit = Math.max(4, Math.round(maxUnits));
-  const lines = Math.max(1, Math.min(2, Math.round(maxLines)));
+  const limit = Math.max(24, Math.round(Number(maxWidth) || LABEL_MAX_WIDTH));
+  const lines = Math.max(1, Math.min(2, Math.round(Number(maxLines) || 2)));
   if (!chars.length) return [""];
-  const width = (ch: string) => (/[\u2e80-\u9fff\uf900-\ufaff\uff00-\uffef]/.test(ch) ? 1 : 0.55);
   const out: string[] = [];
   let line = "";
   let used = 0;
   let truncated = false;
   for (let i = 0; i < chars.length; i++) {
-    const w = width(chars[i]);
+    const w = measure(chars[i]);
     if (used + w > limit && line) {
       out.push(line);
       line = "";
@@ -376,85 +427,299 @@ export function wrapMindmapLabel(text: string, maxUnits = 15, maxLines = 2): str
   return out.slice(0, lines);
 }
 
-/** 节点树 → SVG 坐标（左→右生长；父节点垂直居中于首末子节点之间） */
+interface LayoutMeta {
+  node: MindmapNode;
+  id: string;
+  depth: number;
+  parentId?: string;
+  lines: string[];
+  w: number;
+  h: number;
+  x: number;
+  y: number;
+  kids: LayoutMeta[];
+}
+
+/**
+ * 节点树 → SVG 坐标（左→右生长）。两遍走：
+ *  ① 自顶向下按内容实测算出每个盒子的宽高（列宽不再是定值，文字必在框内）；
+ *  ② 列宽取该层最宽的盒子，x 按列推进；纵向叶子按游标排、父节点居中于首末子节点。
+ */
 export function layoutMindmap(root: MindmapNode, opts: MindmapLayoutOptions = {}): MindmapLayout {
   const collapsed = new Set((opts.collapsed || []).map(String));
-  const nodeW = Math.max(96, Math.round(Number(opts.nodeWidth) || NODE_W));
-  const gapX = Math.max(16, Math.round(Number(opts.gapX) || GAP_X));
-  const gapY = Math.max(4, Math.round(Number(opts.gapY) || GAP_Y));
-  const padding = Math.max(0, Math.round(Number(opts.padding) || PADDING));
-  const maxLines = Math.max(1, Math.min(2, Math.round(Number(opts.maxLines) || 2)));
+  const gapX = Math.max(16, Math.round(num(opts.gapX, GAP_X)));
+  const gapY = Math.max(4, Math.round(num(opts.gapY, GAP_Y)));
+  const padding = Math.max(0, Math.round(num(opts.padding, PADDING)));
+  const maxLines = Math.max(1, Math.min(2, Math.round(num(opts.maxLines, 2))));
+  const measure = typeof opts.measure === "function" ? opts.measure : heuristicMindmapWidth;
+  const labelMaxWidth = Math.max(24, Math.round(num(opts.labelMaxWidth, LABEL_MAX_WIDTH)));
+  const minW = Math.max(48, Math.round(num(opts.minNodeWidth, MIN_NODE_W)));
+  const maxW = Math.max(minW, Math.round(num(opts.maxNodeWidth, MAX_NODE_W)));
+  const padX = Math.max(4, Math.round(num(opts.labelPadX, LABEL_PAD_X)));
+  const badge = Math.max(0, Math.round(num(opts.badgeWidth, BADGE_W)));
 
-  const nodes: MindmapLayoutNode[] = [];
-  const edges: MindmapEdge[] = [];
-  let cursor = padding;
-  let maxRight = padding;
-
-  const walk = (
+  const metas: LayoutMeta[] = [];
+  const build = (
     node: MindmapNode,
     depth: number,
     parentId: string | undefined,
     id: string,
-  ): MindmapLayoutNode => {
-    const lines = wrapMindmapLabel(node.text, 15, maxLines);
-    const h = lines.length > 1 ? 48 : 36;
-    const isCollapsed = collapsed.has(id) && node.children.length > 0;
-    const childNodes: MindmapLayoutNode[] = [];
-    if (!isCollapsed) {
-      node.children.forEach((child, i) => {
-        childNodes.push(walk(child, depth + 1, id, `${id}.${i}`));
-      });
-    }
-
-    let centerY: number;
-    if (!childNodes.length) {
-      centerY = cursor + h / 2;
-      cursor += h + gapY;
-    } else {
-      const first = childNodes[0];
-      const last = childNodes[childNodes.length - 1];
-      centerY = (first.y + first.h / 2 + last.y + last.h / 2) / 2;
-    }
-
-    const x = padding + depth * (nodeW + gapX);
-    const y = centerY - h / 2;
-    const out: MindmapLayoutNode = {
+  ): LayoutMeta => {
+    const lines = wrapMindmapLabel(node.text, labelMaxWidth, maxLines, measure);
+    const widest = lines.reduce((mx, ln) => Math.max(mx, measure(ln)), 0);
+    const reserve = padX + (node.children.length ? badge : 0);
+    const w = Math.min(maxW, Math.max(minW, Math.ceil(widest) + reserve));
+    const self: LayoutMeta = {
+      node,
       id,
-      text: node.text,
-      lines,
-      x,
-      y,
-      w: nodeW,
-      h,
       depth,
       parentId,
-      hasChildren: node.children.length > 0,
-      collapsed: isCollapsed && node.children.length > 0,
-      ref: node.ref,
+      lines,
+      w,
+      h: lines.length > 1 ? 48 : 36,
+      x: 0,
+      y: 0,
+      kids: [],
     };
-    nodes.push(out);
-    maxRight = Math.max(maxRight, x + nodeW);
-
-    // 只连可见子节点；曲线从父右缘到子左缘
-    for (const child of childNodes) {
-      const x1 = x + nodeW;
-      const y1 = y + h / 2;
-      const x2 = child.x;
-      const y2 = child.y + child.h / 2;
-      const mx = (x1 + x2) / 2;
-      edges.push({
-        from: id,
-        to: child.id,
-        d: `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`,
-      });
+    metas.push(self);
+    if (!collapsed.has(id)) {
+      node.children.forEach((child, i) => self.kids.push(build(child, depth + 1, id, `${id}.${i}`)));
     }
-    return out;
+    return self;
   };
+  build(root, 0, undefined, "0");
 
-  walk(root, 0, undefined, "0");
+  const colW: number[] = [];
+  for (const m of metas) colW[m.depth] = Math.max(colW[m.depth] || 0, m.w);
+  const colX: number[] = [];
+  let acc = padding;
+  for (let d = 0; d < colW.length; d++) {
+    colX[d] = acc;
+    acc += colW[d] + gapX;
+  }
 
+  const nodes: MindmapLayoutNode[] = [];
+  const edges: MindmapEdge[] = [];
+  let cursor = padding;
+
+  const place = (m: LayoutMeta): void => {
+    for (const k of m.kids) place(k);
+    if (!m.kids.length) {
+      m.y = cursor;
+      cursor += m.h + gapY;
+    } else {
+      const first = m.kids[0];
+      const last = m.kids[m.kids.length - 1];
+      m.y = (first.y + first.h / 2 + last.y + last.h / 2) / 2 - m.h / 2;
+    }
+    m.x = colX[m.depth] ?? padding;
+    const isCollapsed = collapsed.has(m.id) && m.node.children.length > 0;
+    nodes.push({
+      id: m.id,
+      text: m.node.text,
+      lines: m.lines,
+      x: m.x,
+      y: m.y,
+      w: m.w,
+      h: m.h,
+      depth: m.depth,
+      parentId: m.parentId,
+      hasChildren: m.node.children.length > 0,
+      collapsed: isCollapsed,
+      ref: m.node.ref,
+    });
+    // 只连可见子节点；曲线从父右缘到子左缘
+    for (const k of m.kids) {
+      const x1 = m.x + m.w;
+      const y1 = m.y + m.h / 2;
+      const x2 = k.x;
+      const y2 = k.y + k.h / 2;
+      const mx = (x1 + x2) / 2;
+      edges.push({ from: m.id, to: k.id, d: `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}` });
+    }
+  };
+  place(metas[0]);
+
+  let maxRight = padding;
+  for (const m of metas) maxRight = Math.max(maxRight, m.x + m.w);
+  nodes.sort((a, b) => a.depth - b.depth || a.y - b.y);
   const width = maxRight + padding;
   const height = Math.max(cursor - gapY + padding, padding * 2 + 36);
-  nodes.sort((a, b) => a.depth - b.depth || a.y - b.y);
   return { nodes, edges, width, height };
+}
+
+/** 当前可见节点数（折叠的子树不计）——标题栏的「N 个节点」用，不必为了计数排一遍版 */
+export function countVisibleMindmapNodes(root: MindmapNode, collapsed: string[] = []): number {
+  const set = new Set((collapsed || []).map(String));
+  let n = 0;
+  const walk = (node: MindmapNode, id: string) => {
+    n++;
+    if (set.has(id)) return;
+    node.children.forEach((c, i) => walk(c, `${id}.${i}`));
+  };
+  walk(root, "0");
+  return n;
+}
+
+/** 折叠到第 depth 级（1 起）：返回该深度以下、且有子节点的节点 id；depth<=0 表示全展开 */
+export function foldMindmapByDepth(root: MindmapNode, depth: number): string[] {
+  const level = Math.round(Number(depth));
+  if (!Number.isFinite(level) || level <= 0) return [];
+  const ids: string[] = [];
+  const walk = (node: MindmapNode, d: number, id: string) => {
+    if (d >= level && node.children.length) ids.push(id);
+    node.children.forEach((c, i) => walk(c, d + 1, `${id}.${i}`));
+  };
+  walk(root, 0, "0");
+  return ids;
+}
+
+/* ============================ 视口 ============================ */
+
+export interface MindmapViewport {
+  /** 缩放比例 */
+  s: number;
+  /** 平移量（屏幕像素，已含缩放） */
+  ox: number;
+  oy: number;
+}
+
+/** 视野盒：容器尺寸 + 未缩放的整图尺寸 */
+export interface MindmapViewBox {
+  viewW: number;
+  viewH: number;
+  contentW: number;
+  contentH: number;
+}
+
+export const MINDMAP_MIN_SCALE = 0.15;
+export const MINDMAP_MAX_SCALE = 2.5;
+/** 滚轮缩放速率：与思源内核 mindmap 的 `scale * Math.exp(-delta * 0.01)` 一致 */
+export const MINDMAP_WHEEL_RATE = 0.01;
+/** 平移边界：内容至少留这么多像素在视野里，防止一甩就甩丢 */
+export const MINDMAP_PAN_KEEP = 60;
+
+export function clampMindmapScale(value: number): number {
+  const s = num(value, 1);
+  return Math.min(MINDMAP_MAX_SCALE, Math.max(MINDMAP_MIN_SCALE, s));
+}
+
+/** 滚轮增量 → 新缩放（先夹紧 deltaY，触控板惯性大值不至于一次翻档） */
+export function mindmapWheelScale(scale: number, deltaY: number): number {
+  const d = Math.max(-100, Math.min(100, num(deltaY)));
+  return clampMindmapScale(clampMindmapScale(scale) * Math.exp(-d * MINDMAP_WHEEL_RATE));
+}
+
+/** 跟着指针缩放，保持 (px,py) 处的内容点不动；同思源内核 zoomAt 的公式 */
+export function zoomMindmapAt(vp: MindmapViewport, nextScale: number, px: number, py: number): MindmapViewport {
+  const s = clampMindmapScale(vp.s);
+  const ns = clampMindmapScale(nextScale);
+  if (ns === s) return { s, ox: num(vp.ox), oy: num(vp.oy) };
+  const k = ns / s;
+  return { s: ns, ox: num(px) - (num(px) - num(vp.ox)) * k, oy: num(py) - (num(py) - num(vp.oy)) * k };
+}
+
+/** 夹紧平移：内容比视野大时两端各留 keep 可见；比视野小时贴左上，不许拖进空白里漂 */
+export function boundedMindmapPan(vp: MindmapViewport, box: MindmapViewBox, keep = MINDMAP_PAN_KEEP): MindmapViewport {
+  const s = clampMindmapScale(vp.s);
+  const bound = (offset: number, view: number, content: number) => {
+    const v = Math.max(1, num(view, 1));
+    const c = Math.max(0, num(content)) * s;
+    if (c <= v) return 0;
+    return Math.min(v - Math.min(keep, v), Math.max(Math.min(keep, c) - c, offset));
+  };
+  return {
+    s,
+    ox: bound(num(vp.ox), box.viewW, box.contentW),
+    oy: bound(num(vp.oy), box.viewH, box.contentH),
+  };
+}
+
+/** 适应画布：缩到能看全整图；上限 1:1（小图不硬放大，免得发糊） */
+export function fitMindmapViewport(box: MindmapViewBox, pad = 8): MindmapViewport {
+  const vw = Math.max(1, Math.max(1, num(box.viewW, 1)) - pad * 2);
+  const vh = Math.max(1, Math.max(1, num(box.viewH, 1)) - pad * 2);
+  const cw = Math.max(1, num(box.contentW, 1));
+  const ch = Math.max(1, num(box.contentH, 1));
+  const s = clampMindmapScale(Math.min(1, Math.min(vw / cw, vh / ch)));
+  return { s, ox: pad + Math.max(0, (vw - cw * s) / 2), oy: pad + Math.max(0, (vh - ch * s) / 2) };
+}
+
+/** 适应宽度：只保证横向看全，纵向居中或顶格（宽图看骨架） */
+export function fitMindmapWidth(box: MindmapViewBox, pad = 8): MindmapViewport {
+  const vw = Math.max(1, Math.max(1, num(box.viewW, 1)) - pad * 2);
+  const vh = Math.max(1, num(box.viewH, 1));
+  const ch = Math.max(1, num(box.contentH, 1));
+  const s = clampMindmapScale(Math.min(1, vw / Math.max(1, num(box.contentW, 1))));
+  return { s, ox: pad, oy: ch * s <= vh ? pad + (vh - ch * s) / 2 : pad };
+}
+
+/** 默认视口：1:1（字能读），左上起排、图比视野矮时垂直居中——靠拖动看全图 */
+export function resetMindmapViewport(box: MindmapViewBox, pad = 8): MindmapViewport {
+  const vh = Math.max(1, num(box.viewH, 1));
+  const ch = Math.max(1, num(box.contentH, 1));
+  return { s: 1, ox: pad, oy: ch <= vh ? pad + (vh - ch) / 2 : pad };
+}
+
+/** 把某个节点挪到视野中心（键盘导航/搜索定位用） */
+export function centerMindmapOn(
+  vp: MindmapViewport,
+  viewW: number,
+  viewH: number,
+  cx: number,
+  cy: number,
+): MindmapViewport {
+  const s = clampMindmapScale(vp.s);
+  return {
+    s,
+    ox: (Number(viewW) || 0) / 2 - cx * s,
+    oy: (Number(viewH) || 0) / 2 - cy * s,
+  };
+}
+
+/* ============================ 复制成思源思维导图块 ============================ */
+
+/**
+ * 思源「思维导图块」的可达形态：**普通列表 + IAL `custom-sy-list-mindmap="1"`**。
+ * （旧 `type=mindmap` 那种块的 IAL 只有宽高，Markdown 里表达不出来，别往那条路上走。）
+ * 尾行 `{: …}` 是块的 IAL，Lute 需要 `SetKramdownIAL(true)` 才认——思源正文粘贴走的
+ * protyle lute 恰好开着这个开关，2026-11-08 真机验证：粘进文档直接成导图。
+ */
+export const MINDMAP_LIST_IAL = "custom-sy-list-mindmap";
+
+/** 块引用文字进了 `((id "文字"))` 就要避开会截断解析的引号与括号 */
+function refDisplayText(text: string): string {
+  return String(text || "")
+    .replace(/["“”]/g, "'")
+    .replace(/[()[\]]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** 行首的列表符号/序号会被 Lute 当成子列表（凭空多一层），用反斜杠转义掉 */
+function escapeItemStart(text: string): string {
+  return text
+    .replace(/^([-*+])(?=\s)/, "\\$1")
+    .replace(/^(\d+)([.)])(?=\s)/, "$1\\$2");
+}
+
+function kramdownLine(node: MindmapNode): string {
+  const text = String(node.text || "").replace(/\s+/g, " ").trim();
+  if (node.ref) {
+    const display = refDisplayText(text);
+    return display ? `((${node.ref} "${display}"))` : `((${node.ref}))`;
+  }
+  return escapeItemStart(text);
+}
+
+/** 节点树 → 可粘贴的 kramdown（嵌套列表 + 导图 IAL） */
+export function mindmapToKramdown(root: MindmapNode, indentStep = 2): string {
+  const step = " ".repeat(Math.max(2, Math.min(4, Math.round(Number(indentStep) || 2))));
+  const lines: string[] = [];
+  const walk = (node: MindmapNode, depth: number) => {
+    lines.push(`${step.repeat(depth)}- ${kramdownLine(node)}`);
+    for (const child of node.children) walk(child, depth + 1);
+  };
+  walk(root, 0);
+  return `${lines.join("\n")}\n{: ${MINDMAP_LIST_IAL}="1"}`;
 }

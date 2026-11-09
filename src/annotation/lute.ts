@@ -37,7 +37,7 @@ export function getLute(): any {
 }
 
 /**
- * 为 Lute 实例开启完整 Kramdown/GFM 能力（表格、删除线、IAL、块引用、高亮、标签、上下标、SuperBlock、Callout）。
+ * 为 Lute 实例开启完整 Kramdown/GFM 能力（表格、删除线、IAL、块引用、高亮、标签、上下标、SuperBlock、Callout、行内公式）。
  * 思源自带 Lute（尤其 window.siyuan.lute）默认未必启用 GFM Table，直接调用 Md2HTML/Md2BlockDOM
  * 会导致管道表格被当成普通段落，在批注面板/弹窗 fallback 里显示成原始 `|...|`。
  * 调用方在渲染前调用一次即可；多次调用幂等且带容错（缺失 setter 不抛错）。
@@ -61,6 +61,9 @@ export function configureKramdownLute(lute: any): void {
   opt("SetSub", true);                // ~下标~
   opt("SetSuperBlock", true);         // {{ }}
   opt("SetCallout", true);            // 引述块
+  // 行内公式 $…$（块级 $$…$$ 默认就开）。刻意不开 allow-digit：
+  // 否则「$5 到 $6」这类货币文本会被误判成公式。
+  opt("SetInlineMath", true);
 }
 
 function escapeHtml(s: string): string {

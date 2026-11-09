@@ -272,7 +272,7 @@ export function buildSettingsPatch(draft: AiSettingsDraft): Record<string, any> 
     platforms,
     activePlatformId: activeId,
     sendShortcut: s.sendShortcut === "mod+enter" ? "mod+enter" : "enter",
-    fontSize: Math.min(24, Math.max(10, Math.round(Number(s.fontSize) || 12))),
+    fontSize: Math.min(24, Math.max(10, Math.round(Number(s.fontSize) || 14))),
     inputFontSize: Math.min(24, Math.max(10, Math.round(Number(s.inputFontSize) || 13))),
     streamThrottleMs: Math.min(500, Math.max(0, Math.round(Number(s.streamThrottleMs) || 0))),
     sessionRetentionDays: Math.min(365, Math.max(0, Math.round(Number(s.sessionRetentionDays) || 0))),
@@ -288,14 +288,14 @@ export function savePrefsPatch(prefs: AiPanelPrefs): AiPanelPrefs {
   return normalizeAiPanelPrefs(prefs);
 }
 
-/** 字号生效值：设置缺失时给面板一个明确默认，而不是 CSS 的 13.5px 兜底 */
+/** 字号生效值：设置缺失时给面板一个明确默认（消息 14 / 输入 13），而不是 CSS 兜底 */
 export function fontSizesOf(settings: any): { message: number; input: number } {
   const s = settings || {};
   const num = (v: any, fallback: number) => {
     const n = Math.round(Number(v));
     return Number.isFinite(n) ? Math.min(24, Math.max(10, n)) : fallback;
   };
-  return { message: num(s.fontSize, 12), input: num(s.inputFontSize, 13) };
+  return { message: num(s.fontSize, 14), input: num(s.inputFontSize, 13) };
 }
 
 export function normalizeSkin(v: unknown): AiSkin {

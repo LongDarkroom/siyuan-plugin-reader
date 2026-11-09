@@ -43,6 +43,8 @@
   /** 停靠形态：收起按钮与「在新页签打开」由控制器注入 */
   export let onClose: (() => void) | undefined = undefined;
   export let onOpenTab: (() => void) | undefined = undefined;
+  /** 会话持久化 IO（2026-11-08 P0）：宿主注入后会话真源改为 petal 文件 */
+  export let sessionIO: any = undefined;
 
   let target: AiTabTarget = resolveAiTabTarget();
   let pinned: AiTabPin = { bookId: "", title: "" };
@@ -53,6 +55,25 @@
   let lastGeneral = false;
   let timer: ReturnType<typeof setInterval> | null = null;
   let panelComp: any = null;
+
+  /** 通用对话空态的「最近聊过的书」（2026-11-08 · dock 无书时找不到历史的入口） */
+  let recentBooks: Array<{ bookId: string; sessions: number; updatedAt: number; title?: string }> = [];
+  let recentFor = "";
+
+  /**
+   * 查看模式（2026-11-08 第二步）。
+   *
+   * 点「最近聊过的书」时**不打开阅读器**，而是把面板直接绑到那本书的会话空间：
+   *   viewBookId  = 要看的书
+   *   viewTitle   = 该书书名（面板头部展示；不开阅读器拿不到 host.bookTitle）
+   *   viewContext = false → 不读正文、不传工具、不显示阅读上下文
+   *
+   * 一旦用户打开了真实的阅读器（有活动书），查看模式自动让位给真实绑定。
+   */
+  let viewBookId = "";
+  let viewTitle = "";
+  /** 当前是否处于「查看历史」形态（由 refresh 维护，模板据此决定面板参数） */
+  let viewing = false;
 
   /** 没有活动阅读器时的通用对话宿主：不读正文，只保留对话本身 */
   const GENERAL_HOST = {
@@ -92,6 +113,70 @@
     } catch {
       return null;
     }
+  }
+
+  /** 从书架取书名：会话索引里只存 bookId，空态列表需要可读名字 */
+  function shelfTitle(bookId: string): string {
+    if (!bookId) return "";
+    try {
+      const meta = readerTabs?.getBookMeta?.(bookId);
+      const title = String(meta?.title || "").trim();
+      if (title) return title;
+    } catch {
+      /* 书架不可用时退回空串，UI 显示 bookId */
+    }
+    const hit = readOpenBooks().find((b) => b.bookId === bookId);
+    return hit?.title || "";
+  }
+
+  /**
+   * 加载「最近聊过的书」。
+   *
+   * 只在通用对话（dock 无书）时加载：有书时面板绑在那本书上，这个列表没意义。
+   * 用 `recentFor` 记住上次查询的签名（会话数总和），列表没变化就不重新查盘。
+   */
+  async function loadRecentBooks(force = false): Promise<void> {
+    const io = sessionIO;
+    if (!io || typeof io.listBooks !== "function") {
+      recentBooks = [];
+      return;
+    }
+    try {
+      const list = await io.listBooks();
+      const sig = list.map((b: any) => `${b.bookId}:${b.sessions}:${b.updatedAt}`).join("|");
+      if (!force && sig === recentFor) return;
+      recentFor = sig;
+      recentBooks = list.map((b: any) => ({
+        bookId: b.bookId,
+        sessions: b.sessions,
+        updatedAt: b.updatedAt,
+        title: shelfTitle(b.bookId),
+      }));
+    } catch (e) {
+      logSwallow(e, "AiTabView.svelte · loadRecentBooks", "debug");
+      recentBooks = [];
+    }
+  }
+
+  /**
+   * 点「最近聊过的书」：**不开阅读器**，直接把面板绑到那本书的历史。
+   *
+   * 第二步的核心诉求：有时候不想打开阅读器，只想接着之前的对话聊。
+   * 此时用一个只读上下文的绑定（viewBookId + readContext=false）承载。
+   *
+   * 面板需要的宿主能力（读正文/工具/目录）此时为空——本来就没有实例；
+   * AiPanel 会据此进入「查看历史」形态，只聊对话、不读正文。
+   */
+  function openRecentBook(bookId: string, title?: string): void {
+    if (!bookId) return;
+    viewBookId = bookId;
+    viewTitle = title || shelfTitle(bookId);
+  }
+
+  /** 退出查看模式，回到通用对话 */
+  function exitViewBook(): void {
+    viewBookId = "";
+    viewTitle = "";
   }
 
   function syncPinState(): void {
@@ -137,10 +222,25 @@
     // 右栏是常驻入口：没有书时也必须是可对话的面板，而不是「请先开书」空态。
     // 页签保持不变——页签本来就是围绕一本书打开的，空态更有信息量。
     const nextGeneral = !nextHost && surface === "dock";
-    if (nextGeneral) nextHost = GENERAL_HOST;
+    // 查看历史（2026-11-08 第二步）：没有真实阅读器、但用户指名要看的书。
+    // 有真实实例时立刻让位，避免面板认着旧书不放。
+    const isViewing = nextGeneral && !!viewBookId;
+    viewing = isViewing;
+    if (isViewing) {
+      nextHost = {
+        ...GENERAL_HOST,
+        bookId: viewBookId,
+        bookTitle: viewTitle || shelfTitle(viewBookId),
+      };
+    } else if (nextGeneral) {
+      if (viewBookId) exitViewBook();
+      nextHost = GENERAL_HOST;
+    }
     const sig = nextHost
       ? nextGeneral
-        ? "general"
+        ? isViewing
+          ? `view|${nextHost.bookId}|${nextHost.bookTitle}`
+          : "general"
         : `${nextHost.bookId}|${nextHost.bookTitle}|${nextHost.bookAuthor}|${nextHost.chapterLabel}`
       : "";
     // 只在「换了实例 / 书名章节变了」时更新，避免每 800ms 触发子组件无意义刷新
@@ -204,6 +304,14 @@
   }
 
   $: emptyKind = host ? "" : target.pinnedClosed ? "closed" : target.bookId ? "opening" : "none";
+  // 只在「纯通用对话」时准备跨书列表；查看某本书的历史时不需要它
+  // （面板此时 hasBook=true，自己会列这本书的会话）。
+  $: if (general && !viewing) void loadRecentBooks();
+  else if (recentBooks.length && !general) {
+    recentBooks = [];
+    recentFor = "";
+  }
+
   onMount(() => {
     // 锁定只属于页签：右栏是常驻入口，不该被上一次的页签锁定带入某本书
     if (surface !== "dock") pinned = loadAiTabPin(storage());
@@ -231,7 +339,8 @@
       bookTitle={host.bookTitle}
       bookAuthor={host.bookAuthor}
       chapterLabel={host.chapterLabel}
-      general={general}
+      general={viewing ? false : general}
+      readContext={!general}
       resizable={false}
       overlay={false}
       onClose={surface === "dock" ? onClose : undefined}
@@ -248,6 +357,10 @@
       writeNotePlan={host.writeNotePlan}
       getPrimer={host.getPrimer}
       onLocate={host.onLocate}
+      sessionIO={sessionIO}
+      recentBooks={general ? recentBooks : []}
+      onOpenBook={general && !viewing ? openRecentBook : undefined}
+      onExitView={viewing ? exitViewBook : undefined}
     />
   {:else}
     <div class="re-ai-empty">

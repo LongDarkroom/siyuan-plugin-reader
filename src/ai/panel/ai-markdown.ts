@@ -11,6 +11,10 @@ import { logSwallow } from "../../core/safe.ts";
  * 直接 Md2HTML 会丢掉块引用/行内属性等思源扩展；双转换把它们固化成 BlockDOM
  * 再序列化回来，才能得到正确的 <span data-type="block-ref"> 等节点。
  *
+ * 输出统一包一层 <div class="b3-typography">：与思源正文共用同一套排版基线
+ * （标题/代码/表格按 em 缩放），容器字号由 .ai-md .b3-typography 压过
+ * base.css 的 16px 定值，消息字号设置才能真正生效；复制进文档时版式同源。
+ *
  * 安全：
  *  - getLute() 后显式 SetSanitize(true)（configureKramdownLute 内）；
  *  - 输出再过一道白名单式后处理（去 script/iframe、on* 事件、javascript: URL），
@@ -30,6 +34,13 @@ export function sanitizeRenderedHtml(html: string): string {
     .replace(/(href|src)\s*=\s*(javascript|vbscript):[^\s>]+/gi, '$1="#"');
 }
 
+/** 统一 b3-typography 外壳（renderMarkdown 的 Lute 分支已带壳，避免双层嵌套） */
+function wrapTypography(html: string): string {
+  if (!html) return "";
+  if (/^<div class="b3-typography"/.test(html)) return html;
+  return `<div class="b3-typography">${html}</div>`;
+}
+
 /**
  * 助手 Markdown → HTML。
  * 无 Lute 环境（单测 / 极旧内核）退回 core/markdown 的正则渲染，
@@ -45,20 +56,20 @@ export function renderAssistantMarkdown(md: string): string {
       const kd = ensureBlockSeparators(text);
       const blockDOM = lute.Md2BlockDOM(kd);
       const html = lute.Md2HTML(lute.BlockDOM2Md(blockDOM));
-      if (html && html.trim()) return sanitizeRenderedHtml(html);
+      if (html && html.trim()) return wrapTypography(sanitizeRenderedHtml(html));
     } catch (__swallowErr) {
       logSwallow(__swallowErr, "ai-markdown.ts · renderAssistantMarkdown", "debug");
     }
     try {
       // 双转换失败时的单层兜底（仍开 GFM/表格）
       const html = lute.Md2HTML(ensureBlockSeparators(text));
-      if (html && html.trim()) return sanitizeRenderedHtml(html);
+      if (html && html.trim()) return wrapTypography(sanitizeRenderedHtml(html));
     } catch (__swallowErr) {
       logSwallow(__swallowErr, "ai-markdown.ts · renderAssistantMarkdown · fallback", "debug");
     }
   }
-  // renderMarkdown 自带 b3-typography 包裹与 URL 白名单
-  return renderMarkdown(text);
+  // renderMarkdown 自带 URL 白名单；Lute 分支已带 b3-typography 壳，正则分支在这里补上
+  return wrapTypography(renderMarkdown(text));
 }
 
 /**

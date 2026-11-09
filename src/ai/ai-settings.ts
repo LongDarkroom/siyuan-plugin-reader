@@ -28,7 +28,7 @@ export interface AiSettings {
   promptTemplate: string; // 系统提示词模板（支持占位符）
   jsonMode: boolean;      // true: 要求结构化 JSON；false: 直出 markdown
   /** 显示与操作 */
-  fontSize: number;       // 消息字体大小（px），默认 12（与思源 Copilot 插件的 messageFontSize 默认一致）
+  fontSize: number;       // 消息字体大小（px），默认 14（与思源 Copilot 插件的 messageFontSize 默认一致）
   inputFontSize: number;  // 输入框字体大小（px），默认 13
   /**
    * AI 输入框实现选择。
@@ -563,7 +563,7 @@ export const DEFAULT_AI_SETTINGS: AiSettings = {
   promptTemplate: DEFAULT_AI_DEEPREAD_SYSTEM,
   jsonMode: true,
   // 显示与操作
-  fontSize: 12,
+  fontSize: 14,
   inputFontSize: 13,
   // 2026-09-07 T4：Protyle 输入框全面转正（默认开）。
   //   contenteditable 不再是「默认路径」，仅作 Protyle 构造失败 / 容器零尺寸时的兜底。
@@ -792,7 +792,7 @@ export function normalizeAiSettings(raw: any): AiSettings {
     promptTemplate: template,
     jsonMode: bool(r.jsonMode, true),
     // 显示与操作
-    fontSize: Math.round(num(r.fontSize, 12, 10, 24)),
+    fontSize: Math.round(num(r.fontSize, 14, 10, 24)),
     inputFontSize: Math.round(num(r.inputFontSize, 13, 10, 24)),
     // 2026-09-03 P0：AI 输入框模式（默认 contenteditable，Protyle 实验性）
     useProtyleInput: bool(r.useProtyleInput, false),

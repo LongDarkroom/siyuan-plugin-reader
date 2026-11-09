@@ -471,6 +471,8 @@ import { getLogger } from "../core/logger.ts";
   export let isTranslationConfigured: (() => boolean) | undefined = undefined;
   /** 获取当前 AI 设置快照（用于预翻译弹窗判断可用引擎/模型） */
   export let getAiSettings: (() => AiSettings | null) | undefined = undefined;
+  /** AI 会话持久化 IO（2026-11-08 P0）：注入后会话真源改为 petal 文件 */
+  export let sessionIO: any = undefined;
   /** 保存腾讯翻译用量锁（单位：字符） */
   export let onSaveTencentLock: ((chars: number) => Promise<void> | void) | undefined = undefined;
   /** 2026-08-31：双语设置独立弹窗增量保存 AI 设置（翻译风格/提示词/引擎/参数） */
@@ -14846,6 +14848,7 @@ import { getLogger } from "../core/logger.ts";
         getPrimer={() => primerStore?.get?.(bookId) || ""}
         onLocate={onAiLocate}
         onClose={() => (showAiPanel = false)}
+        sessionIO={sessionIO}
       />
     </div>
   {/if}

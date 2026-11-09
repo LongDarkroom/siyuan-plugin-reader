@@ -27,6 +27,8 @@
   import AiSettingsDialog from "../settings/AiSettingsDialog.svelte";
   import { fontSizesOf } from "../settings/ai-settings-dialog-logic.ts";
   import { renderAssistantMarkdown, blockIdFromTarget } from "./ai-markdown.ts";
+  import { copyAsMarkdown } from "./ai-clipboard.ts";
+  import { renderPost } from "./ai-render-post.ts";
   import {
     MINDMAP_QUICK_ASK,
     outlineFromMarkdown,
@@ -131,6 +133,7 @@
     type AiChatSession,
     type AiSessionState,
   } from "./ai-session-store.ts";
+  import type { AiSessionIO, SessionLoadSource } from "./ai-session-io.ts";
   import {
     buildSessionMarkdown,
     buildSessionJson,
@@ -175,6 +178,19 @@
   /** 右栏没有活动阅读器时的通用对话：不读正文、不显示阅读上下文 */
   export let general = false;
 
+  /* ==================== 会话来源 / 是否读正文（2026-11-08 拆分） ====================
+   * 原先 `general` 一个布尔量同时表示两件事：「没有书」和「不读正文」。要支持
+   * 「不开阅读器也能回顾某本书的对话」，必须把它们拆开：
+   *
+   *   general=true                → 纯通用对话（无书、不读正文、落到 unknown 会话空间）
+   *   viewBookId=xxx, readContext=false → 查看某本书的历史（有书、但不读正文）
+   *   阅读器内                    → bookId=xxx, readContext=true（默认）
+   */
+  /** 面板要查看哪本书的会话（不传则用 bookId）；用于「不开阅读器回顾历史」 */
+  export let viewBookId = "";
+  /** 是否附加正文/章节/工具上下文；查看历史时为 false，避免读到另一本书的正文 */
+  export let readContext = true;
+
   /** 读翻译/AI 设置（宿主 → plugin.getAiSettings） */
   export let getAiSettings: (() => any) | undefined = undefined;
   /** 存设置增量（宿主 → plugin.updateAiSettings） */
@@ -207,6 +223,30 @@
   export let onClose: (() => void) | undefined = undefined;
   /** 在思源页签中打开（仅右侧停靠时提供；页签内不传） */
   export let onOpenTab: (() => void) | undefined = undefined;
+  /**
+   * 会话持久化 IO（2026-11-08 · P0）。
+   *
+   * 宿主注入后，会话真源变为 petal 文件；缺省（旧行为）仍只写 localStorage。
+   * 存在该对象时：
+   *  - 首屏用 `loadCache` 同步渲染 → 再 `loadBook` 异步对账；
+   *  - 所有写点走 `saveBook`（未对账前不会覆盖磁盘）；
+   *  - 卸载 / pagehide 立即 `flush`。
+   */
+  export let sessionIO: AiSessionIO | undefined = undefined;
+
+  /* ======================= 通用对话：最近对话入口 ======================= */
+  /**
+   * 右栏在没有活动阅读器时会落到独立的 `unknown` 会话空间，看不到任何书的
+   * 历史，用户会以为「历史丢了」。这里给它一份跨书会话摘要，用于空态列出
+   * 「最近聊过的书」。
+   *
+   * 只在 general 模式下有意义；有书时面板本来就绑在那本书上。
+   */
+  export let recentBooks: Array<{ bookId: string; sessions: number; updatedAt: number; title?: string }> = [];
+  /** 点「最近对话」里的某本书：打开它的阅读器（宿主注入） */
+  export let onOpenBook: ((bookId: string, title?: string) => void) | undefined = undefined;
+  /** 退出「查看历史」回到通用对话（宿主注入；仅在查看形态有意义） */
+  export let onExitView: (() => void) | undefined = undefined;
 
   /* ============================ 工具循环上限 ============================ */
 
@@ -224,7 +264,7 @@
   let settingsOpen = false;
   let prefs: AiPanelPrefs = { ...DEFAULT_AI_PANEL_PREFS };
   /** 设置窗口负责的显示参数；打开/保存后由 syncCred 一并刷新 */
-  let fontSizes = { message: 12, input: 13 };
+  let fontSizes = { message: 14, input: 13 };
   let sendShortcut: "enter" | "mod+enter" = "enter";
   let streamThrottleMs = 100;
   let messages: AiChatMessage[] = [];
@@ -237,6 +277,22 @@
   let chatGen = 0;
   /** 多会话状态：sessions 内是已落盘快照，messages 是当前会话的工作副本 */
   let sessionState: AiSessionState = emptySessionState();
+  /** P0：本次会话态的加载来源（诊断用）；disk/backup 表示已与 petal 真源对账 */
+  let loadSource: SessionLoadSource = "empty";
+  /** P0：磁盘档损坏且读不出 → 本次不落盘，避免覆盖原始档 */
+  let storageReadOnly = false;
+  /**
+   * 会话真源的书 id（2026-11-08 拆分）。
+   *
+   * 与 `bookId` 的区别：`bookId` 是「当前打开在阅读器里的书」，会随活动阅读器变；
+   * 这个值是「面板此刻在读哪个会话空间」。查看历史（viewBookId）时二者不同，
+   * 所有读写会话的地方都必须用它，否则会把 A 书的会话写进 B 书。
+   */
+  $: sessionBookId = general ? "" : String(viewBookId || bookId || "");
+  /** 有书（含「查看历史」这种有书但不读正文的状态） */
+  $: hasBook = !general && !!sessionBookId;
+  /** 是否真的附加正文/章节上下文：有书 + 未关闭读上下文 */
+  $: readCtx = hasBook && readContext;
   /** 历史浮卡：全部/置顶筛选 + 标题/正文搜索 */
   let showHistory = false;
   let historyQuery = "";
@@ -388,10 +444,51 @@
   function loadSessionsFor(id: string): void {
     chatGen++;
     loadedBookId = id;
-    const loaded = loadSessionState(storage(), id);
     const days = Math.round(Number(getAiSettings?.()?.sessionRetentionDays) || 0);
-    const pruned = pruneSessionsByAge(loaded, days);
-    sessionState = ensureSessionState(pruned === loaded ? loaded : saveSessionState(storage(), id, pruned));
+
+    if (!sessionIO) {
+      // 旧路径（无 IO 注入）：只走 localStorage，行为与历史版本一致
+      const loaded = loadSessionState(storage(), id);
+      const pruned = pruneSessionsByAge(loaded, days);
+      sessionState = ensureSessionState(pruned === loaded ? loaded : saveSessionState(storage(), id, pruned));
+      applyLoadedState(id);
+      return;
+    }
+
+    /**
+     * P0 路径：先同步用热缓存出首屏（<5ms，不闪空），再异步读盘对账。
+     * 注意必须**先渲染再对账**：否则等 petal 的几十毫秒会让面板空白。
+     */
+    const cached = sessionIO.loadCache(id);
+    sessionState = ensureSessionState(pruneSessionsByAge(cached, days));
+    applyLoadedState(id);
+
+    const gen = chatGen;
+    void sessionIO
+      .loadBook(id, { pruneRetentionDays: days })
+      .then((res) => {
+        // 期间换了书/换了会话：丢弃这次结果，避免串书
+        if (gen !== chatGen || loadedBookId !== id) return;
+        sessionState = ensureSessionState(res.state);
+        const active = activeSessionOf(sessionState);
+        // 只在用户尚未发言时替换消息，避免冲掉正在输入/正在流式的内容
+        if (!streaming && !messages.some((m) => m.role === "user")) {
+          messages = active ? active.messages.slice() : [];
+        }
+        loadSource = res.source;
+        if (res.readOnly) {
+          storageReadOnly = true;
+          notice = t("会话档读取失败，本次修改不会落盘（已保留原始档）");
+        }
+        void tick().then(() => autoScroll(true));
+      })
+      .catch((e) => {
+        logSwallow(e, "AiPanel.svelte · loadSessionsFor · io", "debug");
+      });
+  }
+
+  /** 载入后统一重置视图态（两条路径共用） */
+  function applyLoadedState(id: string): void {
     const active = activeSessionOf(sessionState);
     messages = active ? active.messages.slice() : [];
     knowledge = loadKnowledgeSource(storage(), id);
@@ -403,14 +500,46 @@
     composer?.clear?.();
   }
 
+  /**
+   * 生成中落盘投影：流式正文只存在 tokenBuf 里，messages 中的助手消息仍是空串。
+   * 刷新 / 切页 / 切会话直接 persistChat() 会把空消息过滤掉，半截回答就此丢失。
+   * 只在「保存」这一刻投影出带片段的副本，不改动 messages，避免每帧重渲染。
+   */
+  function messagesForSave(list: AiChatMessage[]): AiChatMessage[] {
+    if (!streaming || !streamMsgId) return list;
+    const partial = String(tokenBuf || "");
+    if (!partial.trim()) return list;
+    const reasoning = String(reasonBuf || "").trim();
+    return list.map((m) =>
+      m.id === streamMsgId && m.role === "assistant"
+        ? { ...m, content: partial, ...(reasoning ? { reasoning } : {}), aborted: true }
+        : m,
+    );
+  }
+
   /** 当前工作副本落回会话；切书/切会话/卸载前都要先调用 */
-  function persistChat(targetBookId = bookId): void {
+  function persistChat(targetBookId = sessionBookId): void {
     const id = sessionState.activeId;
     if (!id) return;
     const active = sessionState.sessions.find((s) => s.id === id);
     if (!active) return;
-    const touched = touchSession(active, messages);
-    sessionState = saveSessionState(storage(), targetBookId, upsertSession({ ...sessionState, activeId: id }, touched));
+    const touched = touchSession(active, messagesForSave(messages));
+    sessionState = saveStateFor(targetBookId, upsertSession({ ...sessionState, activeId: id }, touched));
+  }
+
+  /**
+   * 统一落盘入口：注入了 IO 就走「热缓存 + petal 防抖」，否则退回旧 localStorage。
+   * `opts.explicit` 用于删除/清空（跳过缩水守卫并写墓碑）。
+   */
+  function saveStateFor(
+    targetBookId: string,
+    next: AiSessionState,
+    opts: { explicit?: boolean; immediate?: boolean; removedIds?: string[] } = {},
+  ): AiSessionState {
+    if (sessionIO && !storageReadOnly) {
+      return sessionIO.saveBook(targetBookId, next, opts);
+    }
+    return saveSessionState(storage(), targetBookId, next);
   }
 
   function persistPrefs(): void {
@@ -427,14 +556,41 @@
       if (resizable) width = clampWidth(width);
     };
     window.addEventListener("resize", onWinResize);
+    // P0：离开页面前强制落盘。bfcache / 刷新 / 关闭标签页都不走 Svelte 卸载，
+    // 只靠 onMount 的清理函数会漏掉最后一批消息，这里补两道。
+    const onPageHide = () => {
+      try {
+        persistChat(loadedBookId || sessionBookId);
+      } catch (e) {
+        logSwallow(e, "AiPanel.svelte · pagehide · persistChat", "debug");
+      }
+      void sessionIO?.flush();
+    };
+    window.addEventListener("pagehide", onPageHide);
+    document.addEventListener("visibilitychange", onVisibilityHidden);
     return () => {
       window.removeEventListener("resize", onWinResize);
+      window.removeEventListener("pagehide", onPageHide);
+      document.removeEventListener("visibilitychange", onVisibilityHidden);
       // 组件卸载时中断请求并落盘（页面切换不应丢对话）
       try { abortCtrl?.abort(); } catch { /* already aborted */ }
-      persistChat(loadedBookId || bookId);
+      persistChat(loadedBookId || sessionBookId);
       persistPrefs();
+      // 立即落盘，不等 800ms 防抖 —— 卸载后定时器可能不再触发
+      void sessionIO?.flush();
     };
   });
+
+  /** 页面转入后台时落盘：移动端/切窗口都可能被系统回收内存 */
+  function onVisibilityHidden(): void {
+    if (typeof document === "undefined" || document.visibilityState !== "hidden") return;
+    try {
+      persistChat(loadedBookId || sessionBookId);
+    } catch (e) {
+      logSwallow(e, "AiPanel.svelte · visibilitychange · persistChat", "debug");
+    }
+    void sessionIO?.flush();
+  }
 
   onDestroy(() => {
     if (flushTimer) {
@@ -444,14 +600,16 @@
     clearPreviewTimers();
   });
 
-  // 切换书籍（阅读器内换书不重建组件时）跟着换会话。
+  // 切换会话源（换书 / 进入或退出「查看历史」）时跟着换会话。
   // 2026-11-05 AI 页签：跟随活动阅读器时本组件会跨书复用，换书前先把上一本
   // 的工作副本落回它自己的存储，并丢弃「已发出但还没答完」的空占位，
   // 避免空助手气泡留在历史里。
-  $: if (bookId !== loadedBookId) {
+  // 2026-11-08：改用 sessionBookId —— viewBookId 与 bookId 不同（查看历史）时
+  // 也必须正确切换，否则会把 A 书的会话写进 B 书。
+  $: if (sessionBookId !== loadedBookId) {
     discardActiveTurn();
     if (loadedBookId) persistChat(loadedBookId);
-    loadSessionsFor(bookId);
+    loadSessionsFor(sessionBookId);
   }
 
   // 展开面板时刷新凭据：设置可能在双语翻译页被改过
@@ -537,9 +695,14 @@
   function discardActiveTurn(): void {
     if (!streaming) return;
     stop();
-    const last = messages[messages.length - 1];
-    if (last?.role === "assistant" && !last.content.trim() && !last.error && !last.aborted) {
-      messages = messages.slice(0, -1);
+    if (String(tokenBuf || "").trim() && streamMsgId) {
+      // 已流出的片段留在原会话：切回来仍看得到「已停止 / 继续」，不会被当成空气泡丢掉
+      messages = messagesForSave(messages);
+    } else {
+      const last = messages[messages.length - 1];
+      if (last?.role === "assistant" && !last.content.trim() && !last.error && !last.aborted) {
+        messages = messages.slice(0, -1);
+      }
     }
     streaming = false;
     streamMsgId = "";
@@ -712,7 +875,7 @@
       if (!title || gen !== chatGen) return;
       const session = sessionState.sessions.find((s) => s.id === sessionId);
       if (!session || !shouldApplyAutoTitle(session, baseTitle)) return;
-      sessionState = saveSessionState(storage(), loadedBookId || bookId, {
+      sessionState = saveStateFor(sessionBookId, {
         ...sessionState,
         sessions: sessionState.sessions.map((s) => (s.id === sessionId ? applyAiSessionTitle(s, title) : s)),
       });
@@ -914,19 +1077,10 @@
 
     const base = messages.slice(0, idx + 1);
     const history = pickHistory(base, prefs.historyTurns, { includeAborted: true });
-    const userMsg: AiChatMessage = {
-      id: newMessageId(),
-      role: "user",
-      content: prev.content,
-      createdAt: Date.now(),
-      continuation: true,
-    };
-    if (prev.quote) userMsg.quote = { ...prev.quote };
-    if (prev.scope) userMsg.scope = prev.scope;
-    if (prev.range) userMsg.range = { ...prev.range };
-    if (typeof prev.useKnowledge === "boolean") userMsg.useKnowledge = prev.useKnowledge;
+    // 复用原提问，只在请求里附「继续」提示：不再插入一条内容一模一样的用户气泡
+    const userMsg: AiChatMessage = { ...prev, continuation: true };
     const assistant = freshAssistant();
-    messages = [...base, userMsg, assistant];
+    messages = [...base, assistant];
     await runTurn(userMsg, assistant, history);
   }
 
@@ -1010,8 +1164,9 @@
       else notice = t("未能读取本章正文，本次回答不含章节上下文");
     };
 
-    if (general) {
-      // 通用模式没有书：不读正文、不带范围，也不提示「未读到本章」
+    if (!readCtx) {
+      // 无正文上下文：通用对话没有书；查看历史时虽然知道是哪本书，
+      // 但没有它的阅读器实例，读不到正文，也不该提示「未读到本章」。
       scopeUsed = requestedScope;
     } else if (requestedScope === "range") {
       if (getRange && rangeUsed) {
@@ -1093,18 +1248,19 @@
     let knowledgeTruncated = false;
 
     // 2) 组装请求（宿主可用时追加工具说明，让模型知道能自己翻书）
-    const host = general
-      ? null
-      : (() => {
+    // 工具依赖阅读器实例：查看历史时没有实例，不能给工具，否则模型会调空
+    const host = readCtx
+      ? (() => {
           try {
             return getReaderToolHost?.() || null;
           } catch (e) {
             logSwallow(e, "AiPanel.svelte · send · getReaderToolHost", "warn");
             return null;
           }
-        })();
+        })()
+      : null;
     const toolDefs = host ? buildReaderToolDefs() : [];
-    let systemPrompt = general
+    let systemPrompt = !hasBook
       ? buildGeneralSystemPrompt()
       : buildReaderSystemPrompt({
       bookTitle,
@@ -1120,7 +1276,7 @@
       rangeChapters: scopeUsed === "range" ? rangeChapters : undefined,
     });
     // 2.1) 目录：压成编号清单，让模型知道全书结构（读单章/范围时不必靠猜）
-    if (!general && getToc) {
+    if (readCtx && getToc) {
       await ensureToc();
       if (tocItems.length >= 2) {
         const tocPrompt = buildTocPrompt(tocItems);
@@ -1370,7 +1526,7 @@
     // 顺手收掉其它空会话，避免连点「新对话」堆一串
     const rest = sessionState.sessions.filter((s) => s.messages.length > 0 || s.id === sessionState.activeId);
     const fresh = createSession([]);
-    sessionState = saveSessionState(storage(), bookId, {
+    sessionState = saveStateFor(sessionBookId, {
       version: 1,
       activeId: fresh.id,
       sessions: [fresh, ...rest],
@@ -1388,7 +1544,7 @@
       return;
     }
     persistChat();
-    sessionState = saveSessionState(storage(), bookId, withActiveSession(sessionState, id));
+    sessionState = saveStateFor(sessionBookId, withActiveSession(sessionState, id));
     const active = activeSessionOf(sessionState);
     messages = active ? active.messages.slice() : [];
     showHistory = false;
@@ -1412,7 +1568,8 @@
       const fresh = createSession([]);
       next = { version: 1, activeId: fresh.id, sessions: [fresh] };
     }
-    sessionState = saveSessionState(storage(), bookId, next);
+    // 显式删除：跳过缩水守卫，并写入墓碑防止另一实例把已删会话写回来
+    sessionState = saveStateFor(sessionBookId, next, { explicit: true, removedIds: [id] });
     if (wasActive) {
       const active = activeSessionOf(sessionState);
       messages = active ? active.messages.slice() : [];
@@ -1424,8 +1581,14 @@
   function clearAllSessions(): void {
     if (!confirm(t("清空全部历史会话？只删除本机记录，不影响已写入的思源笔记。"))) return;
     discardActiveTurn();
+    // 清空是显式动作：跳过缩水守卫，并把当前所有会话写进墓碑
+    const removedIds = sessionState.sessions.map((s) => s.id);
     const fresh = createSession([]);
-    sessionState = saveSessionState(storage(), bookId, { version: 1, activeId: fresh.id, sessions: [fresh] });
+    sessionState = saveStateFor(
+      sessionBookId,
+      { version: 1, activeId: fresh.id, sessions: [fresh] },
+      { explicit: true, removedIds },
+    );
     messages = [];
     showHistory = false;
     historyQuery = "";
@@ -1548,7 +1711,7 @@
     if (!id || !nextTitle) return;
     const target = sessionState.sessions.find((s) => s.id === id);
     if (!target || target.title === nextTitle) return;
-    sessionState = saveSessionState(storage(), bookId, {
+    sessionState = saveStateFor(sessionBookId, {
       ...sessionState,
       sessions: sessionState.sessions.map((s) => (s.id === id ? renameSession(s, nextTitle) : s)),
     });
@@ -1572,7 +1735,7 @@
       return;
     }
     historyMenu = "";
-    sessionState = saveSessionState(storage(), bookId, setSessionPinned(sessionState, s.id, !s.pinned));
+    sessionState = saveStateFor(sessionBookId, setSessionPinned(sessionState, s.id, !s.pinned));
   }
 
   function downloadText(name: string, text: string, mime: string): void {
@@ -1842,13 +2005,13 @@
     if (!p?.docId) return;
     knowledge = { docId: p.docId, docTitle: p.docTitle, notebookName: p.notebookName };
     knowledgeOn = true;
-    saveKnowledgeSource(storage(), bookId, knowledge);
+    saveKnowledgeSource(storage(), sessionBookId, knowledge);
   }
 
   function clearKnowledge(): void {
     knowledge = null;
     knowledgeOn = false;
-    saveKnowledgeSource(storage(), bookId, null);
+    saveKnowledgeSource(storage(), sessionBookId, null);
   }
 
   /** 快捷上下文：本页 / 本章（偏好持久化，跨书沿用；显式点选会清掉目录范围） */
@@ -2159,14 +2322,16 @@
   /* ============================ 展示辅助 ============================ */
 
   let title = "";
-  $: title = general ? t("AI 助手") : String(bookTitle || "").trim();
-  $: subline = general
+  $: title = !hasBook ? t("AI 助手") : String(bookTitle || "").trim() || t("这本书");
+  $: subline = !hasBook
     ? t("通用对话")
-    : [String(bookAuthor || "").trim(), String(chapterLabel || "").trim()].filter(Boolean).join(" · ");
+    : readCtx
+      ? [String(bookAuthor || "").trim(), String(chapterLabel || "").trim()].filter(Boolean).join(" · ")
+      : t("查看历史 · 未接入正文");
   /** 头部封面块：取书名首字，没有书名就用助手图标位 */
-  $: coverChar = title && !general ? title.slice(0, 1) : "✦";
+  $: coverChar = title && hasBook ? title.slice(0, 1) : "✦";
   /** 对话里助手的自称：通用模式不再叫「阅读助手」 */
-  $: assistantLabel = general ? t("AI 助手") : t("阅读助手");
+  $: assistantLabel = hasBook ? t("阅读助手") : t("AI 助手");
   /** 已存笔记（跨会话汇总；新→旧） */
   $: savedNotes = collectSessionNotes(sessionState);
 
@@ -2184,9 +2349,9 @@
     { label: t("画成导图"), text: t(MINDMAP_QUICK_ASK), sub: t("结构输出"), icon: "图" },
   ];
 
-  $: quickAsks = general ? GENERAL_QUICK_ASKS : QUICK_ASKS;
-  // 通用模式没有书，笔记落点/已存笔记都无意义；停留在笔记页会看到空壳
-  $: if (general && tab === "notes") tab = "chat";
+  $: quickAsks = readCtx ? QUICK_ASKS : GENERAL_QUICK_ASKS;
+  // 没有正文（通用对话 / 查看历史）时笔记落点无意义；停留在笔记页会看到空壳
+  $: if (!readCtx && tab === "notes") tab = "chat";
 
   function quickAsk(item: { text: string; label: string }): void {
     if (item.label === t("解释这段") && !pendingQuote) {
@@ -2202,6 +2367,7 @@
 <aside
   class="ai-panel"
   bind:this={panelEl}
+  use:copyAsMarkdown
   class:paper={prefs.aiSkin === "paper"}
   class:is-overlay={overlay}
   style={`--re-ai-font-size:${fontSizes.message}px;--re-ai-input-font-size:${fontSizes.input}px`}
@@ -2237,6 +2403,13 @@
         <span>{assistantLabel}</span>
       </div>
     </div>
+    {#if hasBook && !readCtx && onExitView}
+      <button
+        class="ai-view-back"
+        title={t("回到通用对话")}
+        on:click={() => onExitView?.()}
+      >{t("返回")}</button>
+    {/if}
     <div class="ai-hd-actions">
       <button
         bind:this={historyBtnEl}
@@ -2464,7 +2637,7 @@
       aria-selected={tab === "chat"}
       on:click={() => (tab = "chat")}
     >{t("对话")}</button>
-    {#if !general}
+    {#if readCtx}
       <button
         class="ai-tab"
         class:on={tab === "notes"}
@@ -2489,12 +2662,59 @@
 
       {#if !messages.length}
         <div class="ai-empty">
-          <div class="ai-empty-title">{general ? t("有什么可以帮你？") : t("就这本书提问")}</div>
-          <div class="ai-empty-sub">
-            {general
-              ? t("可以问任何问题；打开一本书后会自动接上当前章节。")
-              : t("回答只依据当前章节与你的选段；原文引用可点回正文。")}
+          <div class="ai-empty-title">
+            {!hasBook ? t("有什么可以帮你？") : readCtx ? t("就这本书提问") : t("《{title}》的历史对话", { title })}
           </div>
+          <div class="ai-empty-sub">
+            {!hasBook
+              ? t("可以问任何问题；打开一本书后会自动接上当前章节。")
+              : readCtx
+                ? t("回答只依据当前章节与你的选段；原文引用可点回正文。")
+                : t("这里可以查看与继续之前的对话，但不会读取正文。需要引用原文时再打开这本书。")}
+          </div>
+
+          {#if !hasBook && recentBooks.length}
+            <div class="ai-recent">
+              <div class="ai-recent-head">
+                <span>{t("最近聊过的书")}</span>
+                <span class="ai-recent-hint">{t("点开即接上那本书的对话")}</span>
+              </div>
+              {#each recentBooks.slice(0, 6) as b (b.bookId)}
+                <button
+                  class="ai-recent-row"
+                  title={b.title || b.bookId}
+                  on:click={() => onOpenBook?.(b.bookId, b.title)}
+                >
+                  <span class="ai-recent-name">{b.title || b.bookId}</span>
+                  <span class="ai-recent-meta">
+                    {t("{n} 条对话", { n: b.sessions })}{#if b.updatedAt}<span class="ai-recent-dot">·</span>{historyTimeLabel(b.updatedAt)}{/if}
+                  </span>
+                </button>
+              {/each}
+            </div>
+          {:else if hasBook && sessionState.sessions.length > 1}
+            <div class="ai-recent">
+              <div class="ai-recent-head">
+                <span>{t("这本书的对话")}</span>
+                <span class="ai-recent-hint">{t("点一条接着聊")}</span>
+              </div>
+              {#each historyList().slice(0, 6) as s (s.id)}
+                <button
+                  class="ai-recent-row"
+                  class:is-on={s.id === sessionState.activeId}
+                  title={sessionTitleOf(s)}
+                  on:click={() => switchSession(s.id)}
+                >
+                  <span class="ai-recent-name">{sessionTitleOf(s)}</span>
+                  <span class="ai-recent-meta">
+                    {t("{n} 条消息", { n: s.messages.length })}{#if s.updatedAt}<span class="ai-recent-dot">·</span>{historyTimeLabel(s.updatedAt)}{/if}
+                    {#if s.id === sessionState.activeId}<span class="ai-recent-now">{t("当前")}</span>{/if}
+                  </span>
+                </button>
+              {/each}
+            </div>
+          {/if}
+
           <div class="ai-hints">
             {#each quickAsks as item (item.label)}
               <button class="ai-hint" on:click={() => quickAsk(item)}>
@@ -2591,6 +2811,7 @@
                     class="ai-md"
                     class:is-error={m.error}
                     use:codeCopy
+                    use:renderPost
                     on:click={onMdClick}
                     on:mouseover={onRefOver}
                     on:mouseout={onRefOut}
@@ -2718,7 +2939,7 @@
           <button class="ai-note-x" aria-label={t("关闭预览")} on:click={() => (notePlan = null)}>×</button>
         </div>
         <div class="ai-note-plan-title">{notePlan.plan.title}</div>
-        <div class="ai-md ai-note-preview">{@html renderAssistantMarkdown(notePlan.plan.markdown)}</div>
+        <div class="ai-md ai-note-preview" use:renderPost>{@html renderAssistantMarkdown(notePlan.plan.markdown)}</div>
         {#if notePlanError}<div class="ai-field-hint err">{notePlanError}</div>{/if}
         <div class="ai-note-foot">
           <span class="ai-field-hint">{t("只追加内容，不会覆盖文档已有内容。")}</span>
@@ -2754,7 +2975,7 @@
         </div>
       {/if}
 
-      {#if !general}
+      {#if readCtx}
       <div class="ai-ctx-wrap">
         {#if showToc}
           <div class="ai-toc-pop" role="dialog" aria-label={t("选择章节范围")}>
@@ -2808,8 +3029,8 @@
             </div>
           </div>
         {/if}
-        <div class="ai-ctx-row" role="group" aria-label={general ? t("附加资料") : t("阅读上下文")}>
-          {#if !general}
+        <div class="ai-ctx-row" role="group" aria-label={hasBook ? t("阅读上下文") : t("附加资料")}>
+          {#if readCtx}
             <button
               class="ai-ctx-chip"
               class:on={!readRange && contextScope === "page"}
@@ -2863,9 +3084,11 @@
         {sendShortcut}
         placeholder={!isAiReady(cred)
           ? t("请先在设置里配置 AI 模型")
-          : general
-            ? t("输入问题…")
-            : t("就这本书提问…")}
+          : readCtx
+            ? t("就这本书提问…")
+            : hasBook
+              ? t("接着这本书的历史聊…")
+              : t("输入问题…")}
         onSubmit={send}
       />
 
@@ -2901,10 +3124,12 @@
           <span class="ai-model-name">{cred.model || t("未配置模型")}</span>
           <span class="ai-caret" aria-hidden="true">›</span>
         </button>
-        {#if !general}
+        {#if readCtx}
           <span class="ai-ctx-hint" title={t("每次提问附带所选范围正文，超出上限自动截断")}>
             {scopeSummary()} · {prefs.contextChars.toLocaleString()}{t(" 字")}{#if knowledge && knowledgeOn} · {t("知识区")}{/if}
           </span>
+        {:else if hasBook}
+          <span class="ai-ctx-hint" title={t("查看历史模式不读取正文，回答只依据对话本身")}>{t("未接入正文")}{#if knowledge && knowledgeOn} · {t("知识区")}{/if}</span>
         {:else if knowledge && knowledgeOn}
           <span class="ai-ctx-hint">{t("知识区")}</span>
         {/if}
@@ -2968,7 +3193,7 @@
       {#if p.error}
         <div class="ai-bp-err">{p.error}</div>
       {:else}
-        <div class="ai-md ai-bp-body" on:click={onMdClick}>{@html p.html}</div>
+        <div class="ai-md ai-bp-body" use:renderPost on:click={onMdClick}>{@html p.html}</div>
       {/if}
       <div class="ai-bp-foot">
         <button class="ai-link" on:click={() => { void openBlockById(p.id); hidePreview(); }}>{t("打开块")}</button>
@@ -2991,7 +3216,7 @@
     <AiSettingsDialog
       getSettings={getAiSettings}
       {prefs}
-      {general}
+      general={!readCtx}
       {knowledge}
       saveSettings={saveAiSettings}
       savePrefs={applyPrefsFromDialog}
@@ -3014,7 +3239,7 @@
     color: var(--b3-theme-on-background, #1f2329);
     border-left: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
     box-sizing: border-box;
-    font-size: var(--re-ai-font-size, 12px);
+    font-size: var(--re-ai-font-size, 14px);
     /* 思源给 .layout-tab-container 设了 user-select:none（正文在 iframe 里所以阅读区不受影响），
        自定义页签里的面板会继承成不可选 ⇒ 回答无法划选复制。面板根显式放开，停靠态一并受益。 */
     -webkit-user-select: text;
@@ -3113,6 +3338,22 @@
     align-items: center;
     gap: 2px;
     flex: none;
+  }
+  /* 查看历史形态的「返回」：回到通用对话，退出无正文绑定 */
+  .ai-view-back {
+    flex: none;
+    height: 24px;
+    padding: 0 9px;
+    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12));
+    border-radius: 6px;
+    background: transparent;
+    color: var(--b3-theme-on-surface, #6b7280);
+    font-size: 11.5px;
+    cursor: pointer;
+  }
+  .ai-view-back:hover {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    color: var(--b3-theme-on-background, #1f2329);
   }
   .ai-icon-btn {
     position: relative;
@@ -3254,6 +3495,77 @@
     font-size: 12px;
     line-height: 1.6;
     color: var(--b3-theme-on-surface, #6b7280);
+  }
+  /* 通用对话空态 · 最近聊过的书（2026-11-08）
+     右栏没绑书时落到 unknown 空间，这里给出「历史去哪了」的入口 */
+  .ai-recent {
+    width: 100%;
+    margin-top: 14px;
+    padding: 8px 4px 0;
+    border-top: 1px dashed var(--b3-border-color, rgba(0, 0, 0, 0.1));
+    text-align: left;
+  }
+  .ai-recent-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 4px 6px;
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--b3-theme-on-surface, #6b7280);
+  }
+  .ai-recent-hint {
+    font-weight: 400;
+    font-size: 10.5px;
+    opacity: 0.72;
+  }
+  .ai-recent-row {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    width: 100%;
+    padding: 7px 9px;
+    border: 0;
+    border-radius: 8px;
+    background: transparent;
+    color: var(--b3-theme-on-background, #1f2329);
+    text-align: left;
+    cursor: pointer;
+  }
+  .ai-recent-row:hover {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+  .ai-recent-name {
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 12.5px;
+    line-height: 1.45;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ai-recent-meta {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10.5px;
+    color: var(--b3-theme-on-surface, #6b7280);
+  }
+  .ai-recent-dot {
+    opacity: 0.6;
+  }
+  /* 当前会话：整行轻底色 + 尾部「当前」标记，避免和普通行混淆 */
+  .ai-recent-row.is-on {
+    background: var(--b3-theme-primary-lightest, rgba(55, 138, 221, 0.08));
+  }
+  .ai-recent-now {
+    padding: 0 4px;
+    border-radius: 3px;
+    background: var(--b3-theme-primary, #378add);
+    color: #fff;
+    font-size: 9.5px;
+    line-height: 1.6;
   }
   .ai-hints {
     display: flex;
@@ -3474,6 +3786,11 @@
     word-break: break-word;
     overflow-wrap: anywhere;
   }
+  /* S0：与思源正文同排版基线。选择器两级类压过 base.css 的 .b3-typography{font-size:16px}，
+     消息字号设置才能生效；标题/代码/表格在基线里都是 em，随容器缩放。 */
+  .ai-md :global(.b3-typography) {
+    font-size: var(--re-ai-font-size, 14px);
+  }
   .ai-md.is-error {
     color: var(--b3-theme-error, #d23f31);
   }
@@ -3488,7 +3805,7 @@
   .ai-md :global(h3),
   .ai-md :global(h4) {
     margin: 12px 0 6px;
-    font-size: 13.5px;
+    /* 字号不写死：走 b3-typography 的 1.75/1.55/1.38/1.25em，随消息字号缩放 */
     font-weight: 600;
     line-height: 1.4;
   }
@@ -3509,7 +3826,6 @@
   .ai-md :global(table) {
     border-collapse: collapse;
     margin: 8px 0;
-    font-size: 12.5px;
     display: block;
     overflow-x: auto;
   }
@@ -3519,13 +3835,8 @@
     padding: 4px 8px;
     text-align: left;
   }
-  .ai-md :global(code) {
-    padding: 1px 4px;
-    border-radius: 4px;
-    background: var(--b3-theme-surface, rgba(0, 0, 0, 0.05));
-    font-size: 12px;
-    font-family: var(--b3-font-family-code, monospace);
-  }
+  /* 行内 code 的字号/底色/内边距交给 b3-typography 基线（85% + 思源代码底色），
+     这里不再写死 px，保证随消息字号缩放且与文档观感一致 */
   .ai-md :global(pre) {
     position: relative;
     margin: 8px 0;
@@ -3533,7 +3844,9 @@
     border-radius: 8px;
     background: var(--b3-theme-surface, rgba(0, 0, 0, 0.04));
     overflow-x: auto;
-    font-size: 12px;
+    font-size: 0.85em;
+    /* code 带上 .hljs 后不再命中基线的 code:not(.hljs)（那条里有等宽字体），这里补回 */
+    font-family: var(--b3-font-family-code, monospace);
   }
   /* P1：代码块复制按钮由 JS 注入，不能进 Lute 输出 */
   .ai-md :global(.ai-code-copy) {
@@ -3560,9 +3873,32 @@
       opacity: 1;
     }
   }
-  .ai-md :global(pre code) {
+  /* S0：语言标签（JS 注入）左上角悬停显隐，不占代码版面；移动端常显 */
+  .ai-md :global(.ai-code-lang) {
+    position: absolute;
+    top: 6px;
+    left: 10px;
+    font-size: 10.5px;
+    line-height: 1.5;
+    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 0.15s;
+  }
+  .ai-md :global(pre:hover .ai-code-lang) {
+    opacity: 1;
+  }
+  @media (hover: none) {
+    .ai-md :global(.ai-code-lang) {
+      opacity: 1;
+    }
+  }
+  /* 两级类 + 元素，压过基线的 .b3-typography code:not(.hljs)（85%/底色/内边距），
+     代码块内部不再叠一层行内 code 皮肤 */
+  .ai-md :global(.b3-typography pre code) {
     padding: 0;
     background: none;
+    font-size: 100%;
   }
   .ai-md :global(a) {
     color: var(--b3-theme-primary, #378add);
@@ -3575,6 +3911,18 @@
     color: var(--b3-theme-primary, #378add);
     cursor: pointer;
     border-bottom: 1px dashed var(--b3-theme-primary, #378add);
+  }
+  /* S0：公式与图片。块级公式在窄面板里允许横向滚动，不让 KaTeX 撑破气泡 */
+  .ai-md :global(div.language-math) {
+    margin: 8px 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .ai-md :global(img) {
+    max-width: 100%;
+    height: auto;
+    border-radius: 6px;
+    margin: 6px 0;
   }
 
   .ai-foot {
@@ -4891,7 +5239,7 @@
     border-radius: 14px 14px 4px 14px;
     background: var(--re-ai-accent-soft);
     color: var(--re-ai-ink);
-    font-size: 13px;
+    font-size: var(--re-ai-font-size, 14px);
     line-height: 1.65;
   }
   .ai-qchip,

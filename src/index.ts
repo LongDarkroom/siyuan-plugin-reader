@@ -34,6 +34,7 @@ import { initReaderBridge, disposeReaderBridge } from "./ai/reader-bridge.ts";
 // 2026-11-05 AI 页签：把阅读助手提升为思源原生页签（默认跟随活动阅读器）
 import { AiTabController } from "./ai/ai-tab-controller.ts";
 import { AiDockController } from "./ai/ai-dock-controller.ts";
+import { AiSessionIO } from "./ai/panel/ai-session-io.ts";
 import { installConsoleFilter } from "./core/console-filter.ts";
 import { logSwallow } from "./core/safe.ts";
 import { getLogger } from "./core/logger.ts";
@@ -78,6 +79,15 @@ export class ReaderPlugin extends Plugin {
   private aiTabs!: AiTabController;
   /** AI 右栏控制器（思源右侧停靠栏，桌面常驻入口） */
   private aiDock!: AiDockController;
+  /**
+   * AI 会话持久化 IO（2026-11-08 · P0）。
+   *
+   * 懒建：构造时只捕获 this.loadData/this.saveData，不触发任何 IO，
+   * 因此在 onload 同步阶段也能安全被 controller 取到。
+   * 真源是 petal 文件，localStorage 降级为热缓存 —— 桌面端内核端口每次
+   * 重启都会变，origin 随之改变，只写 localStorage 必然丢历史。
+   */
+  private aiSessionIO!: AiSessionIO;
   /** 词典管理（含导入接口） */
   private dictManager!: DictManager;
   /** 翻译宿主（引擎链装配 + 按书缓存 + AI 末端） */
@@ -650,6 +660,31 @@ export class ReaderPlugin extends Plugin {
    * ================================================================ */
   public getAiSettings(): any {
     return this.getTranslateSettings();
+  }
+
+  /**
+   * AI 会话持久化 IO（2026-11-08 · P0）：AI 页签 / 右栏 / 阅读器内嵌面板共用同一实例，
+   * 保证三个面板看到同一份真源，避免「最后写者胜」把对方的历史抹掉。
+   */
+  public getAiSessionIO(): AiSessionIO {
+    if (!this.aiSessionIO) {
+      this.aiSessionIO = new AiSessionIO(
+        {
+          load: (file: string) => this.loadData(file),
+          save: async (file: string, data: unknown) => {
+            await this.saveData(file, data);
+          },
+        },
+        {
+          // 防抖时长走设置项，改完立即生效（不必重启）
+          debounceMs: () => {
+            const n = Math.round(Number(this.getAiSettings()?.sessionSaveThrottleMs));
+            return Number.isFinite(n) && n >= 0 ? Math.min(5000, n) : 800;
+          },
+        },
+      );
+    }
+    return this.aiSessionIO;
   }
 
   public async updateAiSettings(patch: any): Promise<void> {

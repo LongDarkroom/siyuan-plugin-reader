@@ -1,125 +1,172 @@
 <script lang="ts">
   /**
-   * 思维导图渲染（P3-B）
+   * 思维导图卡片（P3-B）
    * ------------------------------------------------------------------
-   * 只做「画」：解析与坐标都在 ai-mindmap.ts（纯逻辑可单测）。
-   * 节点交互：
-   *  - 有子节点 → 点击折叠/展开；
-   *  - 带思源块引用（ref）的叶子 → 点击打开对应块；
-   *  - 有子节点又有 ref → 单击折叠，双击打开引用。
-   * 导图可能比面板宽，容器横向滚动；高度封顶，不把对话顶走。
+   * 只做「卡片外壳 + 状态」：折叠集合、节点计数、复制成思源导图块、放大弹层。
+   * 画布与视口手感在 MindmapCanvas.svelte，解析与坐标在 ai-mindmap.ts。
+   * 放大用思源 Dialog（大窗里看整图比在窄栏里拖来拖去舒服），
+   * 弹层里挂的是同一个画布组件、共用同一份折叠状态。
    */
+  import { onDestroy } from "svelte";
+  import { Dialog } from "siyuan";
   import { t } from "../../i18n/index.ts";
   import {
-    layoutMindmap,
-    type MindmapLayoutNode,
+    countVisibleMindmapNodes,
+    foldMindmapByDepth,
+    mindmapToKramdown,
     type MindmapNode,
   } from "./ai-mindmap.ts";
+  import MindmapCanvas from "./MindmapCanvas.svelte";
 
   export let root: MindmapNode;
   export let onOpenBlock: ((id: string) => void) | undefined = undefined;
 
-  let collapsed: Record<string, true> = {};
+  let collapsed = new Set<string>();
   let lastRoot: MindmapNode | null = null;
+  let copyState: "" | "ok" | "fail" = "";
+  let copyTimer: any = null;
+  let zoom: { dlg: Dialog; canvas: any } | null = null;
 
   $: if (root !== lastRoot) {
     lastRoot = root;
-    collapsed = {};
+    collapsed = new Set();
   }
-  $: collapsedIds = Object.keys(collapsed);
-  $: layout = layoutMindmap(root, { collapsed: collapsedIds });
+  $: collapsedIds = Array.from(collapsed);
+  $: visibleCount = countVisibleMindmapNodes(root, collapsedIds);
   $: hasCollapsed = collapsedIds.length > 0;
+  // 折叠状态改了要同步进放大弹层（那边是同一个组件的第二个实例）
+  $: if (zoom) zoom.canvas.$set({ root, collapsed: collapsedIds });
 
-  function toggle(node: MindmapLayoutNode): void {
-    if (!node.hasChildren) return;
-    const next: Record<string, true> = { ...collapsed };
-    if (next[node.id]) delete next[node.id];
-    else next[node.id] = true;
+  function toggle(id: string): void {
+    const next = new Set(collapsed);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
     collapsed = next;
   }
 
-  function nodeClick(node: MindmapLayoutNode): void {
-    if (node.hasChildren) toggle(node);
-    else if (node.ref) onOpenBlock?.(node.ref);
-  }
-
-  function nodeDblClick(node: MindmapLayoutNode): void {
-    if (node.ref) onOpenBlock?.(node.ref);
-  }
-
-  function nodeKey(e: KeyboardEvent, node: MindmapLayoutNode): void {
-    if (e.key !== "Enter" && e.key !== " ") return;
-    e.preventDefault();
-    nodeClick(node);
+  function foldDepth(depth: number): void {
+    collapsed = new Set(depth > 0 ? foldMindmapByDepth(root, depth) : []);
   }
 
   function expandAll(): void {
-    collapsed = {};
+    collapsed = new Set();
   }
 
-  function nodeTitle(node: MindmapLayoutNode): string {
-    const base = node.text || "";
-    if (node.hasChildren) return `${base}\n${t("点击折叠或展开")}`;
-    if (node.ref) return `${base}\n${t("点击打开引用的块")}`;
-    return base;
+  /** 旧浏览器 / 非安全上下文（局域网 http 访问思源）没有 clipboard API，退回 execCommand */
+  function legacyCopy(text: string): boolean {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      ta.style.opacity = "0";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      return ok;
+    } catch {
+      return false;
+    }
   }
+
+  async function copyMap(): Promise<void> {
+    const text = mindmapToKramdown(root);
+    let ok = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      } else {
+        ok = legacyCopy(text);
+      }
+    } catch {
+      ok = legacyCopy(text);
+    }
+    copyState = ok ? "ok" : "fail";
+    if (copyTimer) clearTimeout(copyTimer);
+    copyTimer = setTimeout(() => (copyState = ""), ok ? 1600 : 3000);
+  }
+
+  function closeZoom(): void {
+    if (!zoom) return;
+    const canvas = zoom.canvas;
+    zoom = null;
+    try {
+      canvas?.$destroy();
+    } catch {
+      /* 组件已随弹层一起销毁 */
+    }
+  }
+
+  function openZoom(): void {
+    if (zoom) return;
+    const dlg = new Dialog({
+      title: `${t("思维导图")} · ${t("放大查看")}`,
+      width: "min(1160px, calc(100vw - 48px))",
+      height: "min(76vh, 760px)",
+      content: `<div class="rw-mm-zoom"></div>`,
+      destroyCallback: () => closeZoom(),
+    });
+    dlg.element.classList.add("re-mm-dialog");
+    const target = dlg.element.querySelector(".rw-mm-zoom") as HTMLElement | null;
+    if (!target) {
+      dlg.destroy();
+      return;
+    }
+    const canvas = new MindmapCanvas({
+      target,
+      props: {
+        root,
+        collapsed: collapsedIds,
+        wide: true,
+        onOpenBlock,
+        onToggle: toggle,
+        onFoldDepth: foldDepth,
+      },
+    });
+    zoom = { dlg, canvas };
+  }
+
+  onDestroy(() => {
+    if (copyTimer) clearTimeout(copyTimer);
+    const dlg = zoom ? zoom.dlg : null;
+    closeZoom();
+    if (dlg) {
+      try {
+        dlg.destroy();
+      } catch {
+        /* 已经关了 */
+      }
+    }
+  });
 </script>
 
 <div class="mm-card">
   <div class="mm-hd">
     <span class="mm-title">{t("思维导图")}</span>
-    <span class="mm-count">{t("{n} 个节点", { n: layout.nodes.length })}</span>
+    <span class="mm-count">{t("{n} 个节点", { n: visibleCount })}</span>
     <span class="mm-spacer"></span>
     {#if hasCollapsed}
       <button class="mm-mini" on:click={expandAll}>{t("展开全部")}</button>
     {/if}
+    <button
+      class="mm-mini copy"
+      class:ok={copyState === "ok"}
+      class:fail={copyState === "fail"}
+      title={t("复制为 Markdown 列表；粘贴进思源文档即成思维导图块")}
+      on:click={copyMap}
+    >{copyState === "ok" ? t("已复制") : copyState === "fail" ? t("复制失败") : t("复制导图")}</button>
   </div>
-  <div class="mm-scroll">
-    <svg
-      class="mm-svg"
-      width={layout.width}
-      height={layout.height}
-      viewBox={`0 0 ${layout.width} ${layout.height}`}
-      role="img"
-      aria-label={t("思维导图")}
-    >
-      {#each layout.edges as edge (edge.from + ">" + edge.to)}
-        <path class="mm-edge" d={edge.d}></path>
-      {/each}
-
-      {#each layout.nodes as node (node.id)}
-        <g
-          class="mm-node"
-          class:root={node.depth === 0}
-          class:collapsed={node.collapsed}
-          class:has-ref={!!node.ref}
-          transform={`translate(${node.x},${node.y})`}
-          role="button"
-          tabindex="0"
-          aria-label={nodeTitle(node)}
-          on:click={() => nodeClick(node)}
-          on:dblclick={() => nodeDblClick(node)}
-          on:keydown={(e) => nodeKey(e, node)}
-        >
-          <title>{nodeTitle(node)}</title>
-          <rect width={node.w} height={node.h} rx="8"></rect>
-          {#each node.lines as line, li (li)}
-            <text class="mm-label" x="10" y={node.lines.length > 1 ? (li === 0 ? 18 : 34) : node.h / 2 + 4}>
-              {line}
-            </text>
-          {/each}
-          {#if node.hasChildren}
-            <circle class="mm-toggle-hit" cx={node.w - 13} cy={node.h / 2} r="8"></circle>
-            <text class="mm-toggle" x={node.w - 13} y={node.h / 2 + 4} text-anchor="middle">
-              {node.collapsed ? "+" : "−"}
-            </text>
-          {:else if node.ref}
-            <text class="mm-open" x={node.w - 13} y={node.h / 2 + 4} text-anchor="middle">↗</text>
-          {/if}
-        </g>
-      {/each}
-    </svg>
-  </div>
+  <MindmapCanvas
+    {root}
+    collapsed={collapsedIds}
+    {onOpenBlock}
+    onToggle={toggle}
+    onFoldDepth={foldDepth}
+    onExpand={openZoom}
+  />
 </div>
 
 <style>
@@ -164,67 +211,17 @@
     border-color: var(--b3-theme-primary, #378add);
     color: var(--b3-theme-primary, #378add);
   }
-  .mm-scroll {
-    overflow: auto;
-    max-height: 340px;
-    overscroll-behavior: contain;
-    scrollbar-width: thin;
+  /* 复制按钮三个状态字数不同（复制导图 / 已复制 / 复制失败），按最长的预留才不会跳 */
+  .mm-mini.copy {
+    min-width: 62px;
+    text-align: center;
   }
-  .mm-svg {
-    display: block;
-    max-width: none;
+  .mm-mini.copy.ok {
+    border-color: var(--b3-theme-success, #67c23a);
+    color: var(--b3-theme-success, #67c23a);
   }
-  .mm-edge {
-    fill: none;
-    stroke: var(--b3-border-color, rgba(0, 0, 0, 0.2));
-    stroke-width: 1.4;
-  }
-  .mm-node {
-    cursor: pointer;
-    outline: none;
-  }
-  .mm-node rect {
-    fill: var(--b3-theme-background, #fff);
-    stroke: var(--b3-border-color, rgba(0, 0, 0, 0.16));
-    stroke-width: 1;
-    transition: stroke 0.12s ease;
-  }
-  .mm-node:hover rect,
-  .mm-node:focus-visible rect {
-    stroke: var(--b3-theme-primary, #378add);
-  }
-  .mm-node.root rect {
-    fill: var(--b3-theme-primary-lightest, rgba(55, 138, 221, 0.1));
-    stroke: var(--b3-theme-primary, #378add);
-  }
-  .mm-node.collapsed rect {
-    stroke-dasharray: 3 2;
-  }
-  .mm-label {
-    fill: var(--b3-theme-on-background, #1f2329);
-    font-size: 12px;
-    font-family: var(--b3-font-family, inherit);
-    pointer-events: none;
-    user-select: none;
-  }
-  .mm-node.has-ref .mm-label {
-    fill: var(--b3-theme-primary, #378add);
-  }
-  .mm-toggle-hit {
-    fill: transparent;
-  }
-  .mm-toggle,
-  .mm-open {
-    fill: var(--b3-theme-on-surface, #6b7280);
-    font-size: 12px;
-    pointer-events: none;
-    user-select: none;
-  }
-  .mm-node.root .mm-toggle {
-    fill: var(--b3-theme-primary, #378add);
-  }
-  .mm-node:hover .mm-toggle,
-  .mm-node:hover .mm-open {
-    fill: var(--b3-theme-primary, #378add);
+  .mm-mini.copy.fail {
+    border-color: var(--b3-theme-error, #e03131);
+    color: var(--b3-theme-error, #e03131);
   }
 </style>

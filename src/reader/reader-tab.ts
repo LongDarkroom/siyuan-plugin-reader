@@ -161,6 +161,8 @@ export class ReaderTabController {
         self.plugin?.checkTranslationCacheHits?.(bookId, texts) ?? Promise.resolve(new Array(texts.length).fill(false)),
       isTranslationConfigured: () => !!self.plugin?.isTranslationConfigured?.(),
       getAiSettings: () => (self.plugin as any)?.getAiSettings?.() ?? null,
+      // 2026-11-08 P0：手机端全屏 AI 面板同样接 petal 真源，避免换端口丢历史
+      sessionIO: (self.plugin as any)?.getAiSessionIO?.() ?? undefined,
       // 2026-11-06：桌面 AI 入口 → 思源右侧停靠栏（手机端 ReaderView 走全屏浮层）
       onOpenAiDock: (bid: string) => (self.plugin as any)?.openAiDock?.(bid),
       // 2026-11-06：划词「问 AI」优先投到已打开的 AI 页签，否则打开右栏并带入选段
@@ -333,6 +335,29 @@ export class ReaderTabController {
       bookId,
       title: rec.title || "",
     }));
+  }
+
+  /**
+   * 取一本书的书架元数据（2026-11-08 · AI 右栏「最近聊过的书」）。
+   *
+   * 会话索引只存 bookId，而空态列表需要可读的书名；已关闭的书不在
+   * openTabs 里，只能查书架。书架未加载完时返回 null，调用方退回 bookId。
+   */
+  getBookMeta(bookId: string): { title: string; author: string; format: string } | null {
+    const id = String(bookId || "").trim();
+    if (!id) return null;
+    try {
+      const meta = this.stores.store.get(id);
+      if (!meta) return null;
+      return {
+        title: String(meta.title || ""),
+        author: String(meta.author || ""),
+        format: String(meta.format || ""),
+      };
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "reader-tab.ts · getBookMeta", "debug");
+      return null;
+    }
   }
 
   /** 打开一本书的阅读 Tab；已打开则聚焦（不重复开），未打开则新建并激活 */

@@ -82,6 +82,20 @@ export function buildSessionMarkdown(session: AiChatSession, meta: SessionExport
     out.push(...quoteBlock(m));
     const content = String(m.content || "").trim();
     if (content) out.push(content, "");
+    const reasoning = String(m.reasoning || "").trim();
+    if (reasoning) {
+      out.push("<details><summary>思考过程</summary>", "", reasoning, "", "</details>", "");
+    }
+    const ctx = m.context;
+    if (ctx) {
+      const parts: string[] = [];
+      if (ctx.scope) parts.push(`范围：${ctx.scope}`);
+      if (ctx.chapterTitle) parts.push(`章节：${ctx.chapterTitle}`);
+      if (ctx.page && ctx.totalPages) parts.push(`页码：${ctx.page}/${ctx.totalPages}`);
+      if (ctx.chars) parts.push(`引用字数：${ctx.chars}`);
+      if (ctx.knowledgeTitle) parts.push(`知识区：${ctx.knowledgeTitle}`);
+      if (parts.length) out.push(`> 上下文：${parts.join(" · ")}`, "");
+    }
     if (m.error) out.push(m.errorText ? `> 请求失败：${m.errorText}` : "> 请求失败", "");
     if (m.aborted) out.push("> 生成已停止", "");
     if (m.tools?.length) {

@@ -2006,3 +2006,33 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
   background: transparent;
   color: var(--b3-theme-on-surface, #6b7280);
 }
+
+/* ------------------------------------------------------------------
+ * 思维导图「放大查看」弹层（AiMindmap → 思源 Dialog）
+ * 宿主的 .b3-dialog__container 没有 max-height、整层不滚动，超高会上下一起被切；
+ * 内容现行挂 __body（老版本是 __content），两代选择器都收；滚动交给画布自己。
+ * ------------------------------------------------------------------ */
+.re-mm-dialog .b3-dialog__container {
+  max-width: calc(100vw - 48px);
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
+  overflow: hidden;
+}
+.re-mm-dialog .b3-dialog__body,
+.re-mm-dialog .b3-dialog__content {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+.re-mm-dialog .rw-mm-zoom {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--b3-theme-background, #fff);
+  color: var(--b3-theme-on-background, #1f2329);
+  font-family: var(--b3-font-family, -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif);
+}

@@ -51,7 +51,29 @@ export interface AiSessionState {
   version: 1;
   activeId: string;
   sessions: AiChatSession[];
+  /**
+   * 单调递增修订号（2026-11-08 P0）：跨 origin 的 petal 真源与
+   * localStorage 热缓存对账时，用 rev 大者胜；缺省视为 0。
+   */
+  rev?: number;
+  /**
+   * 墓碑（2026-11-08 P0）：被显式删除的会话 id → 删除时间戳。
+   * 合并时忽略墓碑中的会话，防止另一实例把已删会话写回来；保留 30 天。
+   */
+  deleted?: Record<string, number>;
 }
+
+/** 会话状态的可比较摘要：用于缩水守卫、索引与诊断 */
+export interface AiSessionMeta {
+  sessionCount: number;
+  messageCount: number;
+  chars: number;
+  rev: number;
+  updatedAt: number;
+}
+
+/** 墓碑保留天数：超期后从 deleted 中清除，避免无限增长 */
+export const TOMBSTONE_KEEP_DAYS = 30;
 
 export interface AiSessionNote {
   note: AiChatNoteReceipt;
@@ -214,7 +236,28 @@ export function normalizeSessionState(raw: any, now = Date.now()): AiSessionStat
   const sessions = limitSessions(out);
   const wanted = typeof src.activeId === "string" ? src.activeId : "";
   const activeId = sessions.some((s) => s.id === wanted) ? wanted : (sessions[0]?.id || "");
-  return { version: 1, activeId, sessions };
+  const state: AiSessionState = { version: 1, activeId, sessions };
+  // rev / 墓碑：跨 origin 对账与删除同步用（2026-11-08 P0）
+  const rev = Math.round(Number(src.rev));
+  if (Number.isFinite(rev) && rev > 0) state.rev = rev;
+  const deleted = normalizeDeleted(src.deleted);
+  if (deleted) state.deleted = deleted;
+  return state;
+}
+
+/** 墓碑归一：只保留「非空 id → 正时间戳」的条目 */
+function normalizeDeleted(raw: any): Record<string, number> | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const out: Record<string, number> = {};
+  let count = 0;
+  for (const [k, v] of Object.entries(raw)) {
+    const id = String(k || "").trim();
+    const at = Math.round(Number(v));
+    if (!id || !Number.isFinite(at) || at <= 0) continue;
+    out[id] = at;
+    if (++count >= 500) break;
+  }
+  return count ? out : undefined;
 }
 
 function stateChars(state: AiSessionState): number {
@@ -232,6 +275,8 @@ export function trimSessionState(state: AiSessionState): AiSessionState {
     activeId: state.activeId,
     sessions: state.sessions.map((s) => ({ ...s, messages: s.messages.slice() })),
   };
+  if (state.rev) next.rev = state.rev;
+  if (state.deleted) next.deleted = { ...state.deleted };
   let chars = stateChars(next);
   while (chars > MAX_SESSION_STORAGE_CHARS) {
     const candidates = next.sessions.filter((s) => s.id !== next.activeId && !s.pinned);
@@ -299,7 +344,11 @@ export function withActiveSession(state: AiSessionState, id: string): AiSessionS
 export function removeSession(state: AiSessionState, id: string): AiSessionState {
   const sessions = state.sessions.filter((s) => s.id !== id);
   const activeId = state.activeId === id ? (sessions[0]?.id || "") : state.activeId;
-  return { version: 1, activeId, sessions };
+  const next: AiSessionState = { version: 1, activeId, sessions };
+  // rev / 墓碑必须随状态一起走，否则跨 origin 对账会把删除「忘掉」
+  if (state.rev) next.rev = state.rev;
+  if (state.deleted) next.deleted = { ...state.deleted };
+  return next;
 }
 
 /** 按保留天数清理超期会话（置顶不受影响）；0/非法 = 永久，无变化时原样返回 */
@@ -310,7 +359,10 @@ export function pruneSessionsByAge(state: AiSessionState, days: number, now = Da
   const sessions = state.sessions.filter((s) => s.pinned || Number(s.updatedAt) >= cutoff);
   if (sessions.length === state.sessions.length) return state;
   const activeId = sessions.some((s) => s.id === state.activeId) ? state.activeId : (sessions[0]?.id || "");
-  return { version: 1, activeId, sessions };
+  const next: AiSessionState = { version: 1, activeId, sessions };
+  if (state.rev) next.rev = state.rev;
+  if (state.deleted) next.deleted = { ...state.deleted };
+  return next;
 }
 
 export function upsertSession(state: AiSessionState, session: AiChatSession): AiSessionState {
@@ -366,4 +418,91 @@ export function sessionClock(at: number): string {
   if (!Number.isFinite(d.getTime())) return "";
   const pad = (n: number) => String(n).padStart(2, "0");
   return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/* ------------------------------------------------------------------ *
+ * 跨 origin 对账支持（2026-11-08 · P0 会话迁 petal）
+ * ------------------------------------------------------------------ */
+
+/** 递增修订号：每次落盘前 +1，用于判断磁盘态与内存态谁更新 */
+export function bumpRev(state: AiSessionState): AiSessionState {
+  const rev = Math.max(0, Math.round(Number(state.rev) || 0)) + 1;
+  return { ...state, rev };
+}
+
+/** 状态摘要：会话数 / 消息总数 / JSON 字符数 / rev / 最近更新时间 */
+export function stateMeta(state: AiSessionState | null | undefined): AiSessionMeta {
+  const sessions = state?.sessions || [];
+  let messageCount = 0;
+  let updatedAt = 0;
+  for (const s of sessions) {
+    messageCount += s.messages?.length || 0;
+    if (Number(s.updatedAt) > updatedAt) updatedAt = Number(s.updatedAt);
+  }
+  return {
+    sessionCount: sessions.length,
+    messageCount,
+    chars: state ? stateChars(state) : 0,
+    rev: Math.max(0, Math.round(Number(state?.rev) || 0)),
+    updatedAt,
+  };
+}
+
+/**
+ * 合并两份状态（会话粒度 LWW + 墓碑 + activeId 最近操作为准）。
+ *
+ * 用途：localStorage 热缓存与 petal 磁盘态对账、缩水守卫的补救。
+ * 规则：
+ *  - 同 id 会话取 updatedAt 较新的一份；
+ *  - `deleted` 里的 id 一律丢弃（墓碑优先于任何一方的内容）；
+ *  - activeId 取 updatedAt 较新一方中存在的那条；
+ *  - rev 取两者最大值（不额外 +1，由调用方的 bumpRev 负责）。
+ */
+export function mergeSessionStates(
+  a: AiSessionState | null | undefined,
+  b: AiSessionState | null | undefined,
+  now = Date.now(),
+): AiSessionState {
+  const left = normalizeSessionState(a, now);
+  const right = normalizeSessionState(b, now);
+  const deleted: Record<string, number> = { ...(right.deleted || {}), ...(left.deleted || {}) };
+  for (const [id, at] of Object.entries(right.deleted || {})) {
+    // 同一 id 取更早的删除时间，代表「先被删」这一事实
+    const prev = deleted[id];
+    if (!prev || at < prev) deleted[id] = at;
+  }
+
+  const byId = new Map<string, AiChatSession>();
+  for (const s of [...left.sessions, ...right.sessions]) {
+    if (deleted[s.id]) continue;
+    const exist = byId.get(s.id);
+    if (!exist || Number(s.updatedAt) > Number(exist.updatedAt)) byId.set(s.id, s);
+  }
+  const sessions = Array.from(byId.values()).sort((x, y) => y.updatedAt - x.updatedAt);
+
+  const preferLeft = Number(left.sessions.find((s) => s.id === left.activeId)?.updatedAt || 0)
+    >= Number(right.sessions.find((s) => s.id === right.activeId)?.updatedAt || 0);
+  const wanted = preferLeft ? left.activeId : right.activeId;
+  const activeId = sessions.some((s) => s.id === wanted) ? wanted : (sessions[0]?.id || "");
+
+  const out: AiSessionState = { version: 1, activeId, sessions };
+  const rev = Math.max(Math.round(Number(left.rev) || 0), Math.round(Number(right.rev) || 0));
+  if (rev > 0) out.rev = rev;
+  if (Object.keys(deleted).length) out.deleted = deleted;
+  return out;
+}
+
+/** 清掉超过保留期的墓碑，避免 deleted 无限膨胀 */
+export function pruneSessionTombstones(state: AiSessionState, now = Date.now()): AiSessionState {
+  const deleted = state.deleted;
+  if (!deleted) return state;
+  const cutoff = now - TOMBSTONE_KEEP_DAYS * 86400000;
+  const kept: Record<string, number> = {};
+  for (const [id, at] of Object.entries(deleted)) {
+    if (Number(at) >= cutoff) kept[id] = at;
+  }
+  const next: AiSessionState = { ...state };
+  if (Object.keys(kept).length) next.deleted = kept;
+  else delete next.deleted;
+  return next;
 }
