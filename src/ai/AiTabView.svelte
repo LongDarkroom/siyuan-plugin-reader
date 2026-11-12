@@ -355,6 +355,7 @@
       readKnowledge={host.readKnowledge}
       resolveNoteTarget={host.resolveNoteTarget}
       writeNotePlan={host.writeNotePlan}
+      applyAnnotations={host.applyAnnotations}
       getPrimer={host.getPrimer}
       onLocate={host.onLocate}
       sessionIO={sessionIO}

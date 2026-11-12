@@ -56,6 +56,20 @@
     type ReaderToolHost,
   } from "./ai-reader-tools.ts";
   import {
+    AI_TOOLS,
+    buildToolPrompt,
+    effectiveToolIds,
+    hideAnnotationFence,
+    loadSessionTools,
+    normalizeToolIds,
+    parseAnnotationDraft,
+    saveSessionTools,
+    stripAnnotationFence,
+    toggleToolId,
+    type AiToolId,
+    type AnnotationDraftItem,
+  } from "./ai-tools.ts";
+  import {
     MAX_RANGE_CHAPTERS,
     buildTocPrompt,
     isSectionInRange,
@@ -219,6 +233,14 @@
   export let resolveNoteTarget: (() => Promise<NoteTargetInfo>) | undefined = undefined;
   /** 把确认过的笔记方案追加到思源（宿主 → probeDoc + appendBlock） */
   export let writeNotePlan: ((plan: NotePlan) => Promise<NoteWriteResult>) | undefined = undefined;
+  /**
+   * 批注草稿：定位预演（dryRun=true）与落库（dryRun=false）走同一个宿主方法，
+   * 与内核 MCP 工具 reader_annotate 共用 ReaderView.applyAiAnnotations。
+   * 缺省则不显示「批注草稿」工具。
+   */
+  export let applyAnnotations:
+    | ((items: unknown, opts?: { dryRun?: boolean; sectionIndex?: number }) => Promise<any>)
+    | undefined = undefined;
   /** 收起面板（宿主自己决定卸载/隐藏） */
   export let onClose: (() => void) | undefined = undefined;
   /** 在思源页签中打开（仅右侧停靠时提供；页签内不传） */
@@ -293,17 +315,34 @@
   $: hasBook = !general && !!sessionBookId;
   /** 是否真的附加正文/章节上下文：有书 + 未关闭读上下文 */
   $: readCtx = hasBook && readContext;
-  /** 历史浮卡：全部/置顶筛选 + 标题/正文搜索 */
+  /** 当前环境真正生效的工具：没开阅读器时批注自动跳过 */
+  $: liveTools = effectiveToolIds(activeTools, readCtx).filter((id) => id !== "annotate" || !!applyAnnotations);
+  /** 换会话就换成那一次的勾选（会话内记忆，不改写全局偏好） */
+  $: {
+    const id = String(sessionState.activeId || "");
+    if (id !== toolsSessionId) {
+      toolsSessionId = id;
+      activeTools = loadSessionTools(storage(), id);
+      toolsMenu = false;
+      annotationDraft = null;
+      annError = "";
+    }
+  }
+  /** 历史浮卡：搜索 + 置顶排序（不再做「全部/置顶」筛选） */
   let showHistory = false;
   let historyQuery = "";
-  let historyFilter: "all" | "pinned" = "all";
-  let historyToolsOpen = false;
   let historyTop = 58;
   let historyMaxH = 480;
+  let historyW = 340;
+  let historyCaretX = 24;
+  /** 管理态：勾选后批量删除；「清空全部」也只在这里出现 */
+  let manageMode = false;
+  let historySel: Set<string> = new Set();
   let panelEl: HTMLElement | undefined = undefined;
   let headerEl: HTMLElement | undefined = undefined;
   let historyEl: HTMLDivElement | undefined = undefined;
   let historyBtnEl: HTMLButtonElement | undefined = undefined;
+  let historySearchEl: HTMLInputElement | undefined = undefined;
   /** P1：会话操作菜单 / 内联重命名 */
   let historyMenu = "";
   let renamingId = "";
@@ -360,6 +399,23 @@
   let notePlanBusyId = "";
   let notePlanError = "";
   let noteWriteBusy = false;
+
+  /* ---------- 本轮工具（输入框上方一行） ---------- */
+  let toolsMenu = false;
+  let activeTools: AiToolId[] = [];
+  let toolsSessionId = "";
+  /** 批注草稿：AI 给的 quote 已做完定位预演，等用户确认才落库 */
+  let annotationDraft: {
+    messageId: string;
+    items: AnnotationDraftItem[];
+    preview: any;
+    /** 预演命中的章节：提交时带上，翻章后写入会被后端拒绝 */
+    sectionIndex?: number;
+  } | null = null;
+  let annWriteBusy = false;
+  let annError = "";
+  /** 助手消息的「更多」菜单：同一时间只开一条 */
+  let msgMenuId = "";
 
   /* ---------- P3：思维导图 / 悬浮预览 ---------- */
   type RenderSegment = { kind: "html"; html: string } | { kind: "mindmap"; root: MindmapNode };
@@ -426,6 +482,10 @@
     cancelEdit();
     notePlan = null;
     notePlanError = "";
+    annotationDraft = null;
+    annError = "";
+    toolsMenu = false;
+    msgMenuId = "";
     mindmapView = null;
     hidePreview();
     readRange = null;
@@ -495,7 +555,6 @@
     knowledgeOn = !!knowledge;
     showHistory = false;
     historyQuery = "";
-    historyToolsOpen = false;
     resetTransientUi();
     composer?.clear?.();
   }
@@ -714,7 +773,8 @@
   }
 
   function shownContent(m: AiChatMessage): string {
-    return streaming && m.id === streamMsgId ? streamText : m.content;
+    const raw = streaming && m.id === streamMsgId ? streamText : m.content;
+    return raw.includes("```re-annotations") ? hideAnnotationFence(raw) : raw;
   }
 
   function shownReasoning(m: AiChatMessage): string {
@@ -788,6 +848,8 @@
     notice = "";
     notePlan = null;
     notePlanError = "";
+    annotationDraft = null;
+    annError = "";
     mindmapView = null;
     showToc = false;
     hidePreview();
@@ -1132,6 +1194,10 @@
     const quote = userMsg.quote || null;
     const requestedScope = normalizeTurnScope(userMsg.scope);
     const effectiveKnowledge = userMsg.useKnowledge === false ? null : knowledge;
+    // 本轮工具在开始时就定格：流式途中再勾选/取消只影响下一轮
+    const turnTools = liveTools.slice();
+    const annotateOn = turnTools.includes("annotate") && !!applyAnnotations;
+    const noteDraftOn = turnTools.includes("note");
 
     streamMsgId = assistant.id;
     streamText = "";
@@ -1284,6 +1350,9 @@
       }
     }
     if (toolDefs.length) systemPrompt += "\n\n" + READER_TOOLS_PROMPT;
+    // 2.2) 本轮工具（导图 / 批注 / 笔记）：只约束输出形态，不新增调用通道
+    const toolPrompt = buildToolPrompt(turnTools);
+    if (toolPrompt) systemPrompt += "\n\n" + toolPrompt;
 
     // 2.5) 知识区：用户选定的思源笔记作为背景资料（读取失败不阻断问答）
     if (effectiveKnowledge) {
@@ -1445,7 +1514,11 @@
     flushNow();
 
     // 4) 收尾：保留已生成的部分内容，错误也落进消息里（可复制/重试）
-    const finalText = String(tokenBuf || res?.content || "");
+    const rawText = String(tokenBuf || res?.content || "");
+    // 批注草稿围栏只给面板消费：从正文里剥掉（含模型半截截断的围栏），解析结果交给确认卡
+    const hadAnnotationFence = rawText.includes("```re-annotations");
+    const draftParse = annotateOn ? parseAnnotationDraft(rawText) : { found: false, items: [] as AnnotationDraftItem[] };
+    const finalText = hadAnnotationFence ? stripAnnotationFence(rawText) : rawText;
     const done: AiChatMessage = { ...assistant, content: finalText };
     if (usageTotal) done.usage = usageTotal;
     const reasoning = String(reasonBuf || res?.reasoning || "");
@@ -1502,6 +1575,24 @@
     persistChat();
     void autoScroll();
 
+    if (draftParse.items.length) {
+      void previewAnnotations(assistant.id, draftParse.items);
+    } else if (annotateOn && draftParse.found) {
+      const msg = t("批注草稿格式无法解析，本轮已跳过");
+      notice = notice ? `${notice}；${msg}` : msg;
+    }
+    // 笔记草稿：回答成功后自动整理方案；批注草稿已占预览位时不抢
+    if (
+      noteDraftOn &&
+      res?.ok &&
+      !res?.aborted &&
+      !done.error &&
+      finalText.trim() &&
+      !draftParse.items.length
+    ) {
+      void proposeNote(done);
+    }
+
     if (!res?.ok) {
       getLogger().warn("[阅读助手] 请求失败", { error: res?.error, tools: useTools });
     }
@@ -1512,11 +1603,7 @@
     discardActiveTurn();
     persistChat();
     const active = activeSessionOf(sessionState);
-    showHistory = false;
-    historyQuery = "";
-    historyMenu = "";
-    historyToolsOpen = false;
-    cancelRename();
+    resetHistoryUi({ close: true, clearQuery: true });
     // 当前就是空会话：别再叠一条「新对话」，只清输入
     if (active && !active.messages.length) {
       composer?.clear?.();
@@ -1547,11 +1634,7 @@
     sessionState = saveStateFor(sessionBookId, withActiveSession(sessionState, id));
     const active = activeSessionOf(sessionState);
     messages = active ? active.messages.slice() : [];
-    showHistory = false;
-    historyQuery = "";
-    historyMenu = "";
-    historyToolsOpen = false;
-    cancelRename();
+    resetHistoryUi({ close: true, clearQuery: true });
     composer?.clear?.();
     resetTransientUi();
     void tick().then(() => autoScroll(true));
@@ -1590,27 +1673,26 @@
       { explicit: true, removedIds },
     );
     messages = [];
-    showHistory = false;
-    historyQuery = "";
-    historyMenu = "";
-    historyToolsOpen = false;
-    cancelRename();
+    resetHistoryUi({ close: true, clearQuery: true });
     composer?.clear?.();
     resetTransientUi();
   }
 
   /** 平铺列表：置顶优先 + 最近更新；搜索覆盖标题、预览与全部消息正文 */
-  function historyList(): AiChatSession[] {
-    const q = historyQuery.trim().toLowerCase();
+  function historyList(
+    list: AiChatSession[] = sessionState.sessions,
+    query: string = historyQuery,
+  ): AiChatSession[] {
+    const q = query.trim().toLowerCase();
     return sortSessionsForHistory(
-      sessionState.sessions.filter((s) => {
-        if (historyFilter === "pinned" && !s.pinned) return false;
+      list.filter((s) => {
         if (!q) return true;
         const hay = [s.title, sessionPreview(s, 200), ...s.messages.map((m) => m.content)].join("\n").toLowerCase();
         return hay.includes(q);
       }),
     );
   }
+  $: historyRows = historyList(sessionState.sessions, historyQuery);
 
   /** 行内时间：今天/昨天带时分，更早只给月日（列表本身已按时间倒序） */
   function historyTimeLabel(at: number): string {
@@ -1625,12 +1707,31 @@
     }
   }
 
+  /** 气泡浮卡右对齐到面板边缘，啾啾对准历史按钮中心 */
   function measureHistory(): void {
     if (!showHistory || !panelEl || !headerEl) return;
     const pr = panelEl.getBoundingClientRect();
     const hr = headerEl.getBoundingClientRect();
+    historyW = Math.max(240, Math.min(340, Math.round(pr.width - 16)));
     historyTop = Math.max(0, Math.round(hr.bottom - pr.top + 6));
-    historyMaxH = Math.max(200, Math.round(pr.height - historyTop - 8));
+    historyMaxH = Math.max(200, Math.round(pr.height - historyTop - 10));
+    const popLeft = pr.width - 8 - historyW;
+    const br = historyBtnEl?.getBoundingClientRect();
+    const center = br ? br.left + br.width / 2 - pr.left : popLeft + historyW - 26;
+    historyCaretX = Math.round(Math.min(historyW - 18, Math.max(18, center - popLeft)));
+  }
+
+  /**
+   * 统一收掉历史浮卡的临时态：菜单/重命名/管理态。
+   * 关闭浮卡时保留搜索词，重进还能接着看；新建或切换会话才清空。
+   */
+  function resetHistoryUi(opts: { close?: boolean; clearQuery?: boolean } = {}): void {
+    if (opts.close) showHistory = false;
+    if (opts.clearQuery) historyQuery = "";
+    historyMenu = "";
+    manageMode = false;
+    historySel = new Set();
+    cancelRename();
   }
 
   async function toggleHistory(): Promise<void> {
@@ -1639,33 +1740,81 @@
       return;
     }
     tab = "chat";
+    resetHistoryUi();
     showHistory = true;
-    historyMenu = "";
-    historyToolsOpen = false;
     await tick();
     measureHistory();
-    historyEl?.focus();
+    historySearchEl?.focus();
   }
 
   function closeHistory(restoreFocus = true): void {
     if (!showHistory) return;
     const hadFocus = !!historyEl && typeof document !== "undefined" && historyEl.contains(document.activeElement);
-    showHistory = false;
-    historyMenu = "";
-    historyToolsOpen = false;
-    cancelRename();
+    resetHistoryUi({ close: true });
     if (restoreFocus && hadFocus) void tick().then(() => historyBtnEl?.focus());
   }
 
-  function setHistoryFilter(next: "all" | "pinned"): void {
-    if (historyFilter === next) return;
-    historyFilter = next;
+  function enterManage(): void {
     historyMenu = "";
     cancelRename();
+    manageMode = true;
+    historySel = new Set();
+  }
+
+  function exitManage(): void {
+    manageMode = false;
+    historySel = new Set();
+  }
+
+  function toggleHistorySel(id: string): void {
+    const next = new Set(historySel);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    historySel = next;
+  }
+
+  function selectAllHistory(): void {
+    const ids = historyList().map((s) => s.id);
+    historySel = ids.length && historySel.size === ids.length ? new Set() : new Set(ids);
+  }
+
+  function deleteSelectedSessions(): void {
+    const ids = Array.from(historySel);
+    if (!ids.length) return;
+    if (!confirm(t("删除选中的 {n} 个会话？只删除本机记录，不影响已写入的思源笔记。", { n: ids.length }))) return;
+    discardActiveTurn();
+    const wasActive = ids.includes(sessionState.activeId);
+    let next: AiSessionState = sessionState;
+    for (const id of ids) next = removeSession(next, id);
+    if (!next.sessions.length) {
+      const fresh = createSession([]);
+      next = { version: 1, activeId: fresh.id, sessions: [fresh] };
+    }
+    // 显式删除：跳过缩水守卫，并写入墓碑防止另一实例把已删会话写回来
+    sessionState = saveStateFor(sessionBookId, next, { explicit: true, removedIds: ids });
+    manageMode = false;
+    historySel = new Set();
+    if (wasActive) {
+      const active = activeSessionOf(sessionState);
+      messages = active ? active.messages.slice() : [];
+      composer?.clear?.();
+      resetTransientUi();
+      void tick().then(() => autoScroll(true));
+    }
   }
 
   function onHistoryKey(e: KeyboardEvent): void {
-    if (!showHistory || e.key !== "Escape") return;
+    if (!showHistory) return;
+    if ((e.key === "ArrowDown" || e.key === "ArrowUp") && !renamingId && !historyMenu) {
+      const rows = Array.from(historyEl?.querySelectorAll<HTMLElement>(".ai-history-main") || []);
+      if (!rows.length) return;
+      e.preventDefault();
+      const idx = rows.indexOf(document.activeElement as HTMLElement);
+      const next = e.key === "ArrowDown" ? Math.min(rows.length - 1, idx + 1) : Math.max(0, idx - 1);
+      rows[next]?.focus();
+      return;
+    }
+    if (e.key !== "Escape") return;
     if (renamingId) {
       e.preventDefault();
       cancelRename();
@@ -1676,9 +1825,9 @@
       historyMenu = "";
       return;
     }
-    if (historyToolsOpen) {
+    if (manageMode) {
       e.preventDefault();
-      historyToolsOpen = false;
+      exitManage();
       return;
     }
     e.preventDefault();
@@ -1815,17 +1964,29 @@
     }
   }
 
+  /**
+   * 判定点击是否落在某个容器里。
+   * 必须走 composedPath：点击会同步重渲染（如「管理」切换头部），
+   * 冒泡到 window 时 e.target 已脱离文档，closest 会误判成「点在外面」。
+   */
+  function clickIn(e: MouseEvent, selector: string): boolean {
+    for (const node of e.composedPath()) {
+      if (node instanceof Element && node.matches(selector)) return true;
+    }
+    return false;
+  }
+
   function onWindowClick(e: MouseEvent): void {
     const el = e.target as HTMLElement | null;
     if (showToc && !el?.closest?.(".ai-ctx-wrap")) showToc = false;
-    if (showHistory && !el?.closest?.(".ai-history, .ai-history-btn")) closeHistory();
-    if (historyToolsOpen && !el?.closest?.(".ai-history-tools")) historyToolsOpen = false;
+    if (showHistory && !clickIn(e, ".ai-history, .ai-history-btn")) closeHistory();
     if (historyMenu && !el?.closest?.(".ai-history-menu, .ai-history-more")) historyMenu = "";
+    if (toolsMenu && !el?.closest?.(".ai-tool-wrap, .ai-tool-pop")) toolsMenu = false;
+    if (msgMenuId && !el?.closest?.(".ai-msg-menu-wrap")) msgMenuId = "";
     if (!modelMenu) return;
     if (el?.closest?.(".ai-model-pop, .ai-model-pill")) return;
     modelMenu = false;
   }
-
   async function copyMessage(m: AiChatMessage): Promise<void> {
     const text = String(m.content || "").trim();
     if (!text) return;
@@ -2097,6 +2258,123 @@
     knowledgeOn = !knowledgeOn;
   }
 
+  /* ============================ 本轮工具 ============================ */
+
+  function toolDefOf(id: AiToolId) {
+    return AI_TOOLS.find((d) => d.id === id) || null;
+  }
+
+  /** 工具是否在当前环境不可用（没开阅读器时的批注） */
+  function toolBlocked(id: AiToolId): boolean {
+    const def = toolDefOf(id);
+    if (!def) return true;
+    if (def.needsReader && !readCtx) return true;
+    if (id === "annotate" && !applyAnnotations) return true;
+    return false;
+  }
+
+  function toolBlockedReason(id: AiToolId): string {
+    if (id === "annotate" && readCtx && !applyAnnotations) return t("当前阅读器不支持批注写入");
+    return t("需要打开一本书，并读到当前章节");
+  }
+
+  function persistTools(): void {
+    saveSessionTools(storage(), toolsSessionId, activeTools);
+  }
+
+  function toggleTool(id: AiToolId): void {
+    const def = toolDefOf(id);
+    if (!def) return;
+    if (toolBlocked(id)) {
+      notice = toolBlockedReason(id);
+      return;
+    }
+    const wasOn = activeTools.includes(id);
+    activeTools = toggleToolId(activeTools, id);
+    persistTools();
+    if (wasOn && id === "annotate") {
+      annotationDraft = null;
+      annError = "";
+    }
+  }
+
+  function removeTool(id: AiToolId): void {
+    if (!activeTools.includes(id)) return;
+    activeTools = toggleToolId(activeTools, id, false);
+    persistTools();
+    if (id === "annotate") {
+      annotationDraft = null;
+      annError = "";
+    }
+  }
+
+  /** 后端错误码 → 用户能看懂的一句话 */
+  function annotationErrorText(res: any): string {
+    const code = String(res?.error || "");
+    if (code === "unsupported_format") return t("当前格式不支持批注（仅 EPUB/MOBI/AZW3/FB2/TXT/MD）");
+    if (code === "no_chapter") return t("还没定位到当前章节，无法写入批注");
+    if (code === "section_not_active") return t("你已经翻到别的章节，回到写入时那一章再试");
+    if (code === "invalid_args") return t("批注草稿为空");
+    return code ? t("批注定位失败：{why}", { why: code }) : t("批注定位失败");
+  }
+
+  /**
+   * 批注草稿预演：只定位、不落库。结果留给确认卡；
+   * 用户点「写入批注」才以 dryRun=false 再走一遍同一个宿主方法。
+   */
+  async function previewAnnotations(messageId: string, items: AnnotationDraftItem[]): Promise<void> {
+    if (!applyAnnotations || !items.length) return;
+    notePlan = null;
+    notePlanError = "";
+    mindmapView = null;
+    annotationDraft = null;
+    annError = "";
+    try {
+      const res = await applyAnnotations(items, { dryRun: true });
+      const sectionIndex = Number.isFinite(Number(res?.sectionIndex)) ? Number(res.sectionIndex) : undefined;
+      annotationDraft = { messageId, items, preview: res, sectionIndex };
+      if (!res || res.ok === false) annError = annotationErrorText(res);
+    } catch (e: any) {
+      annotationDraft = { messageId, items, preview: null };
+      annError = e?.message || t("批注定位失败");
+    }
+  }
+
+  async function commitAnnotations(): Promise<void> {
+    const draft = annotationDraft;
+    if (!draft || annWriteBusy) return;
+    if (!applyAnnotations) {
+      annError = t("批注写入未就绪");
+      return;
+    }
+    annWriteBusy = true;
+    annError = "";
+    try {
+      const res = await applyAnnotations(draft.items, {
+        dryRun: false,
+        sectionIndex: draft.sectionIndex,
+      });
+      if (!res || res.ok === false) throw new Error(annotationErrorText(res));
+      const total = Number(res.total) || draft.items.length;
+      const okCount = Number(res.okCount) || 0;
+      if (!okCount) throw new Error(t("没有可写入的批注，原文可能已变化"));
+      annotationDraft = null;
+      notice = okCount < total
+        ? t("已写入 {ok} 条批注，跳过 {skip} 条未定位", { ok: okCount, skip: total - okCount })
+        : t("已写入 {n} 条批注", { n: okCount });
+    } catch (e: any) {
+      annError = e?.message || String(e);
+    } finally {
+      annWriteBusy = false;
+    }
+  }
+
+  /** 确认卡上的定位次数：按预演结果算可写条数 */
+  function annotationOkCount(): number {
+    const p = annotationDraft?.preview;
+    return p && p.ok !== false ? Number(p.okCount) || 0 : 0;
+  }
+
   /* ============================ 笔记方案（预览优先） ============================ */
 
   /** 这条助手回答对应的用户问题与选段（笔记来源行用） */
@@ -2125,6 +2403,8 @@
     notePlanError = "";
     notePlanBusyId = m.id;
     notePlan = null;
+    annotationDraft = null;
+    annError = "";
     mindmapView = null;
     hidePreview();
     try {
@@ -2475,50 +2755,30 @@
       aria-label={t("历史会话")}
       tabindex="-1"
       bind:this={historyEl}
-      style={`top:${historyTop}px;max-height:${historyMaxH}px`}
+      style={`top:${historyTop}px;max-height:${historyMaxH}px;width:${historyW}px`}
     >
+      <span class="ai-history-caret" style={`left:${historyCaretX}px`} aria-hidden="true"></span>
       <div class="ai-history-hd">
-        <div class="ai-history-tabs" role="tablist" aria-label={t("会话筛选")}>
-          <button
-            class="ai-history-tab"
-            class:on={historyFilter === "all"}
-            role="tab"
-            aria-selected={historyFilter === "all"}
-            on:click={() => setHistoryFilter("all")}
-          >{t("全部")}</button>
-          <button
-            class="ai-history-tab"
-            class:on={historyFilter === "pinned"}
-            role="tab"
-            aria-selected={historyFilter === "pinned"}
-            on:click={() => setHistoryFilter("pinned")}
-          >{t("置顶")}</button>
-        </div>
-        <div class="ai-history-tools">
-          <button
-            class="ai-history-tools-btn"
-            title={t("清空全部")}
-            aria-label={t("清空全部")}
-            aria-haspopup="menu"
-            aria-expanded={historyToolsOpen}
-            on:click={() => (historyToolsOpen = !historyToolsOpen)}
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="M4 7h16M4 12h16M4 17h16" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" />
-            </svg>
-          </button>
-          {#if historyToolsOpen}
-            <div class="ai-history-tools-menu" role="menu">
-              <button role="menuitem" class="danger" on:click={clearAllSessions}>{t("清空全部")}</button>
-            </div>
-          {/if}
-        </div>
-        <button class="ai-history-new" on:click={newChat}>
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
-          </svg>
-          <span>{t("新建会话")}</span>
-        </button>
+        {#if manageMode}
+          <span class="ai-history-hd-title">{t("已选 {n} 项", { n: historySel.size })}</span>
+          <div class="ai-history-hd-actions">
+            <button class="ai-history-txt" on:click={selectAllHistory}>
+              {historySel.size && historySel.size === historyList().length ? t("取消全选") : t("全选")}
+            </button>
+            <button class="ai-history-txt strong" on:click={exitManage}>{t("完成")}</button>
+          </div>
+        {:else}
+          <span class="ai-history-hd-title">{t("历史会话")}</span>
+          <div class="ai-history-hd-actions">
+            <button class="ai-history-txt" on:click={enterManage}>{t("管理")}</button>
+            <button class="ai-history-new" on:click={newChat}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+              </svg>
+              <span>{t("新建会话")}</span>
+            </button>
+          </div>
+        {/if}
       </div>
       <label class="ai-history-search">
         <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -2526,6 +2786,7 @@
           <path d="M10.2 10.2L13.5 13.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
         </svg>
         <input
+          bind:this={historySearchEl}
           type="text"
           spellcheck="false"
           aria-label={t("搜索会话标题或对话内容")}
@@ -2538,8 +2799,14 @@
         />
       </label>
       <div class="ai-history-list">
-        {#each historyList() as s (s.id)}
-          <div class="ai-history-item" class:on={s.id === sessionState.activeId}>
+        {#each historyRows as s, i (s.id)}
+          {@const next = historyRows[i + 1]}
+          <div
+            class="ai-history-item"
+            class:on={s.id === sessionState.activeId}
+            class:pinned={s.pinned}
+            class:sel={manageMode && historySel.has(s.id)}
+          >
             {#if renamingId === s.id}
               <div class="ai-history-rename">
                 <input
@@ -2558,7 +2825,20 @@
                 <button class="ai-history-rename-cancel" aria-label={t("取消")} title={t("取消")} on:click={cancelRename}>×</button>
               </div>
             {:else}
-              <button class="ai-history-main" on:click={() => switchSession(s.id)}>
+              {#if manageMode}
+                <label class="ai-history-check">
+                  <input
+                    type="checkbox"
+                    checked={historySel.has(s.id)}
+                    aria-label={sessionTitleOf(s)}
+                    on:change={() => toggleHistorySel(s.id)}
+                  />
+                </label>
+              {/if}
+              <button
+                class="ai-history-main"
+                on:click={() => (manageMode ? toggleHistorySel(s.id) : switchSession(s.id))}
+              >
                 <span class="ai-history-item-title">
                   {#if s.pinned}<span class="ai-history-pinned" title={t("已置顶")} aria-label={t("已置顶")}>
                     <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden="true">
@@ -2569,6 +2849,9 @@
                   {#if s.titleSource === "ai"}
                     <span class="ai-history-ai" title={t("AI 自动命名")} aria-label={t("AI 自动命名")}>✦ AI</span>
                   {/if}
+                  {#if s.id === sessionState.activeId}
+                    <span class="ai-history-now">{t("当前")}</span>
+                  {/if}
                 </span>
                 <span class="ai-history-item-meta">
                   <span>{historyTimeLabel(s.updatedAt)}</span>
@@ -2578,54 +2861,69 @@
                   {/if}
                 </span>
               </button>
-              <div class="ai-history-actions">
-                <button
-                  class="ai-history-more"
-                  title={t("会话操作")}
-                  aria-label={t("会话操作")}
-                  aria-haspopup="menu"
-                  aria-expanded={historyMenu === s.id}
-                  on:click={() => (historyMenu = historyMenu === s.id ? "" : s.id)}
-                >⋯</button>
-                <button
-                  class="ai-history-del"
-                  title={t("删除会话")}
-                  aria-label={t("删除会话")}
-                  on:click={() => deleteSession(s.id)}
-                >
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-                    <path d="M3.5 4.5h9M6.5 4.5V3.4h3v1.1M5 4.5l.5 8h5l.5-8" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" />
-                  </svg>
-                </button>
-              </div>
-              {#if historyMenu === s.id}
-                <div class="ai-history-menu" role="menu">
-                  <button role="menuitem" on:click={() => startRename(s)}>{t("重命名")}</button>
-                  <button role="menuitem" on:click={() => togglePin(s)}>
-                    {s.pinned ? t("取消置顶") : t("置顶")}
+              {#if !manageMode}
+                <div class="ai-history-actions">
+                  <button
+                    class="ai-history-pin"
+                    class:on={s.pinned}
+                    title={s.pinned ? t("取消置顶") : t("置顶")}
+                    aria-label={s.pinned ? t("取消置顶") : t("置顶")}
+                    on:click={() => togglePin(s)}
+                  >
+                    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M9.3 2.6l4.1 4.1-1.6 1.6-.5-.5-2.5 2.5.2 2.9-1.1 1.1-3-3-2.4 2.4-.2-1.4 2.4-2.4-3-3 1.1-1.1 2.9.2 2.5-2.5-.5-.5z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                    </svg>
                   </button>
                   <button
-                    role="menuitem"
-                    disabled={!s.messages.length}
-                    on:click={() => exportSession(s, "md")}
-                  >{t("导出 Markdown")}</button>
-                  <button
-                    role="menuitem"
-                    disabled={!s.messages.length}
-                    on:click={() => exportSession(s, "json")}
-                  >{t("导出 JSON")}</button>
-                  <button role="menuitem" class="danger" on:click={() => deleteSession(s.id)}>{t("删除会话")}</button>
+                    class="ai-history-more"
+                    title={t("会话操作")}
+                    aria-label={t("会话操作")}
+                    aria-haspopup="menu"
+                    aria-expanded={historyMenu === s.id}
+                    on:click={() => (historyMenu = historyMenu === s.id ? "" : s.id)}
+                  >⋯</button>
                 </div>
+                {#if historyMenu === s.id}
+                  <div class="ai-history-menu" role="menu">
+                    <button role="menuitem" on:click={() => startRename(s)}>{t("重命名")}</button>
+                    <button role="menuitem" on:click={() => togglePin(s)}>
+                      {s.pinned ? t("取消置顶") : t("置顶")}
+                    </button>
+                    <button
+                      role="menuitem"
+                      disabled={!s.messages.length}
+                      on:click={() => exportSession(s, "md")}
+                    >{t("导出 Markdown")}</button>
+                    <button
+                      role="menuitem"
+                      disabled={!s.messages.length}
+                      on:click={() => exportSession(s, "json")}
+                    >{t("导出 JSON")}</button>
+                    <button role="menuitem" class="danger" on:click={() => deleteSession(s.id)}>{t("删除会话")}</button>
+                  </div>
+                {/if}
               {/if}
             {/if}
           </div>
+          {#if s.pinned && next && !next.pinned}<div class="ai-history-div" role="separator"></div>{/if}
         {/each}
-        {#if !historyList().length}
+        {#if !historyRows.length}
           <div class="ai-history-empty">
-            {historyQuery ? t("没有匹配的会话") : historyFilter === "pinned" ? t("还没有置顶会话") : t("还没有历史会话")}
+            {historyQuery ? t("没有匹配的会话") : t("还没有历史会话")}
           </div>
         {/if}
       </div>
+      {#if manageMode}
+        <div class="ai-history-ft">
+          <button class="ai-history-ft-clear" on:click={clearAllSessions}>{t("清空全部")}</button>
+          <span class="ai-history-ft-gap"></span>
+          <button
+            class="ai-history-ft-del"
+            disabled={!historySel.size}
+            on:click={deleteSelectedSessions}
+          >{historySel.size ? t("删除所选（{n}）", { n: historySel.size }) : t("删除所选")}</button>
+        </div>
+      {/if}
     </div>
   {/if}
 
@@ -2662,6 +2960,7 @@
 
       {#if !messages.length}
         <div class="ai-empty">
+          <div class="ai-empty-mark" aria-hidden="true">✦</div>
           <div class="ai-empty-title">
             {!hasBook ? t("有什么可以帮你？") : readCtx ? t("就这本书提问") : t("《{title}》的历史对话", { title })}
           </div>
@@ -2858,49 +3157,90 @@
                 <span class="ai-msg-time" title={new Date(m.createdAt).toLocaleString()}>{sessionClock(m.createdAt)}</span>
                 {#if m.aborted}<span class="ai-flag">{t("已停止")}</span>{/if}
                 {#if m.error}<span class="ai-flag err">{t("失败")}</span>{/if}
+                {#if m.note}
+                  <span class="ai-note-badge" title={`${m.note.docTitle || m.note.docId} · ${m.note.title}`}>
+                    {t("已存为笔记")}
+                  </span>
+                {/if}
                 <span class="ai-foot-spacer"></span>
                 {#if m.aborted}
-                  <button
-                    class="ai-link on"
-                    disabled={streaming}
-                    title={t("沿用同一提问，接着上次的回答继续")}
-                    on:click={() => continueMessage(m)}
-                  >{t("继续")}</button>
-                {/if}
-                {#if onLocate && quoteOfAssistant(idx)}
-                  <button class="ai-link" on:click={() => locateQuote(quoteOfAssistant(idx))}>{t("定位原文")}</button>
+                  <button class="ai-continue" disabled={streaming} title={t("沿用同一提问，接着上次的回答继续")} on:click={() => continueMessage(m)}>{t("继续")}</button>
                 {/if}
                 {#if m.content}
-                  <button class="ai-link" on:click={() => copyMessage(m)}>
-                    {copiedId === m.id ? t("已复制") : t("复制")}
+                  <button
+                    class="ai-act"
+                    class:on={copiedId === m.id}
+                    title={copiedId === m.id ? t("已复制") : t("复制")}
+                    aria-label={t("复制")}
+                    on:click={() => copyMessage(m)}
+                  >
+                    {#if copiedId === m.id}
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <path d="M3.4 8.3l3 3 6.2-6.6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" />
+                      </svg>
+                    {:else}
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <rect x="5.5" y="5.5" width="7.5" height="8" rx="1.5" stroke="currentColor" stroke-width="1.4" />
+                        <path d="M10.5 5.5V4A1.5 1.5 0 0 0 9 2.5H4.5A1.5 1.5 0 0 0 3 4v6a1.5 1.5 0 0 0 1.5 1.5H5.5" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                      </svg>
+                    {/if}
                   </button>
                 {/if}
                 {#if m.content || m.error || m.aborted}
                   <button
-                    class="ai-link"
+                    class="ai-act"
                     disabled={streaming || !!notePlanBusyId}
                     title={t("按同一提问与上下文重新回答")}
+                    aria-label={t("重新生成")}
                     on:click={() => regenerate(m)}
-                  >{t("重新生成")}</button>
+                  >
+                    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                      <path d="M13.4 7.3a5.4 5.4 0 1 0-1.5 4.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" />
+                      <path d="M13.4 2.8v4.5H8.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" />
+                    </svg>
+                  </button>
                 {/if}
-                {#if outlineOf(m)}
-                  <button
-                    class="ai-link"
-                    class:on={mindmapView?.messageId === m.id}
-                    title={t("用本轮回答的大纲生成思维导图")}
-                    on:click={() => toggleMindmap(m)}
-                  >{t("导图")}</button>
-                {/if}
-                {#if m.content && !m.error}
-                  {#if m.note}
-                    <span class="ai-note-badge" title={`${m.note.docTitle || m.note.docId} · ${m.note.title}`}>
-                      {t("已存为笔记")}
-                    </span>
-                  {:else}
-                    <button class="ai-link" disabled={!!notePlanBusyId} on:click={() => proposeNote(m)}>
-                      {notePlanBusyId === m.id ? t("整理中…") : t("存为笔记")}
+                {#if (onLocate && quoteOfAssistant(idx)) || outlineOf(m) || (m.content && !m.error && !m.note)}
+                  <div class="ai-msg-menu-wrap">
+                    <button
+                      class="ai-act"
+                      class:on={msgMenuId === m.id}
+                      title={t("更多操作")}
+                      aria-label={t("更多操作")}
+                      aria-haspopup="menu"
+                      aria-expanded={msgMenuId === m.id}
+                      on:click={() => (msgMenuId = msgMenuId === m.id ? "" : m.id)}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                        <circle cx="3.4" cy="8" r="1.05" fill="currentColor" />
+                        <circle cx="8" cy="8" r="1.05" fill="currentColor" />
+                        <circle cx="12.6" cy="8" r="1.05" fill="currentColor" />
+                      </svg>
                     </button>
-                  {/if}
+                    {#if msgMenuId === m.id}
+                      <div class="ai-msg-menu" role="menu">
+                        {#if onLocate && quoteOfAssistant(idx)}
+                          <button role="menuitem" on:click={() => { msgMenuId = ""; locateQuote(quoteOfAssistant(idx)); }}>
+                            {t("定位原文")}
+                          </button>
+                        {/if}
+                        {#if outlineOf(m)}
+                          <button
+                            role="menuitem"
+                            class:on={mindmapView?.messageId === m.id}
+                            on:click={() => { msgMenuId = ""; toggleMindmap(m); }}
+                          >{t("导图")}</button>
+                        {/if}
+                        {#if m.content && !m.error && !m.note}
+                          <button
+                            role="menuitem"
+                            disabled={!!notePlanBusyId}
+                            on:click={() => { msgMenuId = ""; proposeNote(m); }}
+                          >{notePlanBusyId === m.id ? t("整理中…") : t("存为笔记")}</button>
+                        {/if}
+                      </div>
+                    {/if}
+                  </div>
                 {/if}
               </div>
             {/if}
@@ -2918,6 +3258,57 @@
           <button class="ai-note-x" aria-label={t("关闭预览")} on:click={() => (mindmapView = null)}>×</button>
         </div>
         <AiMindmap root={mindmapView.root} onOpenBlock={openBlockById} />
+      </div>
+    {/if}
+
+    {#if annotationDraft}
+      <div class="ai-note-card ai-ann-card" role="dialog" aria-label={t("批注草稿")}>
+        <div class="ai-note-hd">
+          <span class="ai-note-hd-title">{t("批注草稿")}</span>
+          <span class="ai-note-hd-target">
+            {#if annError}
+              <span class="err">{annError}</span>
+            {:else}
+              {t("《{chapter}》 · {ok}/{total} 条可写入", {
+                chapter: annotationDraft.preview?.chapterTitle || chapterLabel || t("当前章"),
+                ok: annotationOkCount(),
+                total: annotationDraft.items.length,
+              })}
+            {/if}
+          </span>
+          <button
+            class="ai-note-x"
+            aria-label={t("关闭草稿")}
+            on:click={() => { annotationDraft = null; annError = ""; }}
+          >×</button>
+        </div>
+        {#if annotationDraft.preview?.results?.length}
+          <ul class="ai-ann-list">
+            {#each annotationDraft.preview.results as r, i (i)}
+              <li class="ai-ann-item" class:miss={!r.ok}>
+                <span class="ai-ann-ico" aria-hidden="true">{r.ok ? "✓" : "!"}</span>
+                <span class="ai-ann-quote">{r.excerpt || r.quote}</span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+        {#if annError}<div class="ai-field-hint err">{annError}</div>{/if}
+        <div class="ai-note-foot">
+          <span class="ai-field-hint">{t("只写入当前章，来源标记为 AI，可在「我的标记」批量删除。")}</span>
+          <span class="ai-bar-spacer"></span>
+          <button
+            class="ai-btn"
+            disabled={annWriteBusy}
+            on:click={() => { annotationDraft = null; annError = ""; }}
+          >{t("放弃")}</button>
+          <button
+            class="ai-btn primary"
+            disabled={annWriteBusy || annotationOkCount() < 1}
+            on:click={commitAnnotations}
+          >
+            {annWriteBusy ? t("写入中…") : t("写入批注")}
+          </button>
+        </div>
       </div>
     {/if}
 
@@ -2975,6 +3366,7 @@
         </div>
       {/if}
 
+      <div class="ai-composer-meta">
       {#if readCtx}
       <div class="ai-ctx-wrap">
         {#if showToc}
@@ -3078,6 +3470,63 @@
       </div>
       {/if}
 
+      <div class="ai-tools-row" role="group" aria-label={t("本轮工具")}>
+        <div class="ai-tool-wrap">
+          <button
+            class="ai-tool-add"
+            class:open={toolsMenu}
+            aria-expanded={toolsMenu}
+            title={t("选择本轮想让助手做的事")}
+            on:click={() => (toolsMenu = !toolsMenu)}
+          >
+            <span class="ai-tool-plus" aria-hidden="true">＋</span>{t("工具")}
+          </button>
+          {#if toolsMenu}
+            <div class="ai-tool-pop" role="menu" aria-label={t("本轮工具")}>
+              <div class="ai-tool-pop-hd">{t("本轮工具")}</div>
+              {#each AI_TOOLS as def (def.id)}
+                {@const on = activeTools.includes(def.id)}
+                {@const blocked = toolBlocked(def.id)}
+                <button
+                  class="ai-tool-opt"
+                  class:on
+                  role="menuitemcheckbox"
+                  aria-checked={on}
+                  disabled={!on && blocked}
+                  title={!on && blocked ? toolBlockedReason(def.id) : t(def.desc)}
+                  on:click={() => toggleTool(def.id)}
+                >
+                  <span class="ai-tool-check" aria-hidden="true">{on ? "✓" : ""}</span>
+                  <span class="ai-tool-opt-main">
+                    <span class="ai-tool-opt-name">{t(def.label)}</span>
+                    <span class="ai-tool-opt-desc">{t(def.desc)}</span>
+                  </span>
+                  {#if blocked && !on}<span class="ai-tool-tag">{t("需阅读器")}</span>{/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
+        </div>
+        {#each activeTools as id (id)}
+          {@const def = toolDefOf(id)}
+          {#if def}
+            <span
+              class="ai-tool-chip"
+              class:off={!liveTools.includes(id)}
+              title={liveTools.includes(id) ? t(def.desc) : toolBlockedReason(id)}
+            >
+              <span>{t(def.label)}</span>
+              <button
+                class="ai-tool-chip-x"
+                aria-label={t("移除{name}", { name: t(def.label) })}
+                on:click={() => removeTool(id)}
+              >×</button>
+            </span>
+          {/if}
+        {/each}
+      </div>
+      </div>
+
       <AiComposer
         bind:this={composer}
         bind:hasText={composerHasText}
@@ -3134,19 +3583,21 @@
           <span class="ai-ctx-hint">{t("知识区")}</span>
         {/if}
         <span class="ai-bar-spacer"></span>
-        {#if streaming}
-          <button class="ai-stop" on:click={stop}>{t("停止")}</button>
-        {/if}
         <button
           class="ai-send"
-          disabled={!composerHasText || streaming}
-          title={t("发送")}
-          aria-label={t("发送")}
-          on:click={send}
+          class:is-stop={streaming}
+          disabled={!streaming && !composerHasText}
+          title={streaming ? t("停止") : t("发送")}
+          aria-label={streaming ? t("停止") : t("发送")}
+          on:click={streaming ? stop : send}
         >
-          <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-            <path d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
-          </svg>
+          {#if streaming}
+            <span class="ai-stop-ico" aria-hidden="true"></span>
+          {:else}
+            <svg width="15" height="15" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 13V3M8 3L3.5 7.5M8 3l4.5 4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" />
+            </svg>
+          {/if}
         </button>
       </div>
     </div>
@@ -3154,6 +3605,7 @@
     <div class="ai-settings ai-notes">
       {#if !savedNotes.length}
         <div class="ai-notes-empty">
+          <div class="ai-empty-mark" aria-hidden="true">✦</div>
           <div class="ai-empty-title">{t("还没有存过笔记")}</div>
           <div class="ai-empty-sub">{t("回答下方的「存为笔记」写入思源后，会出现在这里。")}</div>
         </div>
@@ -3517,7 +3969,7 @@
   }
   .ai-recent-hint {
     font-weight: 400;
-    font-size: 10.5px;
+    font-size: 11px;
     opacity: 0.72;
   }
   .ai-recent-row {
@@ -3549,7 +4001,7 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    font-size: 10.5px;
+    font-size: 11px;
     color: var(--b3-theme-on-surface, #6b7280);
   }
   .ai-recent-dot {
@@ -3564,8 +4016,8 @@
     border-radius: 3px;
     background: var(--b3-theme-primary, #378add);
     color: #fff;
-    font-size: 9.5px;
-    line-height: 1.6;
+    font-size: 11px;
+    line-height: 1.5;
   }
   .ai-hints {
     display: flex;
@@ -3598,7 +4050,7 @@
     margin-left: auto;
     flex: none;
     font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
   }
 
   .ai-msg {
@@ -3627,7 +4079,7 @@
     gap: 8px;
     padding-right: 2px;
     font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
     opacity: 0;
     transition: opacity 0.15s;
   }
@@ -3675,8 +4127,8 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 10.5px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    font-size: 11px;
+    color: var(--re-ai-muted);
   }
   .ai-qchip,
   .ai-pending-main {
@@ -3728,7 +4180,7 @@
   .ai-typing {
     margin-left: 4px;
     font-weight: 400;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
   }
   .ai-typing::after {
     content: "…";
@@ -3772,7 +4224,7 @@
     align-items: center;
     gap: 6px;
     font-size: 11.5px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
   }
   .ai-tool-label {
     overflow: hidden;
@@ -3858,7 +4310,7 @@
     border-radius: 5px;
     background: var(--b3-theme-background, #fff);
     color: var(--b3-theme-on-surface, #6b7280);
-    font-size: 10.5px;
+    font-size: 11px;
     line-height: 1.5;
     cursor: pointer;
     opacity: 0;
@@ -3878,9 +4330,9 @@
     position: absolute;
     top: 6px;
     left: 10px;
-    font-size: 10.5px;
+    font-size: 11px;
     line-height: 1.5;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
     pointer-events: none;
     opacity: 0;
     transition: opacity 0.15s;
@@ -3931,7 +4383,7 @@
     gap: 6px;
     flex-wrap: wrap;
     font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
   }
   .ai-receipt {
     min-width: 0;
@@ -3942,12 +4394,10 @@
   .ai-msg-time {
     flex: none;
     font-variant-numeric: tabular-nums;
-    opacity: 0.8;
   }
   .ai-usage {
     flex: none;
     font-variant-numeric: tabular-nums;
-    opacity: 0.75;
   }
   /* P4-C：跨天分隔线（首条也显示，便于确认会话从哪天开始） */
   .ai-day {
@@ -3955,8 +4405,8 @@
     align-items: center;
     gap: 10px;
     margin: 8px 12px 0;
-    font-size: 10.5px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    font-size: 11px;
+    color: var(--re-ai-muted);
     white-space: nowrap;
   }
   .ai-day::before,
@@ -3982,7 +4432,7 @@
     background: none;
     padding: 0 2px;
     font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
     cursor: pointer;
   }
   .ai-link:hover {
@@ -4048,7 +4498,7 @@
   }
   .ai-error-detail summary {
     font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
     cursor: pointer;
   }
   .ai-error-detail pre {
@@ -4100,7 +4550,7 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
   }
   .ai-note-hd-target .err {
     color: var(--b3-theme-error, #d23f31);
@@ -4112,7 +4562,7 @@
     padding: 0 2px;
     font-size: 14px;
     line-height: 1;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-faint);
     cursor: pointer;
   }
   .ai-note-plan-title {
@@ -4172,6 +4622,190 @@
     border-color: var(--b3-theme-primary, #378add);
     color: var(--b3-theme-on-background, #1f2329);
   }
+
+  /* ---------- 本轮工具：一行常驻，未选时只有一个「＋ 工具」 ---------- */
+  .ai-tools-row {
+    position: relative;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    min-height: 22px;
+    margin-bottom: 6px;
+  }
+  .ai-tool-wrap {
+    position: relative;
+    flex: none;
+  }
+  .ai-tool-add {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    height: 22px;
+    padding: 0 8px 0 6px;
+    border: 1px dashed var(--b3-border-color, rgba(0, 0, 0, 0.16));
+    border-radius: 999px;
+    background: transparent;
+    color: var(--re-ai-muted);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .ai-tool-add:hover,
+  .ai-tool-add.open {
+    border-color: var(--b3-theme-primary, #378add);
+    color: var(--b3-theme-primary, #378add);
+  }
+  .ai-tool-plus {
+    font-size: 12px;
+    line-height: 1;
+  }
+  .ai-tool-pop {
+    position: absolute;
+    left: 0;
+    bottom: calc(100% + 6px);
+    z-index: 40;
+    width: min(280px, 88vw);
+    padding: 5px;
+    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
+    border-radius: 10px;
+    background: var(--b3-theme-background, #fff);
+    box-shadow: 0 8px 24px rgba(20, 26, 36, 0.14);
+  }
+  .ai-tool-pop-hd {
+    padding: 4px 8px 6px;
+    font-size: 11px;
+    color: var(--re-ai-muted);
+  }
+  .ai-tool-opt {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    width: 100%;
+    padding: 6px 8px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ai-tool-opt:hover:not(:disabled) {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+  .ai-tool-opt:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .ai-tool-check {
+    flex: none;
+    width: 12px;
+    font-size: 11px;
+    line-height: 16px;
+    color: var(--b3-theme-primary, #378add);
+  }
+  .ai-tool-opt-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .ai-tool-opt-name {
+    font-size: 12px;
+    line-height: 16px;
+  }
+  .ai-tool-opt.on .ai-tool-opt-name {
+    color: var(--b3-theme-primary, #378add);
+    font-weight: 600;
+  }
+  .ai-tool-opt-desc {
+    font-size: 11px;
+    line-height: 1.35;
+    color: var(--re-ai-muted);
+  }
+  .ai-tool-tag {
+    flex: none;
+    align-self: center;
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    font-size: 11px;
+    color: var(--re-ai-muted);
+  }
+  .ai-tool-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    height: 22px;
+    padding: 0 4px 0 8px;
+    border: 1px solid rgba(55, 138, 221, 0.22);
+    border-radius: 999px;
+    background: rgba(55, 138, 221, 0.12);
+    color: var(--b3-theme-primary, #378add);
+    font-size: 11px;
+    line-height: 1;
+  }
+  .ai-tool-chip.off {
+    border-style: dashed;
+    border-color: var(--b3-border-color, rgba(0, 0, 0, 0.16));
+    background: transparent;
+    color: var(--re-ai-muted);
+  }
+  .ai-tool-chip-x {
+    border: none;
+    background: none;
+    padding: 0 2px;
+    font-size: 13px;
+    line-height: 1;
+    color: inherit;
+    opacity: 0.7;
+    cursor: pointer;
+  }
+  .ai-tool-chip-x:hover {
+    opacity: 1;
+    color: var(--b3-theme-error, #d23f31);
+  }
+
+  /* ---------- 批注草稿确认卡 ---------- */
+  .ai-ann-list {
+    min-height: 0;
+    max-height: 20vh;
+    margin: 6px 0 0;
+    padding: 0;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    list-style: none;
+  }
+  .ai-ann-item {
+    display: flex;
+    gap: 6px;
+    padding: 4px 0;
+    border-top: 1px dashed var(--b3-border-color, rgba(0, 0, 0, 0.1));
+    font-size: 11.5px;
+    line-height: 1.45;
+  }
+  .ai-ann-item:first-child {
+    border-top: none;
+  }
+  .ai-ann-ico {
+    flex: none;
+    width: 12px;
+    color: var(--b3-theme-primary, #378add);
+  }
+  .ai-ann-item.miss {
+    color: var(--re-ai-muted);
+  }
+  .ai-ann-item.miss .ai-ann-ico {
+    color: var(--b3-theme-error, #d23f31);
+  }
+  .ai-ann-quote {
+    display: -webkit-box;
+    min-width: 0;
+    overflow: hidden;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+
   .ai-pending {
     display: flex;
     align-items: flex-start;
@@ -4188,7 +4822,7 @@
     border: none;
     border-radius: 5px;
     background: transparent;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-faint);
     cursor: pointer;
     font-size: 14px;
     line-height: 1;
@@ -4238,7 +4872,7 @@
   .ai-toc-tip {
     padding: 0 2px 6px;
     color: var(--re-ai-muted);
-    font-size: 10.5px;
+    font-size: 11px;
     line-height: 1.5;
   }
   .ai-toc-list {
@@ -4275,7 +4909,7 @@
     flex: none;
     min-width: 18px;
     color: var(--re-ai-muted);
-    font-size: 10.5px;
+    font-size: 11px;
     font-variant-numeric: tabular-nums;
     text-align: right;
   }
@@ -4304,7 +4938,7 @@
     border-radius: 6px;
     background: rgba(178, 106, 0, 0.1);
     color: #b26a00;
-    font-size: 10.5px;
+    font-size: 11px;
     line-height: 1.5;
   }
   .ai-toc-empty {
@@ -4434,8 +5068,8 @@
   }
   .ai-model-pop-hd {
     padding: 4px 8px 6px;
-    font-size: 10.5px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    font-size: 11px;
+    color: var(--re-ai-muted);
   }
   .ai-model-opt {
     display: flex;
@@ -4477,7 +5111,7 @@
     border: none;
     border-top: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
     background: transparent;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
     font-size: 11px;
     text-align: left;
     cursor: pointer;
@@ -4521,7 +5155,7 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: var(--b3-theme-on-surface-light, #c0c4cc);
+    background: var(--re-ai-faint);
   }
   .ai-model-dot.ok {
     background: var(--b3-theme-success, #4caf50);
@@ -4535,24 +5169,17 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-size: 10.5px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    font-size: 11px;
+    color: var(--re-ai-muted);
   }
   .ai-bar-spacer {
     flex: 1;
   }
-  .ai-stop {
-    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.14));
-    border-radius: 999px;
-    background: transparent;
-    color: var(--b3-theme-on-surface, #6b7280);
-    font-size: 11px;
-    padding: 3px 9px;
-    cursor: pointer;
-  }
-  .ai-stop:hover {
-    color: var(--b3-theme-error, #d23f31);
-    border-color: var(--b3-theme-error, #d23f31);
+  .ai-stop-ico {
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    background: currentColor;
   }
   .ai-send {
     flex: none;
@@ -4566,6 +5193,9 @@
     background: var(--b3-theme-primary, #378add);
     color: #fff;
     cursor: pointer;
+  }
+  .ai-send.is-stop {
+    background: var(--b3-theme-error, #d23f31);
   }
   .ai-send:disabled {
     opacity: 0.35;
@@ -4583,7 +5213,7 @@
   .ai-field-hint {
     font-size: 11px;
     line-height: 1.5;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
   }
   .ai-field-hint.err {
     color: var(--b3-theme-error, #d23f31);
@@ -4643,7 +5273,7 @@
     align-items: center;
     gap: 6px;
     font-size: 11px;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-muted);
   }
   .ai-bp-title {
     font-weight: 600;
@@ -4660,7 +5290,7 @@
     padding: 0 2px;
     font-size: 14px;
     line-height: 1;
-    color: var(--b3-theme-on-surface-light, #9aa0a6);
+    color: var(--re-ai-faint);
     cursor: pointer;
   }
   .ai-bp-body {
@@ -4829,26 +5459,38 @@
     background: var(--re-ai-accent-soft);
   }
 
-  /* ---------- 历史会话：Copilot 式浮卡（不遮对话，无蒙层） ---------- */
+  /* ---------- 历史会话：贴按钮的小气泡（不遮对话，无蒙层） ---------- */
   .ai-history {
     position: absolute;
-    left: 8px;
     right: 8px;
     z-index: 30;
     display: flex;
     flex-direction: column;
-    width: auto;
-    max-width: 420px;
-    margin: 0 auto;
     min-height: 0;
     /* 必须实底：Neo 等主题的 background-light 带 alpha，半透明会让对话内容透出来 */
     background: var(--b3-theme-background, #fff);
     color: var(--re-ai-ink);
     border: 1px solid var(--re-ai-line);
-    border-radius: 16px;
-    box-shadow: 0 18px 48px rgba(20, 26, 36, 0.2), 0 2px 8px rgba(20, 26, 36, 0.08);
+    border-radius: 12px;
+    box-shadow: 0 14px 36px rgba(20, 26, 36, 0.16), 0 2px 6px rgba(20, 26, 36, 0.06);
     outline: none;
     animation: ai-history-in 0.16s ease-out;
+  }
+  /* 小啾啾：旋转 45° 的方块，两条边沿用浮卡描边 */
+  .ai-history-caret {
+    position: absolute;
+    top: -6px;
+    width: 11px;
+    height: 11px;
+    border-top: 1px solid var(--re-ai-line);
+    border-left: 1px solid var(--re-ai-line);
+    border-radius: 2px 0 0;
+    background: var(--b3-theme-background, #fff);
+    transform: translateX(-50%) rotate(45deg);
+    pointer-events: none;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-history { animation: none; }
   }
   @keyframes ai-history-in {
     from {
@@ -4861,111 +5503,68 @@
     }
   }
   .ai-history-hd {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-    align-items: center;
-    gap: 8px;
-    padding: 10px 12px;
-  }
-  .ai-history-tabs {
     display: flex;
     align-items: center;
-    gap: 2px;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 10px 12px 6px;
+  }
+  .ai-history-hd-title {
     min-width: 0;
-  }
-  .ai-history-tab {
-    height: 28px;
-    padding: 0 10px;
-    border: 0;
-    border-radius: 8px;
-    background: transparent;
-    color: var(--re-ai-muted);
-    font-size: 12.5px;
-    font-weight: 600;
-    white-space: nowrap;
-    cursor: pointer;
-  }
-  .ai-history-tab:hover {
-    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    overflow: hidden;
     color: var(--re-ai-ink);
+    font-size: 13px;
+    font-weight: 650;
+    white-space: nowrap;
+    text-overflow: ellipsis;
   }
-  .ai-history-tab.on {
-    background: var(--re-ai-accent-soft);
-    color: var(--re-ai-accent);
-  }
-  .ai-history-tools {
-    position: relative;
-    justify-self: center;
-  }
-  .ai-history-tools-btn {
-    display: inline-flex;
+  .ai-history-hd-actions {
+    flex: none;
+    display: flex;
     align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
+    gap: 4px;
+  }
+  .ai-history-txt {
+    height: 26px;
+    padding: 0 8px;
     border: 0;
-    border-radius: 8px;
+    border-radius: 7px;
     background: transparent;
     color: var(--re-ai-muted);
-    cursor: pointer;
-  }
-  .ai-history-tools-btn:hover,
-  .ai-history-tools-btn[aria-expanded="true"] {
-    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
-    color: var(--re-ai-ink);
-  }
-  .ai-history-tools-menu {
-    position: absolute;
-    top: 34px;
-    left: 50%;
-    z-index: 40;
-    min-width: 132px;
-    padding: 4px;
-    border: 1px solid var(--re-ai-line);
-    border-radius: 10px;
-    background: var(--b3-theme-background, #fff);
-    box-shadow: 0 10px 30px rgba(20, 26, 36, 0.18);
-    transform: translateX(-50%);
-  }
-  .ai-history-tools-menu button {
-    display: block;
-    width: 100%;
-    padding: 7px 9px;
-    border: 0;
-    border-radius: 6px;
-    background: transparent;
-    color: var(--re-ai-ink);
     font-size: 12px;
-    text-align: left;
     white-space: nowrap;
     cursor: pointer;
   }
-  .ai-history-tools-menu button:hover {
+  .ai-history-txt:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    color: var(--re-ai-ink);
   }
-  .ai-history-tools-menu button.danger {
-    color: var(--b3-theme-error, #d23f31);
+  .ai-history-txt.strong {
+    color: var(--re-ai-accent);
+    font-weight: 600;
   }
   .ai-history-new {
-    justify-self: end;
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    gap: 5px;
-    height: 30px;
-    padding: 0 11px;
+    gap: 4px;
+    height: 26px;
+    padding: 0 9px;
     border: 0;
-    border-radius: 9px;
+    border-radius: 8px;
     background: var(--re-ai-accent);
     color: #fff;
-    font-size: 12.5px;
+    font-size: 12px;
     font-weight: 600;
     white-space: nowrap;
     cursor: pointer;
   }
   .ai-history-new:hover {
     filter: brightness(1.06);
+  }
+  /* 深色主题主色偏亮，白字对比不足：压深一档再上白字 */
+  :global(html[data-theme-mode="dark"]) .ai-history-new {
+    background: color-mix(in srgb, var(--re-ai-accent) 62%, #10141c);
   }
   .ai-history-search {
     display: flex;
@@ -4992,7 +5591,7 @@
     font-size: 12.5px;
   }
   .ai-history-search input::placeholder {
-    color: var(--re-ai-faint);
+    color: var(--re-ai-muted);
   }
   .ai-history-list {
     flex: 1;
@@ -5004,19 +5603,50 @@
     position: relative;
     display: flex;
     align-items: center;
-    margin-bottom: 4px;
-    border-radius: 10px;
+    margin-bottom: 2px;
+    border-radius: 9px;
     background: transparent;
-    box-shadow: inset 0 0 0 0 transparent;
     transition: background 0.12s ease;
   }
   .ai-history-item:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.04));
   }
+  /* 置顶靠排序 + 左侧竖条表达，不再做「全部/置顶」筛选 */
+  .ai-history-item.pinned::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 7px;
+    bottom: 7px;
+    width: 2px;
+    border-radius: 2px;
+    background: var(--re-ai-accent);
+    opacity: 0.55;
+  }
+  .ai-history-item.pinned:hover::before,
+  .ai-history-item.pinned.on::before {
+    opacity: 1;
+  }
   .ai-history-item.on {
-    background: var(--re-ai-accent-soft);
-    background: color-mix(in srgb, var(--re-ai-accent) 14%, var(--b3-theme-background, #fff));
-    box-shadow: inset 0 0 0 1.5px var(--re-ai-accent);
+    background: color-mix(in srgb, var(--re-ai-accent) 10%, transparent);
+  }
+  .ai-history-item.sel {
+    background: color-mix(in srgb, var(--re-ai-accent) 12%, transparent);
+  }
+  .ai-history-check {
+    flex: none;
+    align-self: stretch;
+    display: flex;
+    align-items: center;
+    padding: 0 4px 0 9px;
+    cursor: pointer;
+  }
+  .ai-history-check input {
+    width: 14px;
+    height: 14px;
+    margin: 0;
+    accent-color: var(--re-ai-accent);
+    cursor: pointer;
   }
   .ai-history-main {
     flex: 1;
@@ -5031,6 +5661,9 @@
     color: inherit;
     cursor: pointer;
   }
+  .ai-history-check + .ai-history-main {
+    padding-left: 8px;
+  }
   .ai-history-item-title {
     display: flex;
     align-items: center;
@@ -5042,15 +5675,23 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .ai-history-item.on .ai-history-item-text {
-    color: var(--re-ai-accent);
+  .ai-history-now {
+    flex: none;
+    padding: 0 5px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.5;
+    /* 向 ink 混一档：亮色下压深、深色下提亮，两种主题都能过 3:1 */
+    color: color-mix(in srgb, var(--re-ai-accent) 80%, var(--re-ai-ink));
+    background: color-mix(in srgb, var(--re-ai-accent) 14%, transparent);
   }
   .ai-history-item-meta {
     display: flex;
     align-items: center;
     gap: 6px;
     font-size: 11.5px;
-    color: var(--re-ai-faint);
+    color: var(--re-ai-muted);
   }
   .ai-history-meta-dot {
     opacity: 0.6;
@@ -5061,16 +5702,16 @@
     align-items: center;
     padding-right: 6px;
   }
-  .ai-history-more,
-  .ai-history-del {
+  .ai-history-pin,
+  .ai-history-more {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 28px;
-    height: 28px;
+    width: 26px;
+    height: 26px;
     padding: 0;
     border: 0;
-    border-radius: 8px;
+    border-radius: 7px;
     background: transparent;
     color: var(--re-ai-faint);
     cursor: pointer;
@@ -5081,25 +5722,32 @@
     font-size: 15px;
     line-height: 1;
   }
+  .ai-history-item:hover .ai-history-pin,
   .ai-history-item:hover .ai-history-more,
-  .ai-history-item:hover .ai-history-del {
+  .ai-history-item.pinned .ai-history-pin {
     opacity: 1;
   }
-  .ai-history-item.on .ai-history-del {
-    opacity: 1;
+  .ai-history-pin.on {
+    color: var(--re-ai-accent);
   }
   .ai-history-more[aria-expanded="true"] {
     opacity: 1;
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
     color: var(--re-ai-ink);
   }
-  .ai-history-more:hover {
+  .ai-history-more:hover,
+  .ai-history-pin:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
     color: var(--re-ai-ink);
   }
-  .ai-history-del:hover {
-    color: var(--b3-theme-error, #d23f31);
-    background: var(--b3-theme-error-light, rgba(210, 63, 49, 0.08));
+  .ai-history-pin.on:hover {
+    color: var(--re-ai-accent);
+  }
+  .ai-history-div {
+    height: 1px;
+    margin: 6px 6px 7px;
+    background: var(--re-ai-line);
+    opacity: 0.7;
   }
   /* P1：置顶标记 / 更多菜单 / 内联重命名 */
   .ai-history-pinned {
@@ -5121,7 +5769,7 @@
     align-items: center;
     padding: 1px 4px;
     border-radius: 4px;
-    font-size: 9.5px;
+    font-size: 11px;
     font-weight: 600;
     line-height: 1.2;
     letter-spacing: 0.02em;
@@ -5203,15 +5851,54 @@
     color: var(--b3-theme-error, #d23f31);
   }
   @media (hover: none) {
-    .ai-history-more,
-    .ai-history-del {
+    .ai-history-pin,
+    .ai-history-more {
       opacity: 1;
     }
+  }
+  /* 管理态底栏：清空全部只在这里出现 */
+  .ai-history-ft {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px 10px;
+    border-top: 1px solid var(--re-ai-line);
+  }
+  .ai-history-ft-gap {
+    flex: 1;
+  }
+  .ai-history-ft-clear {
+    padding: 6px 8px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--b3-theme-error, #d23f31);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .ai-history-ft-clear:hover {
+    background: var(--b3-theme-error-light, rgba(210, 63, 49, 0.08));
+  }
+  .ai-history-ft-del {
+    padding: 6px 12px;
+    border: 0;
+    border-radius: 7px;
+    background: var(--b3-theme-error, #d23f31);
+    color: #fff;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: opacity 0.12s ease;
+  }
+  .ai-history-ft-del:disabled {
+    opacity: 0.45;
+    cursor: default;
   }
   .ai-history-empty {
     padding: 36px 16px;
     text-align: center;
-    color: var(--re-ai-faint);
+    color: var(--re-ai-muted);
     font-size: 12px;
   }
 
@@ -5264,10 +5951,10 @@
   }
   .ai-role {
     gap: 6px;
-    font-size: 10.5px;
+    font-size: 11px;
     font-weight: 500;
     letter-spacing: 0.04em;
-    color: var(--re-ai-faint);
+    color: var(--re-ai-muted);
   }
   .ai-role .ai-spark.small {
     width: 15px;
@@ -5320,8 +6007,8 @@
   }
   .ai-tool-meta {
     flex: none;
-    font-size: 10.5px;
-    color: var(--re-ai-faint);
+    font-size: 11px;
+    color: var(--re-ai-muted);
   }
 
   /* ---------- 思考过程：虚线小卡 ---------- */
@@ -5387,20 +6074,20 @@
     font-weight: 600;
   }
   .ai-hint-sub {
-    font-size: 10.5px;
-    color: var(--re-ai-faint);
+    font-size: 11px;
+    color: var(--re-ai-muted);
   }
 
   /* ---------- 底部动作行 ---------- */
   .ai-foot {
     gap: 8px;
     padding-top: 2px;
-    font-size: 10.5px;
+    font-size: 11px;
   }
   .ai-link {
     padding: 3px 6px;
     border-radius: 6px;
-    font-size: 10.5px;
+    font-size: 11px;
   }
   .ai-link:hover {
     background: var(--re-ai-accent-soft);
@@ -5446,7 +6133,7 @@
     padding: 4px 7px;
     border-color: transparent;
     border-radius: 6px;
-    font-size: 10.5px;
+    font-size: 11px;
   }
   .ai-model-pill:hover {
     border-color: transparent;
@@ -5459,7 +6146,7 @@
   }
   .ai-day {
     margin: 10px 2px 0;
-    color: var(--re-ai-faint);
+    color: var(--re-ai-muted);
   }
   .ai-day::before,
   .ai-day::after {
@@ -5482,7 +6169,7 @@
   }
   .ai-model-pop-hd,
   .ai-model-more {
-    color: var(--re-ai-faint);
+    color: var(--re-ai-muted);
   }
   .ai-model-more {
     border-top-color: var(--re-ai-line);
@@ -5502,11 +6189,57 @@
   .ai-send:hover:not(:disabled) {
     filter: brightness(0.94);
   }
-  .ai-stop {
-    height: 30px;
-    padding: 0 10px;
-    border-radius: 8px;
+  .ai-send.is-stop {
+    box-shadow: 0 2px 8px rgba(210, 63, 49, 0.26);
+  }
+  /* 本轮工具：跟随面板令牌 */
+  .ai-tool-add {
+    height: 24px;
+    border-color: var(--re-ai-line);
+    color: var(--re-ai-muted);
+  }
+  .ai-tool-add:hover,
+  .ai-tool-add.open {
+    border-color: var(--re-ai-accent);
+    color: var(--re-ai-accent);
+    background: var(--re-ai-accent-soft);
+  }
+  .ai-tool-pop {
+    border-color: var(--re-ai-line);
     background: var(--re-ai-card);
+  }
+  .ai-tool-pop-hd,
+  .ai-tool-opt-desc {
+    color: var(--re-ai-muted);
+  }
+  .ai-tool-opt:hover:not(:disabled) {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+  .ai-tool-opt.on .ai-tool-opt-name,
+  .ai-tool-check {
+    color: var(--re-ai-accent);
+  }
+  .ai-tool-tag {
+    background: transparent;
+    color: var(--re-ai-muted);
+  }
+  .ai-tool-chip {
+    border-color: var(--re-ai-accent-soft);
+    background: var(--re-ai-accent-soft);
+    color: var(--re-ai-accent);
+    font-weight: 600;
+  }
+  .ai-tool-chip.off {
+    border-color: var(--re-ai-line);
+    background: transparent;
+    color: var(--re-ai-muted);
+    font-weight: 400;
+  }
+  .ai-ann-item {
+    border-top-color: var(--re-ai-line);
+  }
+  .ai-ann-ico {
+    color: var(--re-ai-accent);
   }
 
   /* ---------- 笔记 Tab ---------- */
@@ -5514,7 +6247,10 @@
     padding: 14px;
   }
   .ai-notes-empty {
-    padding: 18px 4px;
+    padding: 24px 6px;
+  }
+  .ai-notes-empty .ai-empty-mark {
+    margin-bottom: 10px;
   }
   .ai-note-item {
     display: flex;
@@ -5557,8 +6293,8 @@
   }
   .ai-note-item-date {
     flex: none;
-    font-size: 10.5px;
-    color: var(--re-ai-faint);
+    font-size: 11px;
+    color: var(--re-ai-muted);
     font-variant-numeric: tabular-nums;
   }
 
@@ -5603,9 +6339,22 @@
     width: 34px;
     height: 34px;
   }
-  .ai-panel.is-overlay .ai-stop {
-    padding: 6px 12px;
+  .ai-panel.is-overlay .ai-tool-add,
+  .ai-panel.is-overlay .ai-tool-chip {
+    height: 28px;
     font-size: 12px;
+  }
+  .ai-panel.is-overlay .ai-tool-add {
+    padding: 0 10px 0 8px;
+  }
+  .ai-panel.is-overlay .ai-tool-pop {
+    width: min(320px, 92%);
+  }
+  .ai-panel.is-overlay .ai-tool-opt {
+    min-height: 40px;
+  }
+  .ai-panel.is-overlay .ai-tool-opt-name {
+    font-size: 13px;
   }
   .ai-panel.is-overlay .ai-ctx-hint {
     display: none;
@@ -5634,5 +6383,385 @@
   }
   .ai-panel.is-overlay .ai-map-card :global(.mm-scroll) {
     max-height: 36vh;
+  }
+
+  /* ================= 2026-11-12 B 轮：聊天式重构 =================
+   * 助手回答不再套卡片；用户用实色气泡；输入区收成一张悬浮卡；
+   * 操作行从一排文字链接收成图标 + 「更多」菜单。 */
+
+  .ai-panel {
+    --re-ai-accent-2: #8f6cf0;
+    --re-ai-bubble-bg: var(--b3-theme-primary, #378add);
+    --re-ai-bubble-ink: #fff;
+    --re-ai-bubble-shadow: 0 2px 8px rgba(59, 110, 245, 0.22);
+    --re-ai-seg: rgba(20, 26, 36, 0.055);
+    --re-ai-composer-shadow: 0 10px 30px rgba(20, 26, 36, 0.1);
+  }
+  :global(html[data-theme-mode="dark"]) .ai-panel {
+    --re-ai-accent-2: #a08cf5;
+    /* 主题主色偏亮时白字对比不足，向深色压一档再放白字 */
+    --re-ai-bubble-bg: #3a558f;
+    --re-ai-bubble-bg: color-mix(in srgb, var(--b3-theme-primary, #5b9cf5) 58%, #10141c);
+    --re-ai-bubble-ink: #fff;
+    --re-ai-bubble-shadow: 0 2px 8px rgba(0, 0, 0, 0.32);
+    --re-ai-seg: rgba(255, 255, 255, 0.07);
+    --re-ai-composer-shadow: 0 12px 34px rgba(0, 0, 0, 0.42);
+  }
+  .ai-panel.paper {
+    --re-ai-accent-2: #c49a2e;
+    --re-ai-bubble-bg: #8a6400;
+    --re-ai-bubble-ink: #fffdf8;
+    --re-ai-bubble-shadow: 0 2px 8px rgba(120, 90, 10, 0.2);
+    --re-ai-seg: rgba(120, 95, 40, 0.09);
+    --re-ai-composer-shadow: 0 10px 30px rgba(90, 70, 30, 0.08);
+  }
+  :global(html[data-theme-mode="dark"]) .ai-panel.paper {
+    --re-ai-accent-2: #b99a45;
+    --re-ai-bubble-bg: #d9b23c;
+    --re-ai-bubble-ink: #211f1a;
+    --re-ai-bubble-shadow: 0 2px 8px rgba(0, 0, 0, 0.32);
+    --re-ai-seg: rgba(255, 240, 200, 0.08);
+    --re-ai-composer-shadow: 0 12px 34px rgba(0, 0, 0, 0.45);
+  }
+
+  /* ---------- 头部：再轻一点 ---------- */
+  .ai-panel .ai-hd {
+    gap: 9px;
+    padding: 8px 12px 7px;
+  }
+  .ai-panel .ai-cover {
+    flex: 0 0 30px;
+    width: 30px;
+    height: 36px;
+    border-radius: 5px;
+    font-size: 14px;
+  }
+  .ai-panel .ai-hd-title { font-size: 13px; }
+  .ai-panel .ai-hd-sub { margin-top: 1px; font-size: 11px; }
+  .ai-panel .ai-icon-btn {
+    width: 26px;
+    height: 26px;
+  }
+
+  /* ---------- Tab：分段式 ---------- */
+  .ai-panel .ai-tabs {
+    width: max-content;
+    margin: 8px 12px 2px;
+    padding: 3px;
+    gap: 2px;
+    border: 0;
+    border-radius: 9px;
+    background: var(--re-ai-seg);
+  }
+  .ai-panel .ai-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 26px;
+    margin-right: 0;
+    padding: 0 13px;
+    border-radius: 7px;
+    font-size: 12px;
+  }
+  .ai-panel .ai-tab.on {
+    background: var(--re-ai-card);
+    box-shadow: 0 1px 2px rgba(20, 26, 36, 0.09);
+  }
+  .ai-panel .ai-tab.on::after { display: none; }
+  :global(html[data-theme-mode="dark"]) .ai-panel .ai-tab.on {
+    /* 深色下卡片底比分段轨更暗，激活项反而像凹陷；用抬升的浅层 */
+    background: rgba(255, 255, 255, 0.12);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+  }
+
+  /* ---------- 消息流：助手无壳、用户实色气泡 ---------- */
+  .ai-panel .ai-thread { padding: 14px 14px 6px; }
+  .ai-panel .ai-msg {
+    margin-bottom: 18px;
+    animation: ai-msg-in 160ms ease-out both;
+  }
+  .ai-panel .ai-bubble {
+    padding: 9px 13px;
+    border-color: transparent;
+    border-radius: 16px 16px 4px 16px;
+    background: var(--re-ai-bubble-bg);
+    color: var(--re-ai-bubble-ink);
+    box-shadow: var(--re-ai-bubble-shadow);
+  }
+  .ai-panel .ai-msg.assistant {
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+  .ai-panel .ai-role {
+    gap: 6px;
+    font-size: 11px;
+    letter-spacing: 0;
+  }
+  .ai-panel .ai-role .ai-spark.small {
+    width: 18px;
+    height: 18px;
+    border-radius: 6px;
+    background: linear-gradient(140deg, var(--re-ai-accent), var(--re-ai-accent-2));
+    font-size: 10px;
+  }
+  .ai-panel .ai-md { line-height: 1.75; }
+  /* Lute 会在块之间补 <br>；对话里保留会多出一整行空高，交给块间距排版 */
+  .ai-panel .ai-md :global(.b3-typography > br) { display: none; }
+
+  /* 工具轨迹：从一张小卡收成一行胶囊 */
+  .ai-panel .ai-tools {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .ai-panel .ai-tool {
+    gap: 6px;
+    padding: 3px 9px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--re-ai-accent-soft);
+    font-size: 11px;
+  }
+  .ai-panel .ai-tool-label { color: var(--re-ai-accent); }
+  .ai-panel .ai-tool-meta { color: var(--re-ai-muted); }
+
+  /* ---------- 操作行：时间/用量留在左侧，右侧只留图标 ---------- */
+  .ai-panel .ai-foot {
+    gap: 6px;
+    padding-top: 2px;
+    font-size: 11px;
+    /* 单行：元信息可截断，图标永不换行（否则每条消息多占一行高度） */
+    flex-wrap: nowrap;
+  }
+  .ai-panel .ai-receipt {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  .ai-panel .ai-usage {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ai-panel .ai-foot-spacer {
+    flex: 1 1 0;
+    min-width: 4px;
+  }
+  /* 工具入口在输入区右端：浮层向右展开会顶出面板，改为左侧对齐 */
+  .ai-panel .ai-tool-pop {
+    left: auto;
+    right: 0;
+  }
+  .ai-panel .ai-act {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: 0;
+    border-radius: 5px;
+    background: transparent;
+    color: var(--re-ai-faint);
+    cursor: pointer;
+    opacity: 0.8;
+    transition: background 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+  }
+  .ai-panel .ai-act:hover:not(:disabled) {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    color: var(--re-ai-ink);
+    opacity: 1;
+  }
+  .ai-panel .ai-act.on {
+    color: var(--re-ai-accent);
+    opacity: 1;
+  }
+  .ai-panel .ai-act:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+  .ai-panel .ai-continue {
+    flex: none;
+    height: 22px;
+    padding: 0 9px;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: var(--re-ai-accent-soft);
+    color: var(--re-ai-accent);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .ai-panel .ai-continue:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+  .ai-panel .ai-msg-menu-wrap {
+    position: relative;
+    display: inline-flex;
+    flex: none;
+  }
+  .ai-panel .ai-msg-menu {
+    position: absolute;
+    right: 0;
+    bottom: calc(100% + 4px);
+    z-index: 30;
+    min-width: 132px;
+    padding: 4px;
+    border: 1px solid var(--re-ai-line);
+    border-radius: 9px;
+    background: var(--re-ai-card);
+    box-shadow: 0 8px 24px rgba(20, 26, 36, 0.14);
+    transform-origin: bottom right;
+    animation: ai-menu-in 120ms ease-out;
+  }
+  :global(html[data-theme-mode="dark"]) .ai-panel .ai-msg-menu {
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+  }
+  .ai-panel .ai-msg-menu button {
+    display: block;
+    width: 100%;
+    padding: 6px 9px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--re-ai-ink);
+    font-size: 11.5px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .ai-panel .ai-msg-menu button:hover:not(:disabled) {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+  .ai-panel .ai-msg-menu button.on {
+    color: var(--re-ai-accent);
+    font-weight: 600;
+  }
+  .ai-panel .ai-msg-menu button:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  /* ---------- 空状态 ---------- */
+  .ai-panel .ai-empty { padding: 26px 4px 8px; }
+  .ai-panel .ai-empty-mark {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    margin-bottom: 12px;
+    border-radius: 12px;
+    background: linear-gradient(140deg, var(--re-ai-accent), var(--re-ai-accent-2));
+    color: #fff;
+    font-size: 16px;
+    box-shadow: 0 6px 18px rgba(59, 110, 245, 0.22);
+    box-shadow: 0 6px 18px color-mix(in srgb, var(--re-ai-accent) 24%, transparent);
+  }
+  .ai-panel .ai-empty-title {
+    font-size: 16px;
+    font-weight: 650;
+    letter-spacing: 0;
+  }
+  .ai-panel .ai-empty-sub { font-size: 12.5px; }
+  .ai-panel .ai-hint { border-radius: 12px; }
+
+  /* ---------- 输入区：一张悬浮卡 ---------- */
+  .ai-panel .ai-composer {
+    margin: 4px 10px 10px;
+    padding: 8px 10px 10px;
+    border: 1px solid var(--re-ai-line);
+    border-radius: 16px;
+    background: var(--re-ai-card);
+    box-shadow: var(--re-ai-composer-shadow);
+  }
+  .ai-panel .ai-composer:focus-within {
+    border-color: var(--re-ai-accent);
+    box-shadow: var(--re-ai-composer-shadow), 0 0 0 3px var(--re-ai-accent-soft);
+  }
+  .ai-panel .ai-composer-meta {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+    min-height: 24px;
+    margin-bottom: 2px;
+  }
+  /* 上下文芯片与工具共处一行；display:contents 让目录浮层仍以整行定位 */
+  .ai-panel .ai-composer-meta .ai-ctx-wrap { display: contents; }
+  .ai-panel .ai-composer-meta .ai-ctx-row { margin-bottom: 0; }
+  .ai-panel .ai-composer-meta .ai-tools-row {
+    margin-bottom: 0;
+    margin-left: auto;
+    min-height: 0;
+  }
+  .ai-panel .ai-ctx-chip {
+    padding: 0 8px;
+    border-color: transparent;
+    background: transparent;
+  }
+  .ai-panel .ai-ctx-chip:hover {
+    border-color: transparent;
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+  .ai-panel .ai-ctx-chip.on {
+    border-color: transparent;
+    background: var(--re-ai-accent-soft);
+  }
+  .ai-panel .ai-ctx-note.empty {
+    border-style: dashed;
+    border-color: var(--re-ai-line);
+  }
+  .ai-panel .ai-composer :global(.ai-composer-input) {
+    min-height: 40px;
+    padding: 6px 4px 2px;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    font-size: 13.5px;
+  }
+  .ai-panel .ai-composer :global(.ai-composer-input:focus) {
+    border-color: transparent;
+    box-shadow: none;
+  }
+  .ai-panel .ai-composer-bar {
+    margin-top: 4px;
+    padding: 0 2px;
+  }
+  .ai-panel .ai-send {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+  }
+  /* 纸张皮肤：发送键跟随暖色，别在米色界面里留一颗蓝按钮 */
+  .ai-panel.paper .ai-send:not(.is-stop) {
+    background: var(--re-ai-bubble-bg);
+    color: var(--re-ai-bubble-ink);
+  }
+  .ai-panel .ai-send:hover:not(:disabled) { filter: brightness(0.94); }
+
+  /* 手机覆盖层保留 16px 输入字号，避免 iOS 聚焦放大 */
+  .ai-panel.is-overlay .ai-composer :global(.ai-composer-input) {
+    font-size: 16px;
+    line-height: 1.55;
+  }
+
+  @keyframes ai-msg-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+  }
+  @keyframes ai-menu-in {
+    from { opacity: 0; transform: translateY(3px) scale(0.98); }
+    to { opacity: 1; transform: none; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .ai-panel .ai-msg,
+    .ai-panel .ai-msg-menu { animation: none; }
   }
 </style>

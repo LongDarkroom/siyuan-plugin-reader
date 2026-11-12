@@ -9750,6 +9750,7 @@ import { getLogger } from "../core/logger.ts";
       readKnowledge: readAiKnowledge,
       resolveNoteTarget: resolveAiNoteTarget,
       writeNotePlan: writeAiNotePlan,
+      applyAnnotations: applyAiAnnotations,
       onLocate: onAiLocate,
       getPrimer: () => primerStore?.get?.(bookId) || "",
     };
@@ -14901,6 +14902,7 @@ import { getLogger } from "../core/logger.ts";
         readKnowledge={readAiKnowledge}
         resolveNoteTarget={resolveAiNoteTarget}
         writeNotePlan={writeAiNotePlan}
+        applyAnnotations={applyAiAnnotations}
         getPrimer={() => primerStore?.get?.(bookId) || ""}
         onLocate={onAiLocate}
         onClose={() => (showAiPanel = false)}
