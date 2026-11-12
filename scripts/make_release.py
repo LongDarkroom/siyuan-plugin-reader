@@ -33,7 +33,7 @@ INCLUDE_FILES = [
     # plugin.json 已声明 kernels: ["all"]，漏掉本文件 → Copilot 看不到 reader 工具。
     "kernel.js",
     "icon.png",
-    "preview.webp",  # plugin.json 的 preview 字段指向此文件（1920×1400 品牌预览图，约 204KB）
+    "preview.jpg",  # plugin.json 的 preview 字段指向此文件（1600×900 品牌预览图，约 202KB）
     "README.md",
     # [2026-10-26] 版本更新弹窗：升级后弹一次「本次更新了什么」，日志正文来自包内
     # 插件根的 CHANGELOG.md（src/core/changelog.ts 走 POST /api/file/getFile 读
@@ -66,7 +66,7 @@ INCLUDE_DIRS = [
     # copy-dist 的产物，反而正常，故该缺陷长期未被发现）。
     "cmaps",
     "standard_fonts",
-    # README.md 内嵌预览图与三步教程图（assets/RE-Reader-tutorial-*.jpg）；
+    # README.md 内嵌的五张总览图（assets/overview-*.png）；
     # 集市详情页从发布包离线渲染 README，图片缺失会显示破图 → 必须随包。
     "assets",
 ]
