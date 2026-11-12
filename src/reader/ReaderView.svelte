@@ -4016,6 +4016,10 @@ import { getLogger } from "../core/logger.ts";
       t.tagName === "TEXTAREA" ||
       t.isContentEditable
     )) return;
+    // 2026-11-12：批注卡片开着时，阅读器快捷键一律让位给输入。
+    // 只放行 Esc（点卡片外面再按 Esc 仍应能把卡片收掉）；翻页 / 缩放 / 全屏 / 提示面板
+    // 等一律不响应 —— 卡片里打字时焦点若因重排短暂落到 body，也不会误触发这些动作。
+    if (noteEditor.visible && e.key !== "Escape") return;
     // 矩形框选模式下 Esc 先退出（独立分支）
     if (e.key === "Escape" && pdfRectMode) {
       e.preventDefault();
@@ -7390,9 +7394,16 @@ import { getLogger } from "../core/logger.ts";
   let noteLayoutSeq = 0;
   let noteProtyle: AnnEditor | null = null;
   let noteProtyleEmpty = true;
+  /** 卡内编辑器是否持有焦点。2026-11-12：占位文案改为「空 **且** 未聚焦」才显示 ——
+   *  用户的预期是「点一下写点批注，提示就该消失」。 */
+  let noteProtyleFocused = false;
   let noteKeyHandler: ((e: KeyboardEvent) => void) | null = null;
   /** 键盘监听的挂载点（= Protyle 宿主；卡根元素在 action 执行时可能还没 bind） */
   let noteKeyTarget: HTMLElement | null = null;
+  /** 宿主焦点 / 点击监听（与键盘监听同源生命周期，必须一起解绑） */
+  let noteFocusInHandler: (() => void) | null = null;
+  let noteFocusOutHandler: (() => void) | null = null;
+  let noteHostPointerHandler: ((e: MouseEvent) => void) | null = null;
   let noteFocusSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   /* ============================================================
@@ -9213,14 +9224,30 @@ import { getLogger } from "../core/logger.ts";
   }
 
   function teardownNoteProtyle() {
-    if (noteKeyHandler) {
-      try { noteKeyTarget?.removeEventListener("keydown", noteKeyHandler, true); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
-      noteKeyHandler = null;
+    const target = noteKeyTarget;
+    if (target) {
+      if (noteKeyHandler) {
+        try { target.removeEventListener("keydown", noteKeyHandler, true); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
+      }
+      if (noteFocusInHandler) {
+        try { target.removeEventListener("focusin", noteFocusInHandler); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
+      }
+      if (noteFocusOutHandler) {
+        try { target.removeEventListener("focusout", noteFocusOutHandler); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
+      }
+      if (noteHostPointerHandler) {
+        try { target.removeEventListener("mousedown", noteHostPointerHandler); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
+      }
     }
+    noteKeyHandler = null;
     noteKeyTarget = null;
+    noteFocusInHandler = null;
+    noteFocusOutHandler = null;
+    noteHostPointerHandler = null;
     try { noteProtyle?.destroy?.(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · teardownNoteProtyle", "debug"); }
     noteProtyle = null;
     noteProtyleEmpty = true;
+    noteProtyleFocused = false;
   }
 
   /**
@@ -9247,7 +9274,22 @@ import { getLogger } from "../core/logger.ts";
       // 捕获阶段接键盘：Protyle 自己会消费 Escape/回车，冒泡到卡片时可能已被拦。
       noteKeyHandler = (e: KeyboardEvent) => onNoteKeydown(e);
       noteKeyTarget = node;
+
+      // 占位文案随焦点显隐（用户预期：点一下「写点批注…」提示就该消失）。
+      noteFocusInHandler = () => { noteProtyleFocused = true; };
+      noteFocusOutHandler = () => { noteProtyleFocused = false; };
+      // 点在宿主留白（::before 那层是 pointer-events:none，点到的就是宿主本体）时，
+      // 把焦点与光标交给编辑器 —— 否则「点了没反应、提示还在」。
+      noteHostPointerHandler = (e: MouseEvent) => {
+        const target = e.target as HTMLElement | null;
+        if (target?.closest(".protyle")) return;   // 点在正文里：Protyle 自己处理
+        e.preventDefault();                        // 防止点到非编辑区时清掉已有选区
+        noteProtyle?.focus();
+      };
       node.addEventListener("keydown", noteKeyHandler, true);
+      node.addEventListener("focusin", noteFocusInHandler);
+      node.addEventListener("focusout", noteFocusOutHandler);
+      node.addEventListener("mousedown", noteHostPointerHandler);
     };
     mountNow();
     return {
@@ -10691,7 +10733,10 @@ import { getLogger } from "../core/logger.ts";
             // 兜底：若 foliate 未在重显时触发 relocate，延迟补绘一次
             setTimeout(() => {
               if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再补绘
-              if (annotationsDirty) { redrawBookAnnotations(); annotationsDirty = false; }
+              // 2026-11-12：书还没解析完（view.book 未挂上）时**不要清 dirty** ——
+              // 这轮补绘必然全部落空，dirty 被吃掉就再没有兜底机会。保留到
+              // create-overlay / 下次 relocate 再补（addReaderAnnotation 内部幂等）。
+              if (annotationsDirty && view?.book) { redrawBookAnnotations(); annotationsDirty = false; }
             }, 450);
           }
           // 离开可见区：保留 annotationsDirty，下次回到页签再补绘
@@ -11232,7 +11277,10 @@ import { getLogger } from "../core/logger.ts";
    */
   async function addReaderAnnotation(it: AnnDrawInput, onlyCfis?: Set<string>): Promise<void> {
     dbgHud.addAnnotationTries++;
-    if (!it.cfi || !it.color || !view) return;
+    // 2026-11-12：view.book 未挂上 = open() 还在解析书（大书可达数秒）。
+    // 此时 view 已存在但 book 为 undefined，addAnnotation 内部的 resolveCFI 必炸；
+    // 不在这里画，等 create-overlay（解析完逐节触发）再补，视觉不丢。
+    if (!it.cfi || !it.color || !view || !view.book) return;
     if (it.deletedAt) return; // 软删除项不重绘（最终一致保障：翻页后已删高亮彻底消失）
     // 2026-09-09 双绘根治：PDF 文本标注视觉单一真源是自建覆盖层 PdfTextHlLayer。
     // 此处是 foliate 原生管线的唯一入口，PDF 下必须拒绘——fixed-layout 每页也建
@@ -11263,6 +11311,7 @@ import { getLogger } from "../core/logger.ts";
 
   /** 绘制单段批注气泡（独立 overlay；点击由 foliate hitTest → show-annotation 派发） */
   async function drawNoteBadgeCfi(cfi: string, color: string): Promise<void> {
+    if (!view?.book) return; // 书未就绪：交给 create-overlay 补绘（见 addReaderAnnotation 闸门）
     try {
       await view.addAnnotation({ value: NOTE_KEY_PREFIX + cfi, color, style: "note" });
     } catch (err) {
@@ -11272,6 +11321,7 @@ import { getLogger } from "../core/logger.ts";
 
   /** 删除单段批注气泡（仅在没有笔记/删除标注时调用；不碰高亮层） */
   async function eraseNoteBadgeCfi(cfi: string): Promise<void> {
+    if (!view?.book) return; // 书未就绪：没有可删的 overlay，别喂给 foliate
     try {
       await view.deleteAnnotation({ value: NOTE_KEY_PREFIX + cfi, color: "", style: "note" });
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · eraseNoteBadgeCfi", "debug"); }
@@ -11312,7 +11362,7 @@ import { getLogger } from "../core/logger.ts";
    * 不依赖自建 SVG 层。供 onCreateOverlay / 页签可见性兜底 / relocate 兜底复用。
    */
   function redrawBookAnnotations() {
-    if (!annStore || !bookId || !view) return;
+    if (!annStore || !bookId || !view || !view.book) return;
     // 2026-09-09 双绘根治：PDF 标注视觉单一真源是 PdfTextHlLayer，
     // 页签可见性兜底 / relocate 兜底不得再把 PDF 标注喂进 foliate 原生管线。
     if (isPdfBook()) return;
@@ -12669,6 +12719,12 @@ import { getLogger } from "../core/logger.ts";
    */
   function toggleFullscreen() {
     try {
+      // 2026-11-12：正在输入时绝不进全屏。
+      // 批注卡片里打字，焦点一旦短暂落到 body，F11 之类的按键就会走进来 ——
+      // 整窗进全屏（macOS 绿钮同款）会让用户完全失去上下文。宁可这次不响应。
+      const ae = document.activeElement as HTMLElement | null;
+      if (noteEditor.visible) return;
+      if (ae && (ae.isContentEditable || ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
       if (document.fullscreenElement) {
         void document.exitFullscreen?.();
       } else {
@@ -13211,7 +13267,7 @@ import { getLogger } from "../core/logger.ts";
     if (annReconcileTimer != null) clearTimeout(annReconcileTimer);
     annReconcileTimer = setTimeout(() => {
       annReconcileTimer = null;
-      if (!annStore || !bookId || !view) return;
+      if (!annStore || !bookId || !view || !view.book) return;
       try {
         syncVisualWithStore(view, annStore, bookId);
         const active = (annStore.getByBook(bookId) || []).filter((it: any) => it.cfi && !it.deletedAt);
@@ -14736,7 +14792,7 @@ import { getLogger } from "../core/logger.ts";
         <div
           class="reader-note-protyle"
           class:viewer={isNoteViewer}
-          class:empty={noteProtyleEmpty}
+          class:empty={noteProtyleEmpty && !noteProtyleFocused}
           data-placeholder={t("写点批注…")}
           use:noteProtyleHost={noteEditor.id ?? "create"}
         ></div>
@@ -16276,6 +16332,36 @@ import { getLogger } from "../core/logger.ts";
   .reader-note-protyle :global(.protyle-wysiwyg > [data-node-id]:last-child) {
     margin-bottom: 0;
     padding-bottom: 0;
+  }
+  /* 2026-11-12（首行空白·CSS 侧双保险）：
+     批注框不需要 Protyle 的文档标题栏 / 面包屑 / 块标尺 —— 它们即使不渲染内容，
+     容器自身仍占一行高度，表现为「正文上方空一行」。一并压掉。
+     首块选择器放宽到任意首元素（伪空段等可能不带 data-node-id，原规则会漏）。 */
+  .reader-note-protyle :global(.protyle-title),
+  .reader-note-protyle :global(.protyle-breadcrumb),
+  .reader-note-protyle :global(.protyle-gutters) {
+    display: none !important;
+  }
+  .reader-note-protyle :global(.protyle),
+  .reader-note-protyle :global(.protyle-content) {
+    padding-top: 0 !important;
+  }
+  .reader-note-protyle :global(.protyle-wysiwyg > *:first-child) {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+  }
+  /* 2026-11-12（二次定位，实测数据驱动）：
+     首行空白的真凶是 .protyle-wysiwyg 自带的 padding-top:16px —— 它与外壳的 6px 相加，
+     正好让占位文案比正文高出一行（占位符画在 top:6px）。实测该覆盖在本机赢不了级联
+     （计算值仍是 16px），所以正文留白最终由 ann-editor.ts 对内联样式加 important 钉死。
+     这里保留两条兜底：.protyle-top（文档标题/图标包装层，render.title/background 均关闭，
+     不承载可交互内容）整层压掉；首块纵向边界清零，避免块自身 margin 再叠一层。 */
+  .reader-note-protyle :global(.protyle-top) {
+    display: none !important;
+    height: 0 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    min-height: 0 !important;
   }
 
   /*⚠️ 2026-10-08 删除了原「行 4 · 动作区」的全部样式：

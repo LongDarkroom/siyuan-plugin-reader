@@ -412,7 +412,11 @@ export class View extends HTMLElement {
         if (this.book?.rewordPdf && !remove && !value.startsWith(SEARCH_PREFIX)) return
         if (value.startsWith(SEARCH_PREFIX)) {
             const cfi = value.replace(SEARCH_PREFIX, '')
-            const { index, anchor } = await this.resolveNavigation(cfi)
+            // [REword patch 2026-11-12] resolveNavigation 是「软失败」契约（解析不了返回
+            // undefined），这里必须先判空再解构，否则会抛 destructure 错误刷控制台。
+            const resolved = await this.resolveNavigation(cfi)
+            if (!resolved) return
+            const { index, anchor } = resolved
             const obj = this.#getOverlayer(index)
             if (obj) {
                 const { overlayer, doc } = obj
@@ -426,7 +430,9 @@ export class View extends HTMLElement {
             return
         } else if (value.startsWith(NOTE_PREFIX)) {
             const cfi = value.replace(NOTE_PREFIX, '')
-            const { index, anchor } = await this.resolveNavigation(cfi)
+            const resolved = await this.resolveNavigation(cfi)
+            if (!resolved) return
+            const { index, anchor } = resolved
             const obj = this.#getOverlayer(index)
             if (obj) {
                 const { overlayer, doc } = obj
@@ -442,7 +448,9 @@ export class View extends HTMLElement {
             }
             return
         }
-        const { index, anchor } = await this.resolveNavigation(value)
+        const resolved = await this.resolveNavigation(value)
+        if (!resolved) return
+        const { index, anchor } = resolved
         const obj = this.#getOverlayer(index)
         if (obj) {
             const { overlayer, doc } = obj
@@ -513,6 +521,11 @@ export class View extends HTMLElement {
         return CFI.joinIndir(baseCFI, CFI.fromRange(range))
     }
     resolveCFI(cfi) {
+        // [REword patch 2026-11-12] book 还没挂上时（open() 里 await makeBook 解析期间），
+        // 解析 CFI 必然失败：以前这里抛 TypeError，被 resolveNavigation 的 catch 吞掉后
+        // 每条批注刷 2 行红色 console.error，再被 addAnnotation 解构 undefined 抛第二次。
+        // 直接返回空，让调用方静默跳过；书解析完 create-overlay 会补绘，不会丢标注。
+        if (!this.book) return
         if (this.book.resolveCFI)
             return this.book.resolveCFI(cfi)
         else {
