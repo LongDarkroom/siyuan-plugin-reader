@@ -2,7 +2,7 @@
   "name": "siyuan-plugin-reader",
   "author": "LongDarkroom",
   "url": "https://github.com/LongDarkroom/siyuan-plugin-reader",
-  "version": "0.6.5",
+  "version": "0.6.6",
   "minAppVersion": "3.7.0",
   "kernels": [
     "all"
@@ -28,6 +28,17 @@
   "readme": {
     "default": "README.md",
     "zh-CN": "README.md"
+  },
+  "funding": {
+    "custom": [
+      "https://ifdian.net/a/3435d"
+    ],
+    "links": [
+      {
+        "label": "爱发电 · 支持 RE 阅读器持续开发",
+        "url": "https://ifdian.net/a/3435d"
+      }
+    ]
   },
   "icon": "icon.png",
   "preview": "preview.jpg",
