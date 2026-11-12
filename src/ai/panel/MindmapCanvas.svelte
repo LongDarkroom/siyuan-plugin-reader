@@ -8,20 +8,25 @@
    * 不再是「定高盒子 + 裸滚动条」——6 层图约 1200px 宽时不必拖着滚动条爬。
    * 缩放/平移公式全在 ai-mindmap.ts（纯逻辑可单测），这里只接线。
    */
-  import { onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
   import { t } from "../../i18n/index.ts";
   import {
     boundedMindmapPan,
     clampMindmapScale,
+    easeMindmapFold,
     fitMindmapViewport,
     fitMindmapWidth,
     heuristicMindmapWidth,
     layoutMindmap,
+    mindmapEdgePath,
     mindmapWheelScale,
     MINDMAP_MAX_SCALE,
     MINDMAP_MIN_SCALE,
+    planMindmapFold,
     resetMindmapViewport,
     zoomMindmapAt,
+    type MindmapEdge,
+    type MindmapLayout,
     type MindmapLayoutNode,
     type MindmapMeasurer,
     type MindmapNode,
@@ -48,6 +53,8 @@
   let vp: MindmapViewport = { s: 1, ox: 8, oy: 8 };
   let locked = false;
   let wheelPan = false;
+  /** 首次拿到真实尺寸后再落视口：卡片 1:1，弹层直接整图适应 */
+  let viewportSettled = false;
   let depthChoice = 0;
   let lastRoot: MindmapNode | null = null;
   let drag: { id: number; x: number; y: number; ox: number; oy: number; moved: boolean } | null = null;
@@ -90,6 +97,93 @@
 
   $: layout = layoutMindmap(root, { collapsed, measure: ready ? measure : undefined });
 
+  /* ------------------------- 折叠动画 ------------------------- */
+  // 参数据思源原生思维导图块：展开 280ms / 收起 180ms，
+  // 进场节点左移 36px 滑入并淡入，离场节点收敛到祖先右缘并淡出。
+  type RenderNode = MindmapLayoutNode & { opacity: number };
+  let renderNodes: RenderNode[] = [];
+  let renderEdges: MindmapEdge[] = [];
+  let lastLayout: MindmapLayout | null = null;
+  let lastFoldSig = "";
+  let syncedRoot: MindmapNode | null = null;
+  let foldRaf = 0;
+
+  const edgesOf = (nodes: MindmapLayoutNode[]): MindmapEdge[] => {
+    const byId = new Map(nodes.map((n) => [n.id, n]));
+    const out: MindmapEdge[] = [];
+    for (const n of nodes) {
+      const parent = n.parentId ? byId.get(n.parentId) : undefined;
+      if (parent) out.push({ from: parent.id, to: n.id, d: mindmapEdgePath(parent, n) });
+    }
+    return out;
+  };
+
+  function showLayout(next: MindmapLayout): void {
+    renderNodes = next.nodes.map((n) => ({ ...n, opacity: 1 }));
+    renderEdges = next.edges;
+  }
+
+  function stopFoldAnim(): void {
+    if (foldRaf) cancelAnimationFrame(foldRaf);
+    foldRaf = 0;
+  }
+
+  /** 用户又动手了/组件要销毁：画面直接落到上一版布局，别和新动作抢帧 */
+  function settleFoldAnim(): void {
+    if (!foldRaf) return;
+    stopFoldAnim();
+    if (lastLayout) showLayout(lastLayout);
+  }
+
+  function reducedMotion(): boolean {
+    return typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  }
+
+  /**
+   * 节点集合变了（折叠/展开）才播动画；只是量出真实字宽或面板改宽导致的挪位直接落位，
+   * 换树（流式新内容）也不播——那些不是用户眼里的「折叠动作」。
+   */
+  function syncLayout(next: MindmapLayout): void {
+    const prev = lastLayout;
+    const sig = next.nodes.map((n) => n.id).join(",");
+    const foldChanged = prev !== null && sig !== lastFoldSig;
+    const rootChanged = root !== syncedRoot;
+    lastLayout = next;
+    lastFoldSig = sig;
+    syncedRoot = root;
+    if (!prev || rootChanged || !foldChanged || !renderNodes.length || reducedMotion()) {
+      stopFoldAnim();
+      showLayout(next);
+      return;
+    }
+    const plan = planMindmapFold(prev.nodes, next.nodes);
+    stopFoldAnim();
+    const start = performance.now();
+    const step = (now: number): void => {
+      const t = Math.min(1, Math.max(0, (now - start) / plan.duration));
+      const k = easeMindmapFold(plan.entering, t);
+      const nodes = plan.frames.map((f) => ({
+        ...f.node,
+        x: f.fromX + (f.toX - f.fromX) * k,
+        y: f.fromY + (f.toY - f.fromY) * k,
+        opacity: f.fromOpacity + (f.toOpacity - f.fromOpacity) * k,
+      }));
+      renderNodes = nodes;
+      renderEdges = edgesOf(nodes);
+      if (t >= 1) {
+        foldRaf = 0;
+        showLayout(next);
+        return;
+      }
+      foldRaf = requestAnimationFrame(step);
+    };
+    renderNodes = plan.frames.map((f) => ({ ...f.node, x: f.fromX, y: f.fromY, opacity: f.fromOpacity }));
+    renderEdges = edgesOf(renderNodes);
+    foldRaf = requestAnimationFrame(step);
+  }
+
+  $: syncLayout(layout);
+
   const box = (): MindmapViewBox => ({
     viewW,
     viewH,
@@ -109,23 +203,36 @@
     if (next.s !== vp.s || next.ox !== vp.ox || next.oy !== vp.oy) vp = next;
   }
 
+  // bind:clientWidth 的初值在 onMount 时可能还是 0，等尺寸和真实字宽都到位再落视口：
+  // 卡片落 1:1（拍板②），放大弹层直接整图适应，打开就能看全，不用先手点。
+  $: if (!viewportSettled && ready && viewW && viewH) {
+    viewportSettled = true;
+    vp = wide ? fitMindmapViewport(box()) : resetMindmapViewport(box());
+  }
+
   onMount(() => {
     ready = true;
-    if (viewW && viewH) vp = resetMindmapViewport(box());
   });
+  onDestroy(() => stopFoldAnim());
 
   function onPointerDown(e: PointerEvent): void {
     if (locked || e.button !== 0) return;
+    settleFoldAnim();
+    // 按下时不能立即 setPointerCapture：捕获之后浏览器补发的 click 会被重定向到
+    // 画布容器，节点 <g> 上的「−/+」折叠和双击打开引用就再也收不到点击了。
+    // 等越过拖动阈值、确认这次是拖拽再捕获。
     drag = { id: e.pointerId, x: e.clientX, y: e.clientY, ox: vp.ox, oy: vp.oy, moved: false };
-    host.setPointerCapture(e.pointerId);
   }
 
   function onPointerMove(e: PointerEvent): void {
     if (!drag || drag.id !== e.pointerId) return;
     const dx = e.clientX - drag.x;
     const dy = e.clientY - drag.y;
-    if (!drag.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
-    drag.moved = true;
+    if (!drag.moved) {
+      if (Math.abs(dx) + Math.abs(dy) < 4) return;
+      drag.moved = true;
+      host.setPointerCapture(e.pointerId);
+    }
     apply({ s: vp.s, ox: drag.ox + dx, oy: drag.oy + dy });
   }
 
@@ -142,6 +249,7 @@
 
   function onWheel(e: WheelEvent): void {
     if (locked) return;
+    settleFoldAnim();
     const rect = host.getBoundingClientRect();
     if (e.ctrlKey || e.metaKey) {
       e.preventDefault();
@@ -184,10 +292,14 @@
     return base;
   }
 
-  function pickDepth(e: Event): void {
+  /** 展开到 N 级：折叠会让整图变小，等新布局落到组件上再重新适应，别按旧尺寸算 */
+  async function pickDepth(e: Event): Promise<void> {
     const depth = Number((e.target as HTMLSelectElement).value) || 0;
     depthChoice = depth;
+    settleFoldAnim();
     onFoldDepth?.(depth);
+    await tick();
+    apply(fitMindmapViewport(box()));
   }
 
   $: zoomPct = Math.round(vp.s * 100);
@@ -223,22 +335,24 @@
 >
   <svg class="mm-svg" width="100%" height="100%" role="img" aria-label={t("思维导图")}>
     <g transform={`translate(${vp.ox},${vp.oy}) scale(${vp.s})`}>
-      {#each layout.edges as edge (edge.from + ">" + edge.to)}
+      {#each renderEdges as edge (edge.from + ">" + edge.to)}
         <path class="mm-edge" d={edge.d}></path>
       {/each}
 
-      {#each layout.nodes as node (node.id)}
+      {#each renderNodes as node (node.id)}
         <g
           class="mm-node"
           class:root={node.depth === 0}
           class:collapsed={node.collapsed}
           class:has-ref={!!node.ref}
           transform={`translate(${node.x},${node.y})`}
+          opacity={node.opacity}
+          pointer-events={node.opacity < 1 ? "none" : undefined}
           role="button"
           tabindex="0"
           aria-label={nodeTitle(node)}
           on:click={() => nodeClick(node)}
-          on:dblclick={() => node.ref && onOpenBlock?.(node.ref)}
+          on:dblclick|stopPropagation={() => node.ref && onOpenBlock?.(node.ref)}
           on:keydown={(e) => nodeKey(e, node)}
         >
           <title>{nodeTitle(node)}</title>

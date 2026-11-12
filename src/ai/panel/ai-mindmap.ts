@@ -350,6 +350,19 @@ export interface MindmapEdge {
   d: string;
 }
 
+/** 父右缘 → 子左缘的三次贝塞尔；折叠动画每帧按插值坐标重算也走这一份 */
+export function mindmapEdgePath(
+  parent: { x: number; y: number; w: number; h: number },
+  child: { x: number; y: number; h: number },
+): string {
+  const x1 = parent.x + parent.w;
+  const y1 = parent.y + parent.h / 2;
+  const x2 = child.x;
+  const y2 = child.y + child.h / 2;
+  const mx = (x1 + x2) / 2;
+  return `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}`;
+}
+
 export interface MindmapLayout {
   nodes: MindmapLayoutNode[];
   edges: MindmapEdge[];
@@ -530,12 +543,7 @@ export function layoutMindmap(root: MindmapNode, opts: MindmapLayoutOptions = {}
     });
     // 只连可见子节点；曲线从父右缘到子左缘
     for (const k of m.kids) {
-      const x1 = m.x + m.w;
-      const y1 = m.y + m.h / 2;
-      const x2 = k.x;
-      const y2 = k.y + k.h / 2;
-      const mx = (x1 + x2) / 2;
-      edges.push({ from: m.id, to: k.id, d: `M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}` });
+      edges.push({ from: m.id, to: k.id, d: mindmapEdgePath(m, k) });
     }
   };
   place(metas[0]);
@@ -572,6 +580,111 @@ export function foldMindmapByDepth(root: MindmapNode, depth: number): string[] {
   };
   walk(root, 0, "0");
   return ids;
+}
+
+/* ============================ 折叠动画 ============================ */
+
+/**
+ * 参数照搬思源原生思维导图块：展开（有节点进场）280ms 的 easeInOutQuad，
+ * 纯收起 180ms 的 easeOutCubic；进场节点从目标位左侧 36px 滑入并淡入，
+ * 离场节点收敛到最近幸存祖先的右缘中点并淡出。`prefers-reduced-motion` 由调用方短路。
+ */
+export const MINDMAP_FOLD_ENTER_MS = 280;
+export const MINDMAP_FOLD_COLLAPSE_MS = 180;
+export const MINDMAP_FOLD_ENTER_OFFSET = 36;
+
+export interface MindmapFoldFrame {
+  node: MindmapLayoutNode;
+  fromX: number;
+  fromY: number;
+  toX: number;
+  toY: number;
+  fromOpacity: number;
+  toOpacity: number;
+}
+
+export interface MindmapFoldPlan {
+  frames: MindmapFoldFrame[];
+  duration: number;
+  /** 有节点进场（展开）→ easeInOutQuad；纯收起 → easeOutCubic */
+  entering: boolean;
+}
+
+/** 进场节点的起点：沿祖先位移反推，再左移 36px（同思源 animateFold） */
+function enteringOrigin(
+  node: MindmapLayoutNode,
+  prev: Map<string, MindmapLayoutNode>,
+  next: Map<string, MindmapLayoutNode>,
+): { x: number; y: number } {
+  let pid = node.parentId;
+  while (pid) {
+    const before = prev.get(pid);
+    const after = next.get(pid);
+    if (before && after) {
+      return {
+        x: node.x + before.x - after.x - MINDMAP_FOLD_ENTER_OFFSET,
+        y: node.y + before.y - after.y,
+      };
+    }
+    pid = next.get(pid)?.parentId;
+  }
+  return { x: node.x - MINDMAP_FOLD_ENTER_OFFSET, y: node.y };
+}
+
+/** 离场节点收敛到最近的、这一版还活着的祖先右缘中点（同思源 animateFold） */
+function survivingAncestor(
+  node: MindmapLayoutNode,
+  prev: Map<string, MindmapLayoutNode>,
+  next: Map<string, MindmapLayoutNode>,
+): MindmapLayoutNode | null {
+  let pid = node.parentId;
+  while (pid) {
+    const hit = next.get(pid);
+    if (hit) return hit;
+    pid = prev.get(pid)?.parentId;
+  }
+  return next.get("0") || null;
+}
+
+/** 旧布局 → 新布局的逐节点起止帧；调用方按 easeMindmapFold 插值即可 */
+export function planMindmapFold(prevNodes: MindmapLayoutNode[], nextNodes: MindmapLayoutNode[]): MindmapFoldPlan {
+  const prev = new Map(prevNodes.map((n) => [n.id, n]));
+  const next = new Map(nextNodes.map((n) => [n.id, n]));
+  const entering = nextNodes.some((n) => !prev.has(n.id));
+  const frames: MindmapFoldFrame[] = [];
+  for (const n of nextNodes) {
+    const before = prev.get(n.id);
+    if (before) {
+      frames.push({ node: n, fromX: before.x, fromY: before.y, toX: n.x, toY: n.y, fromOpacity: 1, toOpacity: 1 });
+    } else {
+      const origin = enteringOrigin(n, prev, next);
+      frames.push({ node: n, fromX: origin.x, fromY: origin.y, toX: n.x, toY: n.y, fromOpacity: 0, toOpacity: 1 });
+    }
+  }
+  for (const gone of prevNodes) {
+    if (next.has(gone.id)) continue;
+    const anc = survivingAncestor(gone, prev, next);
+    frames.push({
+      node: gone,
+      fromX: gone.x,
+      fromY: gone.y,
+      toX: anc ? anc.x + anc.w : gone.x,
+      toY: anc ? anc.y + (anc.h - gone.h) / 2 : gone.y,
+      fromOpacity: 1,
+      toOpacity: 0,
+    });
+  }
+  return {
+    frames,
+    duration: entering ? MINDMAP_FOLD_ENTER_MS : MINDMAP_FOLD_COLLAPSE_MS,
+    entering,
+  };
+}
+
+/** 0→1 时间进度 → 位移进度（缓动值与思源 animateFold 一致） */
+export function easeMindmapFold(entering: boolean, t: number): number {
+  const k = Math.min(1, Math.max(0, num(t)));
+  return entering ? (k < 0.5 ? 2 * k * k : 1 - ((-2 * k + 2) ** 2) / 2) : 1 - (1 - k) ** 3;
 }
 
 /* ============================ 视口 ============================ */
@@ -619,13 +732,19 @@ export function zoomMindmapAt(vp: MindmapViewport, nextScale: number, px: number
   return { s: ns, ox: num(px) - (num(px) - num(vp.ox)) * k, oy: num(py) - (num(py) - num(vp.oy)) * k };
 }
 
-/** 夹紧平移：内容比视野大时两端各留 keep 可见；比视野小时贴左上，不许拖进空白里漂 */
+/**
+ * 夹紧平移：
+ *  - 内容比视野大：两端各留 keep 可见，防止一甩甩丢；
+ *  - 内容比视野小：允许在 [0, 视野-内容] 内摆动（整块始终留在画面里）。
+ *    早先这里是 `return 0`（贴左上、不许拖），结果「装得下的图」拖起来完全没反应，
+ *    用户以为画布卡死；改成允许在视野内挪位置，手感才对得上抓手光标。
+ */
 export function boundedMindmapPan(vp: MindmapViewport, box: MindmapViewBox, keep = MINDMAP_PAN_KEEP): MindmapViewport {
   const s = clampMindmapScale(vp.s);
   const bound = (offset: number, view: number, content: number) => {
     const v = Math.max(1, num(view, 1));
     const c = Math.max(0, num(content)) * s;
-    if (c <= v) return 0;
+    if (c <= v) return Math.min(v - c, Math.max(0, offset));
     return Math.min(v - Math.min(keep, v), Math.max(Math.min(keep, c) - c, offset));
   };
   return {
@@ -654,11 +773,17 @@ export function fitMindmapWidth(box: MindmapViewBox, pad = 8): MindmapViewport {
   return { s, ox: pad, oy: ch * s <= vh ? pad + (vh - ch * s) / 2 : pad };
 }
 
-/** 默认视口：1:1（字能读），左上起排、图比视野矮时垂直居中——靠拖动看全图 */
+/** 默认视口：1:1（字能读）；装得下的轴居中、装不下的贴左上靠拖动看全图 */
 export function resetMindmapViewport(box: MindmapViewBox, pad = 8): MindmapViewport {
+  const vw = Math.max(1, num(box.viewW, 1));
   const vh = Math.max(1, num(box.viewH, 1));
+  const cw = Math.max(1, num(box.contentW, 1));
   const ch = Math.max(1, num(box.contentH, 1));
-  return { s: 1, ox: pad, oy: ch <= vh ? pad + (vh - ch) / 2 : pad };
+  return {
+    s: 1,
+    ox: cw <= vw ? (vw - cw) / 2 : pad,
+    oy: ch <= vh ? (vh - ch) / 2 : pad,
+  };
 }
 
 /** 把某个节点挪到视野中心（键盘导航/搜索定位用） */
