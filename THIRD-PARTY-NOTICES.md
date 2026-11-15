@@ -5,7 +5,7 @@ RE 阅读器（siyuan-plugin-reader）源码以 **AGPL-3.0-or-later** 发布（�
 
 | 组件 | 用途 | 许可 | 上游 |
 |---|---|---|---|
-| js-mdict 7 | MDX/MDD 离线词典解析（构建进 `index.js`） | **AGPL-3.0** | https://github.com/terasum/js-mdict |
+| js-mdict 6.0.8 | MDX/MDD 离线词典解析（构建进 `index.js`） | MIT | https://github.com/terasum/js-mdict |
 | foliate-js | EPUB 渲染内核（`src/reader/vendor/foliate-js`） | MIT | https://github.com/johnfactotum/foliate-js |
 | PDF.js | PDF 固定版式渲染（`pdf.worker.mjs` 及 foliate 内置副本） | Apache-2.0 | https://github.com/mozilla/pdf.js |
 | zip.js | EPUB 随机访问解压（foliate-js 内置） | BSD-3-Clause | https://github.com/gildas-lormeau/zip.js |
@@ -13,14 +13,20 @@ RE 阅读器（siyuan-plugin-reader）源码以 **AGPL-3.0-or-later** 发布（�
 | Svelte 4 | UI 运行时（编译产物内含其运行时） | MIT | https://github.com/sveltejs/svelte |
 | construct-style-sheets-polyfill | adoptedStyleSheets 垫片 | MIT | https://github.com/calebdwilliams/construct-style-sheets |
 | Tabler Icons | 划词工具栏图标（构建期内联，源自思源自带图标） | MIT | https://github.com/tabler/tabler-icons |
+| 思源宋体 Source Han Serif SC | 内置中文衬线字体（可变字重子集 250–900，`assets/fonts/REwordSerifSC-VF.woff2`） | **SIL OFL 1.1** | https://github.com/adobe-fonts/source-han-serif |
+| 思源黑体 Source Han Sans SC | 内置中文无衬线字体（子集，`assets/fonts/REwordSansSC-Regular.woff2`） | **SIL OFL 1.1** | https://github.com/adobe-fonts/source-han-sans |
 
-## 为什么本插件是 AGPL 而不是 MIT
+## 关于本插件与第三方组件的许可证
 
-`js-mdict` 采用 AGPL-3.0，且其代码被构建进对外分发的 `index.js`。AGPL 作品并入后，
-整体必须以 AGPL 分发——因此本插件自改用 js-mdict 起即应为 AGPL-3.0；仓库 LICENSE
-改为 AGPL-3.0 全文正是补齐这一既有要求。js-mdict 的版权声明为
-`Copyright (C) 2026 terasum <terasum@163.com>`，其许可证与本插件 `LICENSE` 同为
-AGPL-3.0 全文。
+（2026-11-13 更新）`js-mdict` 已从 7.0.0（AGPL-3.0）降到 **6.0.8（MIT）**。它的代码仍被
+构建进对外分发的 `index.js`，但不再带来 AGPL 的传染性义务 —— 至此本插件打包的第三方
+组件里**没有 AGPL 或其它 copyleft 代码**（见上表：MIT / BSD-3-Clause / Apache-2.0 /
+SIL OFL 1.1）。js-mdict 的版权声明为 `Copyright (c) 2018 terasum`，MIT 许可证全文见
+https://github.com/terasum/js-mdict/blob/master/LICENSE。
+
+本插件自身仍按仓库 `LICENSE` 声明的 **AGPL-3.0-or-later** 发布，这是项目所有者的选择，
+与第三方组件无关。若要将本插件改为闭源/其它许可分发，只需修改 `LICENSE` 与
+`package.json` 的 `license` 字段，不再有第三方 copyleft 阻碍。
 
 其余组件（MIT / BSD-3-Clause / Apache-2.0）均可单向并入 AGPLv3：保留其版权声明与
 许可证全文即可，不改变本插件整体的 AGPL 授权。Apache-2.0 的 PDF.js 在产物中保留了
@@ -385,3 +391,39 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+---
+
+## 思源宋体 / 思源黑体 — SIL Open Font License 1.1
+
+本插件内置两款中文正文字体（**子集**，随包分发）：
+
+| 文件 | 字体 | 体积 |
+|---|---|---|
+| `assets/fonts/REwordSerifSC-VF.woff2` | 思源宋体 Source Han Serif SC（可变字重子集，wght 250–900） | 4.08 MB |
+| `assets/fonts/REwordSansSC-Regular.woff2` | 思源黑体 Source Han Sans SC Regular | 1.95 MB |
+
+版权声明：
+
+```
+Copyright 2017-2022 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+Copyright 2014-2025 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+Source is a trademark of Adobe in the United States and/or other countries.
+```
+
+许可证全文随字体文件分发，见：
+
+- `assets/fonts/LICENSE-SourceHanSerif.txt`
+- `assets/fonts/LICENSE-SourceHanSans.txt`
+
+### 对 OFL 的遵守说明
+
+OFL 1.1 规定「修改版不得使用保留字体名」。**子集化属于修改**，因此本插件分发的
+两款字体已在 `name` 表中把 family / full / PostScript 名改成自有名
+`REword Serif SC` / `REword Sans SC`（构建脚本 `scripts/build_builtin_fonts.py`
+可复现），不再使用保留名 `Source`。可变字体的命名实例（如
+`SourceHanSerifSCVF-Bold`）也一并改为 `REwordSerifSCVF-Bold`。
+字体**未单独售卖**，仅作为本插件的一部分分发。
+
+字符集：ASCII + 中西文标点 + GB2312 全字符（6763 汉字 + 682 符号）。子集外的生僻
+字由浏览器按 CSS 字体回退链继续查找，不会出现豆腐块。

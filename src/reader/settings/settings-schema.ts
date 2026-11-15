@@ -19,6 +19,8 @@ import { t } from "../../i18n/index.ts";
 import {
   READER_FONT_SIZE_MIN,
   READER_FONT_SIZE_MAX,
+  READER_FONT_WEIGHT_MIN,
+  READER_FONT_WEIGHT_MAX,
   THEME_PRESETS,
   LAYOUT_PRESETS,
   LAYOUT_PRESET_KEYS,
@@ -240,6 +242,14 @@ export interface GroupDef {
    * 让用户点开前就知道里面有什么（否则 showIf 隐藏会导致布局跳动）。
    */
   collapsed?: boolean;
+  /**
+   * 卡片下方的补充说明（2026-11-13）。
+   *
+   * 用于「主开关关掉后，本组其余行被 showIf 藏起」留下的空白：
+   * 不留一句解释的话，用户只看到孤零零一个开关，会以为其余设置丢了。
+   * 写成声明而非在组件里特判，保持 schema 是唯一真源。
+   */
+  note?: { text: string; showIf?: (s: any, extra: any) => boolean };
 }
 
 /** Tab 定义 */
@@ -418,7 +428,20 @@ export const TABS: TabDef[] = [
             unit: "px",
             hint: t("图注 / 脚注的小字下限"),
           },
-          { path: "text.fontWeight", label: t("字重"), ctrl: "stepper", min: 100, max: 900, step: 100 },
+          {
+            path: "text.fontWeight",
+            label: t("字重"),
+            ctrl: "stepper",
+            // 2026-11-13：下界必须对齐字体本身（内置宋体 wght 轴 250–900）。
+            // 原因见 READER_FONT_WEIGHT_MIN 的注释。
+            min: READER_FONT_WEIGHT_MIN,
+            max: READER_FONT_WEIGHT_MAX,
+            // 25 一档：只给 100 一档时「要么偏浅要么偏深」，中间档位调不出来。
+            step: 25,
+            // 2026-11-13：实测 19px 下内置宋体 600 的笔画粗细（3.11px）最接近
+            // macOS 宋体 Songti SC Regular（3.2px），400 档则明显偏细。
+            hint: t("约 600 最接近系统宋体"),
+          },
         ],
       },
       {
@@ -479,7 +502,9 @@ export const TABS: TabDef[] = [
             showIf: (s) => FONT_FAMILY_ON(s),
             // 2026-11-01 拉丁/中文分工：这两槽是**西文**槽（英文正文走这里），
             // 汉字由「中文字体」槽接手（浏览器按字符逐个回退）。
-            hint: t("西文衬线；汉字走中文字体"),
+            // 2026-11-13：候选里已**移除**中文字体（23 项里 22 项中文渲染逐像素相同，
+            // 见 reader-settings.ts 的 SERIF_FONT_PRESETS 注释）。
+            hint: t("只作用于西文；汉字另设"),
           },
           {
             path: "sansSerifFont",
@@ -487,7 +512,7 @@ export const TABS: TabDef[] = [
             ctrl: "select",
             optionsFrom: sansSerifFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
-            hint: t("西文无衬线；汉字走中文字体"),
+            hint: t("只作用于西文；汉字另设"),
           },
           {
             path: "monospaceFont",
@@ -508,7 +533,9 @@ export const TABS: TabDef[] = [
             // 2026-10-14 方案 A：CJK 也改为动态 store，但首项保留翻译标签。
             optionsFrom: cjkFontOptions,
             showIf: (s) => FONT_FAMILY_ON(s),
-            hint: t("汉字回退到此；留空用系统栈"),
+            // 2026-11-13：「自动」= 按正文分类配对内置字体（衬线→思源宋体、无衬线→思源黑体）。
+            // 旧文案「留空用系统栈」与实现不符（空值实际落到候选池第一名霞鹜文楷）。
+            hint: t("自动按衬线/无衬线配对"),
           },
         ],
       },
@@ -1051,8 +1078,8 @@ export const TABS: TabDef[] = [
   /* ==================== Tab · 双语翻译 ==================== */
   // 2026-10-14 简化重设计（对标 Readest「对照阅读」）：
   //   1. 从「语言」Tab 抽出、独立成 Tab；一个插件只有一个翻译配置入口。
-  //   2. 引擎收口为**腾讯机器翻译单引擎** —— 删「翻译服务」下拉（含 AI 兜底）与
-  //      「译文样式」（AI 提示词风格）；密钥仍走 __translateEngine 二级页（现只腾讯）。
+  //   2. 引擎入口统一走 __translateEngine 二级页；2026-11-13 起支持
+  //      千问 MT（首选）+ 腾讯机翻（兜底）双引擎，页面内可选「自动 / 千问 / 腾讯」。
   //   3. 运行时收敛为**渐进式单模式**（边读边译边缓存），故原「预翻译页数」改名
   //      「渐进预取分节」，语义是「当前分节之后额外预译的分节数」。
   //   AI 兜底、监督中心、五引擎优先级链、译文归档已整体下线。
@@ -1063,13 +1090,51 @@ export const TABS: TabDef[] = [
     groups: [
       {
         title: t("对照阅读"),
+        // 关闭态只留一个开关会显得「其余设置丢了」——补一句说明填补空白。
+        note: {
+          text: t("开启翻译后，语言、预取与重试等选项才会显示"),
+          showIf: (s) => !s.bilingual,
+        },
         rows: [
           { path: "bilingual", label: t("启用翻译"), ctrl: "switch",
             hint: t("原文下插入译文，边读边译"), apply: "render", scope: "book" },
-          // 引擎凭据入口（现仅腾讯）。二级页给开关 + SecretId/SecretKey + 连通性测试。
+          // ---- 以下 6 项仅在开启翻译后显示 ----
+          { path: "bilingualShowSource", label: t("显示原文"), ctrl: "switch",
+            apply: "render", scope: "book",
+            showIf: (s) => !!s.bilingual },
+          // 悬停显形：只淡出译文、不收起占位，鼠标扫过正文时不会上下跳动；
+          // 与「显示原文 = 关」互斥（原文都藏了，译文再藏会是空白页）。
+          { path: "bilingualHoverShow", label: t("悬停显示译文"), ctrl: "switch",
+            apply: "render", scope: "book",
+            hint: t("悬停原文时才显示译文"),
+            showIf: (s) => !!s.bilingual && s.bilingualShowSource !== false },
+          { path: "bilingualTarget", label: t("翻译到"), ctrl: "select",
+            // 2026-10-06：原先此行既无 options 也无 optionsFrom → 下拉渲染成空，
+            // 用户以为功能坏了。选项复用双语模块的既有语言表（含简繁中文）。
+            options: TARGET_LANG_OPTIONS,
+            apply: "render", scope: "book",
+            showIf: (s) => !!s.bilingual },
+          { path: "bilingualPrefetchPages", label: t("渐进预取分节"), ctrl: "stepper",
+            min: 0, max: 20, step: 1, unit: t("节"), showIf: (s) => !!s.bilingual },
+          { path: "translationFontSize", label: t("译文字号"), ctrl: "slider",
+            min: 0.4, max: 1.2, step: 0.02, unit: "%", showIf: (s) => !!s.bilingual },
+          { path: "bilingualSkipCached", label: t("跳过已缓存"), ctrl: "switch",
+            showIf: (s) => !!s.bilingual },
+          { path: "bilingualRetry", label: t("失败自动重试"), ctrl: "switch",
+            showIf: (s) => !!s.bilingual },
+        ],
+      },
+      {
+        // 2026-11-13：入口行单独成组。此前三条入口与阅读选项混在「对照阅读」里，
+        // 「凭据 / 术语 / 缓存」是**配置与管理**，不是阅读行为，混排会让
+        // 只想调「译文字号」的人误以为要先进这三个页面。
+        title: t("翻译服务"),
+        rows: [
+          // 引擎选择 + 凭据入口（千问 / 腾讯）。二级页给引擎选择、开关、
+          // 各自凭据字段 + 连通性测试。
           {
             path: "__translateEngine",
-            label: t("腾讯翻译凭据"),
+            label: t("翻译引擎与凭据"),
             ctrl: "action",
             action: "translateEngine",
             apply: "translate",
@@ -1102,24 +1167,6 @@ export const TABS: TabDef[] = [
             scope: "global",
             hint: t("按书查看或清空缓存"),
           },
-          // ---- 以下 3 项为 2026-10-07 对标 Readest 补齐（此前完全没有）----
-          { path: "bilingualShowSource", label: t("显示原文"), ctrl: "switch",
-            apply: "render", scope: "book",
-            showIf: (s) => !!s.bilingual },
-          { path: "bilingualTarget", label: t("翻译到"), ctrl: "select",
-            // 2026-10-06：原先此行既无 options 也无 optionsFrom → 下拉渲染成空，
-            // 用户以为功能坏了。选项复用双语模块的既有语言表（含简繁中文）。
-            options: TARGET_LANG_OPTIONS,
-            apply: "render", scope: "book",
-            showIf: (s) => !!s.bilingual },
-          { path: "bilingualPrefetchPages", label: t("渐进预取分节"), ctrl: "stepper",
-            min: 0, max: 20, step: 1, unit: t("节"), showIf: (s) => !!s.bilingual },
-          { path: "translationFontSize", label: t("译文字号"), ctrl: "slider",
-            min: 0.4, max: 1.2, step: 0.02, unit: "%", showIf: (s) => !!s.bilingual },
-          { path: "bilingualSkipCached", label: t("跳过已缓存"), ctrl: "switch",
-            showIf: (s) => !!s.bilingual },
-          { path: "bilingualRetry", label: t("失败自动重试"), ctrl: "switch",
-            showIf: (s) => !!s.bilingual },
         ],
       },
     ],

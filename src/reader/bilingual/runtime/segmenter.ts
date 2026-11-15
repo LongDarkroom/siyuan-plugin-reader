@@ -17,6 +17,13 @@ import { segHash, isTranslatedPeer } from "../../bilingual-v2/render.ts";
 const BLOCK = "p, li, blockquote";
 /** div 仅作叶子文本块兜底：部分 EPUB 用 div 而非 p 做段落 */
 const LEAF_DIV = "div";
+/**
+ * 表格单元格（2026-11-13 新增）：只切「叶子单元格」——
+ * 单元格里若有 p/div 等块级子节点，正文由那些块承担，单元格整体再切会重复翻译。
+ */
+const CELL = "td, th";
+/** 至少含一个文字字符（表格里大量纯数字/符号单元格，翻译它们纯属浪费额度） */
+const HAS_LETTER = /\p{L}/u;
 /** 不应翻译的节点 */
 const EXCLUDED = "pre, code, math, style, script";
 /** 作为整体翻译的容器：其内 p/li 跳过，改译容器整体 */
@@ -38,18 +45,24 @@ export function segmentDocument(
   isSegmentHidden?: (hash: string) => boolean,
 ): Segment[] {
   if (!doc || typeof doc.querySelectorAll !== "function") return [];
-  const all = Array.from(doc.querySelectorAll(`${BLOCK}, ${LEAF_DIV}`)) as Element[];
+  const all = Array.from(doc.querySelectorAll(`${BLOCK}, ${LEAF_DIV}, ${CELL}`)) as Element[];
   const out: Segment[] = [];
   let recent: string[] = [];
   for (const el of all) {
     if (el.closest(EXCLUDED)) continue;
     if ((el as HTMLElement).classList?.contains("reword-bilingual")) continue;
     if (el.hasAttribute("data-translation-mark")) continue;
-    if (el.tagName === "DIV" && el.querySelector("p, li, blockquote, div")) continue;
+    // 叶子判定：div 与单元格只在「没有块级后代」时整体翻译；
+    // 含 table 的单元格同样跳过（嵌套表格由内层单元格各自承担）。
+    if (
+      (el.tagName === "DIV" || el.tagName === "TD" || el.tagName === "TH") &&
+      el.querySelector("p, li, blockquote, div, table")
+    ) continue;
     if (el.parentElement?.closest(CONTAINER)) continue;
     if (el.hasAttribute("data-reword-translated") || isTranslatedPeer(el)) continue;
     const text = cleanText(el.textContent || "");
     if (!text) continue;
+    if ((el.tagName === "TD" || el.tagName === "TH") && !HAS_LETTER.test(text)) continue;
     if (isSegmentHidden && isSegmentHidden(segHash(text))) continue;
     out.push({
       locatorKey: segHash(text),

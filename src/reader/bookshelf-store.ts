@@ -14,6 +14,7 @@ import { unzipSync } from "fflate";
 import { writable } from "svelte/store";
 import { bookFingerprint } from "./book-fingerprint.ts";
 import { type BookType } from "./reader-mode.ts";
+import { isMobile } from "../core/env.ts";
 
 /*
  * 类型与常量已原位抽取到 library/ 层（library-types.ts / library-persist.ts），
@@ -50,6 +51,24 @@ export class BookshelfStore {
   private loaded = false;
   /** 内部 Svelte store：让消费者可订阅书架变化（导入/删除/进度更新后自动刷新） */
   private _store = writable<BookMeta[]>([]);
+
+  /**
+   * 2026-11-15 开书提速：最近打开书籍的**文件缓存**（bookId → Blob，LRU）。
+   *
+   * 为什么需要：`getFileBlob` 每次都把整个书籍文件经 `/api/file/getFile`
+   * 从磁盘搬到 WebView 内存（书架上 10–27 MB 的 EPUB 很常见，还有 176 MB 的 PDF）。
+   * 关掉再开同一本书时，这份搬运会**原样再做一遍** —— 移动端 IO 与内存都弱，
+   * 表现就是「每次点书都要等好几秒」。
+   *
+   * 预算按前端分档（Map 迭代顺序即插入顺序，命中时重新 set 到末尾即为 LRU）：
+   *  · 桌面：单本 ≤ 160 MB，总计 ≤ 320 MB —— 大 PDF 也能缓存；
+   *  · 移动：单本 ≤ 32 MB，总计 ≤ 64 MB —— WebView 进程内存有限，
+   *    缓存过大反被系统回收（甚至 OOM），宁可重读。
+   * 超过单本上限的文件一律不缓存：大 PDF 首次慢是文件本身决定的，缓存救不了它，
+   * 但牺牲它换整机稳定是划算的。
+   */
+  private fileCache = new Map<string, Blob>();
+  private fileCacheBytes = 0;
 
   constructor(private plugin: any) {}
 
@@ -481,12 +500,53 @@ export class BookshelfStore {
     return getFileBlob(meta.cover);
   }
 
-  /** 读取书籍文件为 Blob */
+  /** 读取书籍文件为 Blob（命中文件缓存时不再走磁盘） */
   async getBlob(id: string): Promise<Blob | null> {
     await this.load();
     const meta = this.get(id);
     if (!meta) return null;
-    return getFileBlob(meta.path);
+    const cached = this.fileCache.get(id);
+    if (cached) {
+      // LRU：命中后挪到末尾（Map 迭代顺序 = 插入顺序）
+      this.fileCache.delete(id);
+      this.fileCache.set(id, cached);
+      return cached;
+    }
+    const blob = await getFileBlob(meta.path);
+    if (blob) this.rememberFile(id, blob);
+    return blob;
+  }
+
+  /** 把刚读到的书籍文件放进缓存（超预算则跳过或淘汰最旧的） */
+  private rememberFile(id: string, blob: Blob): void {
+    const mobile = isMobile();
+    const maxOne = mobile ? 32 * 1024 * 1024 : 160 * 1024 * 1024;
+    const maxTotal = mobile ? 64 * 1024 * 1024 : 320 * 1024 * 1024;
+    if (blob.size > maxOne) return;
+    // 同一本书被重新导入（同 id 新文件）时先减掉旧值，避免重复计数
+    const prev = this.fileCache.get(id);
+    if (prev) {
+      this.fileCacheBytes -= prev.size;
+      this.fileCache.delete(id);
+    }
+    this.fileCache.set(id, blob);
+    this.fileCacheBytes += blob.size;
+    // 超总量：从最旧的开始淘汰，但绝不淘汰刚放进去的这本
+    while (this.fileCacheBytes > maxTotal && this.fileCache.size > 1) {
+      const oldest = this.fileCache.keys().next().value as string | undefined;
+      if (oldest === undefined || oldest === id) break;
+      const old = this.fileCache.get(oldest);
+      this.fileCache.delete(oldest);
+      if (old) this.fileCacheBytes -= old.size;
+    }
+  }
+
+  /** 书籍删除/替换时清缓存，避免继续读到旧文件 */
+  private forgetFile(id: string): void {
+    const old = this.fileCache.get(id);
+    if (!old) return;
+    this.fileCache.delete(id);
+    this.fileCacheBytes -= old.size;
   }
 
   /**
@@ -498,6 +558,8 @@ export class BookshelfStore {
     await this.load();
     const meta = this.get(id);
     if (meta) {
+      // 2026-11-15：先清文件缓存，防止「删了还能从缓存里打开」
+      this.forgetFile(id);
       if (opts.deleteFile) {
         try {
           await removeFile(meta.path);

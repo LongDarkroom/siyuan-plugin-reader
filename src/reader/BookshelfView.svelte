@@ -7,6 +7,8 @@
   import { onMount, onDestroy, tick } from "svelte";
   // 2026-10-24 移动端适配 Phase 1/3：响应式视口状态（根节点状态类 + 手机端交互分支）
   import { viewport, isPhoneBreakpoint } from "../core/viewport-store.ts";
+  // 2026-11-15：触屏设备判定 —— 决定是否启用 HTML5 拖拽（见下方 touchUI 注释）
+  import { isTouchDevice } from "../core/env.ts";
   import type {
     BookshelfStore,
     BookMeta,
@@ -20,6 +22,7 @@
   import { isSupportedBookFile } from "../reader/book-adapters";
   import ReadingStatsPanel from "./ReadingStatsPanel.svelte";
   import OpdsSearchPanel from "./OpdsSearchPanel.svelte";
+  import CloudShelfPanel from "./CloudShelfPanel.svelte";
   import GraphPanel from "./GraphPanel.svelte";
   import BookshelfContextMenu, { type MenuItem } from "./bookshelf-context-menu.svelte";
   // 2026-09-11 多语言：中文原文即 key；t 被局部变量遮蔽的作用域改用别名 T
@@ -83,6 +86,23 @@
    *  - 计时 500→550ms；弹出时轻震反馈（Android；iOS 无 API，静默降级）。
    * ================================================================ */
   $: isPhoneBp = isPhoneBreakpoint($viewport.breakpoint);
+
+  /**
+   * 2026-11-15 触屏设备：**必须关掉书卡的 HTML5 拖拽**（真机反馈「书架滑不动」的根因）。
+   *
+   * 病因链（iOS WKWebView / Android WebView 同一机制）：
+   *  · `draggable="true"` 的元素，WebKit 会把该元素上的触摸序列先当作「拖拽候选」，
+   *    滚动要等拖拽判定失败后才启动 ⇒ 手指按在任意一张卡上起滑，纵向滚动被吞掉。
+   *  · 书架满屏都是卡片，所以「几乎按哪里都滑不动」，而不是某块区域滑不动。
+   *  · 封面又是 `<img>`（img 默认 draggable），长按还会弹系统「存储图像」，
+   *    进一步打断手势。
+   *
+   * 拖拽本身是**桌面交互**：触屏已有等价入口（卡片 ⋯ 菜单 / 长按菜单 / 多选移入分组），
+   * 所以触屏直接不开 draggable，桌面行为一行不变。
+   * 与「思阅」的 `dragEnabled = !isMobile()` 同一取舍（README_zh_CN.md:303）。
+   */
+  const touchUI = isTouchDevice();
+
   let lpTimer: ReturnType<typeof setTimeout> | null = null;
   let lpFired = false;
   function onCardTouchStart(e: TouchEvent, items: MenuItem[]) {
@@ -167,6 +187,8 @@
   let showStats = false;
   /** OPDS 在线书源面板开关（B · 在线书源 / OPDS 搜书） */
   let showOpds = false;
+  /** 云端书库面板开关（WebDAV / S3，读用户自己的网盘目录） */
+  let showCloud = false;
   /** 阅读知识图谱面板开关（C · 图谱 / 画布联动） */
   let showGraph = false;
 
@@ -1502,6 +1524,11 @@
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.globe}</span></button>
     <button
       class="shelf-icon-btn"
+      title={t("云端书库（WebDAV / S3）")}
+      on:click={() => (showCloud = true)}
+    ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.cloudShelf}</span></button>
+    <button
+      class="shelf-icon-btn"
       title={t("阅读知识图谱")}
       on:click={() => (showGraph = true)}
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.graph}</span></button>
@@ -1956,11 +1983,11 @@
             <div
               class="book-card"
               class:selected={selectedIds.includes(book.id)}
-              draggable={true}
+              draggable={!touchUI}
               on:dragstart={(e) => onBookDragStart(e, book.id)}
               on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
               on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
-              on:touchmove={onCardTouchMove}
+              on:touchmove|passive={onCardTouchMove}
               on:touchend={onCardTouchEnd}
               on:touchcancel={onCardTouchEnd}
             >
@@ -1970,7 +1997,7 @@
                   on:click={() => (selectMode ? toggleSelect(book.id) : onOpen(book.id))}
                 >
                   {#if coverUrls[book.id]}
-                    <img class="book-cover-img" src={coverUrls[book.id]} alt={book.title} />
+                    <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
                   {:else}
                     <span class="book-cover-text">{book.title.slice(0, 2)}</span>
                   {/if}
@@ -2081,11 +2108,11 @@
               class:focused={rowFocusIdx === idx}
               data-idx={idx}
               class:selected={selectedIds.includes(book.id)}
-              draggable={true}
+              draggable={!touchUI}
               on:dragstart={(e) => onBookDragStart(e, book.id)}
               on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
               on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
-              on:touchmove={onCardTouchMove}
+              on:touchmove|passive={onCardTouchMove}
               on:touchend={onCardTouchEnd}
               on:touchcancel={onCardTouchEnd}
             >
@@ -2110,7 +2137,7 @@
               <div class="row-title-line">
                 <button class="row-cover" title={book.title} on:click={() => onOpen(book.id)}>
                   {#if coverUrls[book.id]}
-                    <img class="book-cover-img" src={coverUrls[book.id]} alt={book.title} />
+                    <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
                   {:else}
                     <span class="row-cover-text">{book.title.slice(0, 1)}</span>
                   {/if}
@@ -2347,7 +2374,7 @@
           <div class="edit-cover-row">
             <div class="edit-cover-preview">
               {#if coverUrls[editTarget.id]}
-                <img class="book-cover-img" src={coverUrls[editTarget.id]} alt={editTarget.title} />
+                <img class="book-cover-img" draggable="false" src={coverUrls[editTarget.id]} alt={editTarget.title} />
               {:else}
                 <span class="book-cover-text">{editTitle.slice(0, 2)}</span>
               {/if}
@@ -2488,6 +2515,11 @@
   <!-- B · 在线书源（OPDS）：模态面板（自身已含 edit-mask 遮罩） -->
   {#if showOpds}
     <OpdsSearchPanel {store} onOpenBook={onOpen} on:close={() => (showOpds = false)} />
+  {/if}
+
+  <!-- 云端书库（WebDAV / S3）：只读远端目录，下载后走 importBook 进本地书架 -->
+  {#if showCloud}
+    <CloudShelfPanel {store} onOpenBook={onOpen} on:close={() => (showCloud = false)} />
   {/if}
 
   <!-- C · 阅读知识图谱 / 画布联动：模态面板（自身已含 edit-mask 遮罩） -->
@@ -2752,10 +2784,16 @@
     min-width: 0;
     transition: transform 0.15s ease;
   }
-  .book-card:hover {
-    /* 2026-10-11 B3：-2px → -3px。2px 在密集网格里会被相邻卡片的阴影吃掉，
-       看起来像「抖了一下」；3px + L3 阴影才读得出是被抬起来了。 */
-    transform: translateY(-3px);
+  /* 2026-11-15 触屏流畅度：卡片上浮必须只在「真有指针悬停」的设备生效。
+     触屏 WebView 会在 touchstart 那一刻命中 :hover，并一直保持到下次点击别处 ——
+     手指沿列表滑动时，每经过一张卡它就上浮 3px + 换阴影（触发布局与重绘），
+     体感就是「滑得一抖一抖 / 不跟手」。桌面完全不受影响。 */
+  @media (hover: hover) {
+    .book-card:hover {
+      /* 2026-10-11 B3：-2px → -3px。2px 在密集网格里会被相邻卡片的阴影吃掉，
+         看起来像「抖了一下」；3px + L3 阴影才读得出是被抬起来了。 */
+      transform: translateY(-3px);
+    }
   }
   .book-cover {
     position: relative;
@@ -2774,9 +2812,11 @@
     box-shadow: var(--reword-elev-2, 0 2px 8px rgba(0, 0, 0, 0.12));
     transition: box-shadow 0.2s ease;
   }
-  .book-card:hover .book-cover {
-    /* L3，和 translateY(-2px) 一起抬 */
-    box-shadow: var(--reword-elev-3, 0 8px 20px rgba(0, 0, 0, 0.18));
+  @media (hover: hover) {
+    .book-card:hover .book-cover {
+      /* L3，和 translateY(-2px) 一起抬 */
+      box-shadow: var(--reword-elev-3, 0 8px 20px rgba(0, 0, 0, 0.18));
+    }
   }
   .book-cover-text {
     font-size: 22px;
@@ -3638,14 +3678,34 @@
   .shelf-main {
     flex: 1;
     min-width: 0;
+    /* 2026-11-15：flex 子项默认 min-height:auto，内容比视口高时「撑开而不滚动」；
+       显式归零让 overflow-y 真正接管纵向滚动（配合 .bookshelf-body 的 min-height:0）。 */
+    min-height: 0;
     overflow-y: auto;
     /* 2026-10-25 移动端适配 C2/C5：滚动收敛 + 滚动声明。
        contain：滚到头/底不把滚动链传给宿主 Dialog（手机滑动"生涩/串动"体感来源之一）；
        pan-y：纵向滚动明确交给浏览器合成器（更跟手），横向手势不被卡片拦截。 */
     overscroll-behavior: contain;
     touch-action: pan-y;
+    /* 老 WebView（iOS 12 / 部分鸿蒙）没有这行就没有惯性滚动，松手立即停 */
+    -webkit-overflow-scrolling: touch;
     container-type: inline-size;
     container-name: shelf-main;
+  }
+  /* 2026-11-15 触屏：彻底断掉元素级原生拖拽。
+     draggable 属性已按设备关闭（见 script 里的 touchUI），这里再用 CSS 兜一层：
+     Safari 对 <img> / <a> 等默认 draggable 的元素不看属性，只认 -webkit-user-drag。 */
+  .bookshelf-view.re-phone .book-card,
+  .bookshelf-view.re-large-phone .book-card,
+  .bookshelf-view.re-tablet .book-card,
+  .bookshelf-view.re-phone .shelf-row,
+  .bookshelf-view.re-large-phone .shelf-row,
+  .bookshelf-view.re-tablet .shelf-row,
+  .bookshelf-view.re-phone .book-cover-img,
+  .bookshelf-view.re-large-phone .book-cover-img,
+  .bookshelf-view.re-tablet .book-cover-img {
+    -webkit-user-drag: none;
+    -webkit-touch-callout: none;
   }
   .shelf-sb-block {
     display: flex;

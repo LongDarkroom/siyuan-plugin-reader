@@ -20,6 +20,7 @@ import type {
   SegmenterLike,
   VisibilityLike,
 } from "../core/types.ts";
+import type { PretranslateScan } from "../../bilingual-types.ts";
 import { PRETRANSLATE_DEFAULTS } from "../core/types.ts";
 import type { Injector } from "./injector.ts";
 
@@ -61,6 +62,11 @@ export interface PretranslateQueue {
   /** 翻页/窗口推进后调用：把窗口内已缓存但未注入的块补注进去 */
   pumpFromCache(): Promise<void>;
   cancel(): void;
+  /** 暂停派发（在途批次照常跑完，结果不丢） */
+  pause(): void;
+  resume(): void;
+  /** 预扫描：不送译，统计全书段数/字数/已缓存数 */
+  scan(signal?: AbortSignal): Promise<PretranslateScan>;
   state(): PretranslateState;
   /** 已完成（已入缓存）的定位键，用于断点续传 */
   doneKeys(): string[];
@@ -68,6 +74,9 @@ export interface PretranslateQueue {
 
 export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQueue {
   let cancelled = false;
+  let paused = false;
+  /** 暂停时挂起的 worker，resume/cancel 时统一唤醒 */
+  let resumeWaiters: Array<() => void> = [];
   const done = new Set<string>();
   const state: PretranslateState = {
     status: "idle",
@@ -80,6 +89,18 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
 
   function aborted(signal?: AbortSignal): boolean {
     return cancelled || !!signal?.aborted;
+  }
+
+  /** 暂停闸门：暂停中挂起，恢复/取消时放行 */
+  function waitIfPaused(): Promise<void> {
+    if (!paused) return Promise.resolve();
+    return new Promise((resolve) => resumeWaiters.push(resolve));
+  }
+
+  function wakeWaiters(): void {
+    const waiters = resumeWaiters;
+    resumeWaiters = [];
+    for (const w of waiters) w();
   }
 
   function emit(): void {
@@ -143,6 +164,11 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
     let cursor = 0;
     async function worker(): Promise<void> {
       while (cursor < pending.length && !aborted(signal)) {
+        // 暂停点：一个批次跑完才停（在途请求不中断，结果照常入缓存）
+        if (paused) {
+          await waitIfPaused();
+          if (aborted(signal)) break;
+        }
         const chunk = pending.slice(cursor, cursor + blocksPerLane);
         cursor += blocksPerLane;
         await runChunk(chunk);
@@ -167,6 +193,15 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
       const blocksPerLane = job.blocksPerLane ?? PRETRANSLATE_DEFAULTS.blocksPerLane;
       const ahead = job.aheadSections ?? PRETRANSLATE_DEFAULTS.aheadSections;
       cancelled = false;
+      paused = false;
+      // 每轮从 0 起算：弹窗进度条与 ETA 都以「本轮」为口径，
+      // 沿用上一轮计数会让 done 单调累加、进度超过 100%。
+      state.done = 0;
+      state.total = 0;
+      state.cachedOnly = 0;
+      state.injected = 0;
+      state.failed = 0;
+      done.clear();
       state.status = "running";
       emit();
 
@@ -179,6 +214,10 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
           } else {
             for (const sec of sections) {
               if (aborted(job.signal)) break;
+              if (paused) {
+                await waitIfPaused();
+                if (aborted(job.signal)) break;
+              }
               const doc = await sec.createDocument();
               if (!doc) continue;
               const idx = typeof sec.index === "number" ? sec.index : 0;
@@ -233,7 +272,69 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
 
     cancel(): void {
       cancelled = true;
-      if (state.status === "running") state.status = "cancelled";
+      paused = false;
+      wakeWaiters();
+      if (state.status === "running" || state.status === "paused") state.status = "cancelled";
+    },
+
+    pause(): void {
+      if (state.status !== "running") return;
+      paused = true;
+      state.status = "paused";
+      emit();
+    },
+
+    resume(): void {
+      if (!paused) return;
+      paused = false;
+      state.status = "running";
+      wakeWaiters();
+      emit();
+    },
+
+    /**
+     * 预扫描：枚举全书分节 → 按 locatorKey 去重 → 统计段数/字数/已缓存。
+     * 不送译、不注入，仅 CPU + 一次缓存读，可安全在确认弹窗打开时调用。
+     */
+    async scan(signal?: AbortSignal): Promise<PretranslateScan> {
+      const seen = new Map<string, string>();
+      const sections = deps.getSections?.() ?? [];
+      const collect = (segs: Segment[]) => {
+        for (const s of segs) if (!seen.has(s.locatorKey)) seen.set(s.locatorKey, s.text);
+      };
+      if (sections.length) {
+        for (const sec of sections) {
+          if (aborted(signal)) break;
+          const doc = await sec.createDocument();
+          if (!doc) continue;
+          const idx = typeof sec.index === "number" ? sec.index : 0;
+          collect(deps.segmenter.segmentsOf(doc, idx));
+          deps.segmenter.invalidate(doc);
+        }
+      } else {
+        collect(windowSegments(PRETRANSLATE_DEFAULTS.aheadSections));
+      }
+      const texts = [...seen.values()];
+      let cached = 0;
+      if (deps.checkCached && texts.length) {
+        // 分批查：避免一次把几千段塞进单个缓存查询
+        const CHUNK = 200;
+        for (let i = 0; i < texts.length; i += CHUNK) {
+          if (aborted(signal)) break;
+          try {
+            const flags = await deps.checkCached(texts.slice(i, i + CHUNK));
+            cached += flags.filter(Boolean).length;
+          } catch {
+            // 缓存查询失败不该阻断「开始预翻译」，按未命中计
+          }
+        }
+      }
+      return {
+        sections: sections.length || 1,
+        total: texts.length,
+        chars: texts.reduce((n, s) => n + s.length, 0),
+        cached,
+      };
     },
 
     state(): PretranslateState {

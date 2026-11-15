@@ -134,7 +134,11 @@ export interface PretranslateJob {
 
 /** 预翻译运行时状态 */
 export interface PretranslateState {
-  status: "idle" | "running" | "done" | "cancelled" | "error";
+  /**
+   * paused = 用户暂停：不再派发新块，但已发出去的请求会跑完
+   * （中断在途 HTTP 会白付一次费用且结果丢失，恢复到下一批才真省钱）。
+   */
+  status: "idle" | "running" | "paused" | "done" | "cancelled" | "error";
   /** 已处理块数（含命中缓存的） */
   done: number;
   /** 总块数（progressive 模式下随翻页增长） */
@@ -202,6 +206,9 @@ export interface InjectorLike {
 export interface PretranslateQueueLike {
   start(job: PretranslateJob): Promise<void>;
   cancel(): void;
+  /** 暂停派发（在途批次跑完即停在分节边界上） */
+  pause(): void;
+  resume(): void;
   /** 翻页/推进：窗口变化后按进度补注入已缓存块 */
   onProgress(): void;
   state(): PretranslateState;

@@ -2,22 +2,43 @@
  * 翻译引擎编排
  * ------------------------------------------------------------------
  * buildProviders：组装「未命中缓存」段落要走的 provider 链。
- *   - 2026-10-14 简化：双语只保留**腾讯机器翻译**单一引擎。
- *     原先的「免费引擎优先级链（腾讯/有道/百度/微软/LibreTranslate）+ AI 兜底」
- *     整条下线 —— AI 翻译暂不支持，其余四家凭据/用量/优先级配置一并撤除。
- *     deps（AI 注入函数）形参保留只为不破坏 run.ts 的调用签名，实际不再使用。
- *   - 链为 `[TencentTranslator]`（已配置密钥）或 `[]`（未配置）。
- *     链空时由调用方（run.ts / TranslateHost）提示「未配置」，不静默返回空。
+ *   - 2026-11-13：恢复双引擎 —— 千问 MT（首选）+ 腾讯机翻（兜底）。
+ *     用户可在设置里选「自动 / 千问 / 通用大模型 / 腾讯」；自动模式按
+ *     千问 → 通用大模型 → 腾讯 顺序尝试。显式选择时只装配该引擎，未配置
+ *     就返回空链（由调用方提示未配置，而不是静默换另一家 —— 用户选了腾讯
+ *     却走千问会产生费用归属困惑）。
+ *   - 缓存命名空间跟引擎/模型绑定（见 cacheNamespaceOf），换引擎不会误用旧译文。
  *
  * translateWithFallback：链内依次尝试，返回首个「成功且译文非空」的结果；
- *   全部失败则返回全空串（provider: "none"）。单引擎下等价于「试一次腾讯」。
+ *   全部失败则返回全空串（provider: "none"）。
  */
 import type { Translator, TranslateRequest, TranslateOutcome } from "./types.ts";
 import { TencentTranslator } from "./providers/tencent.ts";
+import {
+  QwenMtTranslator,
+  DEFAULT_QWEN_BASE_URL,
+  DEFAULT_QWEN_MT_MODEL,
+} from "./providers/qwen-mt.ts";
+import { OpenAiCompatTranslator } from "./providers/openai-compat.ts";
 import type { AiTranslateFn, AiTranslateBatchFn } from "./providers/ai.ts";
+
+/** 用户可选的引擎链（auto = 按优先级自动尝试） */
+export type EngineChoice = "auto" | "qwen-mt" | "openai-compat" | "tencent";
 
 /** 引擎配置（来自 AiSettings 的翻译相关字段） */
 export interface EngineConfig {
+  // 千问机器翻译（Qwen-MT / DashScope 兼容模式）
+  qwenEnabled?: boolean;
+  qwenApiKey?: string;
+  qwenBaseUrl?: string;
+  qwenModel?: string;
+  qwenCharsUsed?: number;
+  // 通用大模型（任意 OpenAI 兼容端点）
+  openaiEnabled?: boolean;
+  openaiApiKey?: string;
+  openaiBaseUrl?: string;
+  openaiModel?: string;
+  openaiCharsUsed?: number;
   // 腾讯翻译（Tencent Cloud TMT）
   tencentSecretId?: string;
   tencentSecretKey?: string;
@@ -102,6 +123,15 @@ export function isAiTokenLocked(cfg: EngineConfig): boolean {
 /** 判断单引擎当前是否可用（已启用 + 已配置 + 未达用量锁） */
 export function isEngineAvailable(name: string, cfg: EngineConfig): boolean {
   switch (name) {
+    case "qwen-mt":
+      return !!(cfg.qwenEnabled && cfg.qwenApiKey);
+    case "openai-compat":
+      return !!(
+        cfg.openaiEnabled &&
+        cfg.openaiApiKey &&
+        cfg.openaiBaseUrl &&
+        cfg.openaiModel
+      );
     case "tencent":
       return !!(cfg.tencentEnabled && cfg.tencentSecretId && cfg.tencentSecretKey && !isTencentLocked(cfg));
     case "youdao":
@@ -119,18 +149,66 @@ export function isEngineAvailable(name: string, cfg: EngineConfig): boolean {
   }
 }
 
+/** 用户传入的引擎值归一：任何未知值（含 undefined / 旧字段）都按 auto 处理 */
+export function normalizeEngine(engine: string | undefined): EngineChoice {
+  return engine === "qwen-mt" || engine === "openai-compat" || engine === "tencent"
+    ? engine
+    : "auto";
+}
+
 /**
- * 组装 provider 链：只可能是「腾讯」单引擎。
- * 仅当腾讯「已启用 + 已配置密钥 + 未达用量锁」才入链，否则返回空链（由调用方提示未配置）。
- *
- * @param _deps  保留形参以兼容 run.ts 调用签名；AI 已下线，这里不使用。
- * @param _engine 保留形参；单引擎下无「选链」语义，忽略用户传入值。
+ * 引擎对应的缓存命名空间。
+ * 千问/通用大模型按模型隔离（不同模型译文不同）；腾讯沿用空串（历史缓存继续命中）。
  */
-export function buildProviders(cfg: EngineConfig, _deps: EngineDeps, _engine?: string): Translator[] {
-  if (isEngineAvailable("tencent", cfg)) {
-    return [new TencentTranslator(cfg.tencentSecretId!, cfg.tencentSecretKey!)];
+export function cacheNamespaceOf(name: string, cfg: EngineConfig): string {
+  if (name === "qwen-mt") return `qwen-mt:${cfg.qwenModel || DEFAULT_QWEN_MT_MODEL}`;
+  if (name === "openai-compat") {
+    return cfg.openaiModel ? `openai:${cfg.openaiModel}` : "openai:";
   }
-  return [];
+  if (name === "ai") return "ai";
+  return "";
+}
+
+/**
+ * 组装 provider 链。
+ * - auto：千问（已配置）→ 通用大模型（已配置）→ 腾讯（已配置），任一可缺；
+ * - 显式：只装配所选引擎，未配置返回空链（调用方据此提示「未配置」）。
+ *
+ * @param _deps 保留形参以兼容 run.ts 调用签名；AI provider 当前不在链内。
+ */
+export function buildProviders(cfg: EngineConfig, _deps: EngineDeps, engine?: string): Translator[] {
+  const want = normalizeEngine(engine);
+  const qwenOk = isEngineAvailable("qwen-mt", cfg);
+  const openaiOk = isEngineAvailable("openai-compat", cfg);
+  const tencentOk = isEngineAvailable("tencent", cfg);
+
+  const qwen = () =>
+    new QwenMtTranslator({
+      apiKey: cfg.qwenApiKey || "",
+      baseUrl: cfg.qwenBaseUrl || DEFAULT_QWEN_BASE_URL,
+      model: cfg.qwenModel || DEFAULT_QWEN_MT_MODEL,
+    });
+  const openai = () =>
+    new OpenAiCompatTranslator({
+      apiKey: cfg.openaiApiKey || "",
+      baseUrl: cfg.openaiBaseUrl || "",
+      model: cfg.openaiModel || "",
+    });
+  const tencent = () => new TencentTranslator(cfg.tencentSecretId!, cfg.tencentSecretKey!);
+
+  if (want === "qwen-mt") return qwenOk ? [qwen()] : [];
+  if (want === "openai-compat") return openaiOk ? [openai()] : [];
+  if (want === "tencent") return tencentOk ? [tencent()] : [];
+  const chain: Translator[] = [];
+  if (qwenOk) chain.push(qwen());
+  if (openaiOk) chain.push(openai());
+  if (tencentOk) chain.push(tencent());
+  return chain;
+}
+
+/** 当前选择下是否存在可翻译引擎（isConfigured / 设置页状态用） */
+export function hasEngine(cfg: EngineConfig, engine?: string): boolean {
+  return buildProviders(cfg, { translateOne: async () => "" }, engine).length > 0;
 }
 
 /** 按顺序尝试 providers，返回首个成功且译文非空的结果 */

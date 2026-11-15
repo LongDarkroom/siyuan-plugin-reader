@@ -91,6 +91,13 @@ export interface AiGenerateOptions extends AiToolOptions {
   timeout?: number;
   /** 取消信号（停止生成用） */
   signal?: AbortSignal;
+  /**
+   * 追加进请求体的厂商私有字段（2026-11-13 新增）。
+   * 千问 MT 的 `translation_options` 是顶层字段，且只在 user 消息下生效；
+   * 塞进 messages 或 system prompt 都无效，故需要一条通用出口。
+   * 合并顺序在标准字段之后：允许覆盖 temperature / max_tokens 等。
+   */
+  extraBody?: Record<string, any>;
 }
 
 export interface AiGenerateResult {
@@ -547,7 +554,10 @@ export async function requestAIGenerate(
   const url = buildChatUrl(settings.baseUrl);
   if (!url) throw new Error(T("AI baseUrl 为空或无法解析为 chat 端点"));
 
-  const body = buildRequestBody(opts.messages, settings, opts.jsonMode ?? settings.jsonMode, opts.tools, opts.toolChoice);
+  const body = {
+    ...buildRequestBody(opts.messages, settings, opts.jsonMode ?? settings.jsonMode, opts.tools, opts.toolChoice),
+    ...(opts.extraBody || {}),
+  };
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (settings.apiKey) headers["Authorization"] = `Bearer ${settings.apiKey}`;
 

@@ -16,11 +16,22 @@
 
   /** 翻译宿主（TranslateHost 实例，由 SettingsDialog 传入） */
   export let host: any = null;
+  /**
+   * 取样当前书籍正文（2026-11-13）。由阅读器注入；缺省时隐藏「自动提取」——
+   * 书架等没有打开书的地方点了也无从取样。
+   */
+  export let sampleBookText: null | (() => Promise<string>) = null;
+  /** 双语目标语言（提取候选的译法语言，ISO 代码） */
+  export let targetLang = "zh";
 
   interface Term { src: string; dst: string; caseSensitive?: boolean; note?: string }
   let terms: Term[] = [];
   let tip = "";
   let loaded = false;
+  /** 自动提取进行中（按钮禁用 + 文案切换） */
+  let extracting = false;
+  /** 自动提取的单独提示（不覆盖保存提示） */
+  let extractTip = "";
 
   function load() {
     try {
@@ -41,6 +52,55 @@
   }
   function clearAll() {
     terms = [];
+  }
+
+  /**
+   * 自动提取术语（2026-11-13）。
+   *
+   * 流程：取样 → 宿主调对话模型 → 候选并入编辑表 → 用户核对后手动保存。
+   * 不自动落盘是刻意的：模型给错译法时若直接生效，会污染整本书的译文。
+   */
+  async function autoExtract() {
+    if (extracting || !loaded) return;
+    if (!sampleBookText) {
+      extractTip = t("没有打开的书籍，无法取样");
+      return;
+    }
+    if (!host?.extractGlossaryTerms) {
+      extractTip = t("当前版本不支持自动提取");
+      return;
+    }
+    extracting = true;
+    extractTip = t("正在取样并提取术语…");
+    try {
+      const sample = await sampleBookText();
+      const r = await host.extractGlossaryTerms(sample, targetLang);
+      if (!r?.ok) {
+        extractTip = r?.error || t("提取失败，请稍后重试");
+        return;
+      }
+      const existing = new Set(
+        terms.filter((x) => x.src?.trim()).map((x) => x.src.trim().toLowerCase()),
+      );
+      const next = [...terms];
+      let added = 0;
+      for (const term of (r.terms || []) as Term[]) {
+        const key = (term?.src || "").trim().toLowerCase();
+        if (!key || existing.has(key)) continue;
+        existing.add(key);
+        next.push({ src: term.src, dst: term.dst ?? "", caseSensitive: false });
+        added++;
+      }
+      terms = next;
+      extractTip = added
+        ? t("已加入 {n} 条候选，请核对译法后点「保存术语表」", { n: added })
+        : t("没有发现新术语（已存在的不会重复加入）");
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 自动提取术语失败", { error: e });
+      extractTip = t("提取失败，请查看日志");
+    } finally {
+      extracting = false;
+    }
   }
 
   async function save() {
@@ -70,11 +130,24 @@
 
   <div class="gl-toolbar">
     <button type="button" class="rwd-tr-btn" on:click={addRow}>{t("+ 添加术语")}</button>
+    {#if sampleBookText}
+      <button
+        type="button"
+        class="rwd-tr-btn"
+        disabled={extracting || !loaded}
+        on:click={autoExtract}
+      >
+        {extracting ? t("提取中…") : t("自动提取术语")}
+      </button>
+    {/if}
     {#if terms.length > 0}
       <button type="button" class="rwd-tr-btn ghost" on:click={clearAll}>{t("清空")}</button>
     {/if}
     <span class="gl-count">{t("共 {n} 条", { n: terms.filter((x) => x.src?.trim()).length })}</span>
   </div>
+  {#if extractTip}
+    <p class="gl-extract-tip">{extractTip}</p>
+  {/if}
 
   {#if !loaded}
     <div class="gl-empty">{t("载入中…")}</div>
@@ -106,8 +179,9 @@
 <style>
   .gl-page { display: flex; flex-direction: column; gap: 12px; padding: 4px 2px; }
   .gl-intro { margin: 0; font-size: 12px; line-height: 1.6; color: var(--b3-theme-on-surface, #777); }
-  .gl-toolbar { display: flex; align-items: center; gap: 8px; }
+  .gl-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .gl-count { margin-left: auto; font-size: 12px; color: var(--b3-theme-on-surface, #999); }
+  .gl-extract-tip { margin: 0; font-size: 11px; line-height: 1.5; color: var(--b3-theme-on-surface, #777); }
   .gl-empty { padding: 18px 0; text-align: center; font-size: 12px; color: var(--b3-theme-on-surface, #999); }
   .gl-head, .gl-row { display: grid; grid-template-columns: 1fr 1fr 56px 34px; gap: 8px; align-items: center; }
   .gl-head { font-size: 11px; color: var(--b3-theme-on-surface, #999); padding: 0 2px; }

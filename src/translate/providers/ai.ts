@@ -50,6 +50,7 @@ export interface AiTranslatorDeps {
 
 export class AiTranslator implements Translator {
   readonly name = "ai" as const;
+  readonly cacheNs = "ai";
 
   private deps: AiTranslatorDeps;
 

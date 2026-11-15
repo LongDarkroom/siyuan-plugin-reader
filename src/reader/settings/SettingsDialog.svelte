@@ -22,7 +22,11 @@
   import TranslateEnginePage from "./TranslateEnginePage.svelte";
   import GlossaryPage from "./GlossaryPage.svelte";
   import CachePage from "./CachePage.svelte";
-  import { refreshFontOptions } from "../reader-settings.ts";
+  import { refreshFontOptions, setSysFontInventory } from "../reader-settings.ts";
+  // 2026-11-13：内核系统字体清单（判断「本机是否真有这个族」的唯一可靠来源）
+  import { getSysFonts } from "../../siyuan/api.ts";
+  // 2026-11-13：内置宋/黑注册到主文档，供 canvas 试画判重（否则与系统同款重复两行）
+  import { ensureBuiltinFontsInDocument } from "../builtin-fonts.ts";
   import FontManagerPage from "./FontManagerPage.svelte";
   import TargetManagerPage from "./TargetManagerPage.svelte";
   import DocTreePickerPage from "./DocTreePickerPage.svelte";
@@ -46,6 +50,11 @@
    * 「两棵组件树间经宿主对象通信」做法（DictManager 也是这样传的）。
    */
   export let translateHost: any = null;
+  /**
+   * 取样当前书籍正文（2026-11-13，术语自动提取用）。
+   * 由阅读器注入；缺省时术语页不显示「自动提取」按钮（书架等无书场景）。
+   */
+  export let sampleBookText: null | (() => Promise<string>) = null;
   /**
    * 思源 API（2026-10-08 新增，供「选择导出文档」二级页列文档用）。
    *
@@ -102,6 +111,12 @@
   let panelEl: HTMLElement | null = null;
   /** 搜索框 DOM（跳转后回焦用） */
   let searchEl: HTMLInputElement | null = null;
+  /**
+   * Tab 条 DOM（移动端横向滚动定位用，2026-11-13）。
+   * ≤720px 时左列折成顶部横条并 overflow-x:auto；不把当前项滚进视野的话，
+   * 切到靠后的 Tab（双语翻译/朗读）只会露出半个名字，看起来像被裁坏了。
+   */
+  let tabsEl: HTMLElement | null = null;
   /** 打开前的焦点，关闭后归还 */
   let lastFocus: HTMLElement | null = null;
   /** 2026-10-14：document.fonts loadingdone 事件 handler 引用（供 onDestroy 清理） */
@@ -173,6 +188,9 @@
       // 用户会以为设置弹窗被别的浮层顶开了。
       subPage = null;
       query = "";
+      confirmReset = false;
+      // 入口行状态（凭据 / 术语 / 缓存）每次打开都重新读：缓存会被阅读过程改动
+      void refreshEntryStatus();
       // 2026-10-14：宿主指定聚焦 Tab（如「双语设置」直达 translate）；非法 key 落到下面的合法性兜底。
       if (initialTab && visibleTabs.some((x) => x.key === initialTab)) {
         activeKey = initialTab;
@@ -184,6 +202,7 @@
         } catch {
           /* 聚焦失败不影响使用 */
         }
+        centerActiveTab();
       });
     }
   }
@@ -209,6 +228,30 @@
     if (document.fonts?.addEventListener) {
       document.fonts.addEventListener("loadingdone", fontLoadingDoneHandler);
     }
+    // 2026-11-13：再拉一次**内核**系统字体清单（`/api/system/getSysFonts`）。
+    // document.fonts 只有已注册的 face，系统字体大多不在其中 ⇒ 靠它无法判断
+    // 「本机到底装没装这个族」。内核清单是思源「外观 → 字体」同一份数据，
+    // 拿到后「未安装」标记才有依据；接口不可用（旧内核）时静默保持不标记。
+    void (async () => {
+      try {
+        const faces = await getSysFonts();
+        if (!faces.length) return;
+        setSysFontInventory(faces);
+        refreshFontOptions();
+      } catch {
+        /* 清单不可用 → 保留 document.fonts 的结果，不影响面板 */
+      }
+    })();
+    // 2026-11-13：把内置宋/黑注册进主文档，否则 canvas 试画时它们是回退帧，
+    // 无法与系统里那份同款字体判重（列表会重复两行）。完成后重算一次选项。
+    void (async () => {
+      try {
+        await ensureBuiltinFontsInDocument(fontStore?.pluginName ?? "");
+        refreshFontOptions();
+      } catch {
+        /* 注册失败 → 选项里仍有「内置」两项（豁免不隐藏），只是不去重 */
+      }
+    })();
   });
 
   onDestroy(() => {
@@ -226,6 +269,11 @@
     if (e.key === "Escape") {
       e.preventDefault();
       e.stopPropagation();
+      // 确认层是最上面一层：Esc 先关它，而不是把整个设置弹窗关掉
+      if (confirmReset) {
+        confirmReset = false;
+        return;
+      }
       if (subPage) {
         subPage = null;
         return;
@@ -290,7 +338,18 @@
       } catch {
         /* 忽略 */
       }
+      centerActiveTab();
     });
+  }
+
+  /** 把当前选中的 Tab 滚到横条中央（仅移动端可滚时生效） */
+  function centerActiveTab() {
+    const box = tabsEl;
+    if (!box || box.scrollWidth <= box.clientWidth + 1) return;
+    const on = box.querySelector<HTMLElement>(".rwd-tab.on");
+    if (!on) return;
+    const target = on.offsetLeft - (box.clientWidth - on.offsetWidth) / 2;
+    box.scrollLeft = Math.max(0, Math.min(target, box.scrollWidth - box.clientWidth));
   }
 
   /**
@@ -311,6 +370,7 @@
       /* 日志失败不影响交互 */
     }
     activeKey = key;
+    void Promise.resolve().then(centerActiveTab);
   }
 
   /** 遮罩点击（面板内部点击不冒泡到遮罩） */
@@ -367,14 +427,99 @@
   }
 
   /**
+   * 翻译服务入口行的状态（2026-11-13）。
+   *
+   * 这三个值都不在 ReaderSettings 里：凭据在 TranslateHost 的引擎配置、
+   * 术语在 reader-glossary.json、缓存在该书目录的译文文件。
+   * 只能运行时向宿主问，schema 保持纯静态。
+   *
+   * 缓存段数要逐本读（listCachedBooks 只给 bookId/title），
+   * 故先渲染「读取中…」再异步补齐 —— 行高固定，文字变化不引起位移。
+   */
+  let entryStatus: Record<string, { text: string; set: boolean }> = {};
+  let entryStatusSeq = 0;
+
+  async function refreshEntryStatus() {
+    const h = translateHost;
+    if (!h) return;
+    const seq = ++entryStatusSeq;
+    const next: Record<string, { text: string; set: boolean }> = {};
+
+    try {
+      const ready = h.isConfigured?.() === true;
+      next.__translateEngine = { text: ready ? t("已配置") : t("未配置"), set: ready };
+    } catch {
+      next.__translateEngine = { text: t("状态未知"), set: false };
+    }
+
+    try {
+      const n = (h.glossaryTerms?.() ?? []).length;
+      next.__glossary = n > 0 ? { text: t("{n} 条", { n }), set: true } : { text: t("暂无术语"), set: false };
+    } catch {
+      next.__glossary = { text: t("状态未知"), set: false };
+    }
+
+    next.__cache = { text: t("读取中…"), set: false };
+    if (seq !== entryStatusSeq) return;
+    entryStatus = next;
+
+    try {
+      const books = await Promise.resolve(h.listCachedBooks?.() ?? []);
+      if (seq !== entryStatusSeq) return;
+      const list = Array.isArray(books) ? books : [];
+      if (!list.length) {
+        entryStatus = { ...entryStatus, __cache: { text: t("暂无缓存"), set: false } };
+        return;
+      }
+      let seg = 0;
+      try {
+        const sizes = await Promise.all(
+          list.map(async (b: any) => {
+            try {
+              return Number(await h.cacheSize?.(b.bookId)) || 0;
+            } catch {
+              return 0;
+            }
+          }),
+        );
+        seg = sizes.reduce((a: number, b: number) => a + b, 0);
+      } catch {
+        /* 段数读不到时退化为只显示本数，不影响入口可用 */
+      }
+      if (seq !== entryStatusSeq) return;
+      entryStatus = {
+        ...entryStatus,
+        __cache: {
+          text: seg > 0 ? t("{n} 本 · {m} 段", { n: list.length, m: seg }) : t("{n} 本", { n: list.length }),
+          set: true,
+        },
+      };
+    } catch {
+      if (seq === entryStatusSeq) {
+        entryStatus = { ...entryStatus, __cache: { text: t("状态未知"), set: false } };
+      }
+    }
+  }
+
+  /**
    * 给 action 行注入「当前值」（2026-10-10 列表化收敛）。
    *
    * 为什么要运行时注入而不是写在 schema 里：schema 是**纯静态声明**，
    * 拿不到宿主的书架 store。总览页要显示「共 N 本 · 已绑定 M」这种聚合统计，
    * 只有运行时从 `store` 才能算出来。
+   *
+   * ⚠️ `status` 必须由模板显式传入（`decorateRow(row, entryStatus)`）：
+   * Svelte 只追踪模板表达式里**直接出现**的变量；函数体内部读 `entryStatus`
+   * 不会建立依赖 —— 异步状态回写后行不会重渲染（曾表现为永远停在「读取中…」）。
    */
-  function decorateRow(row: any): any {
+  function decorateRow(row: any, status: Record<string, { text: string; set: boolean }>): any {
     if (row?.ctrl !== "action") return row;
+    // 翻译服务三个入口（2026-11-13）：状态由 refreshEntryStatus 异步读入。
+    // 入口行在点进去之前就能看到「已配置 / N 条 / N 本」，不必逐个点开确认。
+    const st = status[row.path];
+    if (st) {
+      return { ...row, displayValue: st.text, displayValueSet: st.set };
+    }
     if (row.path === "__targetManager") {
       const list: any[] = store?.list ?? [];
       const total = list.length;
@@ -406,6 +551,46 @@
       }
     }
     return n;
+  }
+
+  /**
+   * 分组补充说明的显隐（2026-11-13）。
+   * 与 RowControl 的 showIf 同口径：条件函数抛错时按「不显示」处理。
+   */
+  function showGroupNote(group: any, settings: any, extra: any): boolean {
+    try {
+      return !!group?.note && (!group.note.showIf || !!group.note.showIf(settings ?? {}, extra ?? {}));
+    } catch {
+      return false;
+    }
+  }
+
+  /* ===================== 重置二次确认（2026-11-13） =====================
+   * 点击即重置是**不可撤销**的破坏性操作，而按钮就挂在「完成」旁边，
+   * 误点成本极高。故加一层确认：说清范围（书本 + PDF 全部）、
+   * 也说清不受影响的部分（翻译凭据 / 术语表 / 缓存），避免读者以为会丢配置。
+   */
+  let confirmReset = false;
+  let resetCancelEl: HTMLButtonElement | null = null;
+
+  function askReset() {
+    confirmReset = true;
+    // 焦点落到「取消」而不是「确认重置」：误触场景下回车不应直接执行破坏性操作
+    void Promise.resolve().then(() => {
+      try {
+        resetCancelEl?.focus?.();
+      } catch {
+        /* 聚焦失败不影响使用 */
+      }
+    });
+  }
+
+  /** 二级页返回一级页时刷新入口状态（术语 / 缓存 / 凭据都可能刚被改过） */
+  let prevSubPage: string | null = null;
+  $: if (subPage !== prevSubPage) {
+    const wasSub = prevSubPage;
+    prevSubPage = subPage;
+    if (wasSub && !subPage) void refreshEntryStatus();
   }
 </script>
 
@@ -451,7 +636,7 @@
             {/if}
           </div>
 
-          <div class="rwd-tabs" role="tablist">
+          <div class="rwd-tabs" role="tablist" bind:this={tabsEl}>
             {#each visibleTabs as tab (tab.key)}
               <button
                 type="button"
@@ -528,7 +713,11 @@
           <TranslateEnginePage host={translateHost} />
 
         {:else if subPage === "glossary"}
-          <GlossaryPage host={translateHost} />
+          <GlossaryPage
+            host={translateHost}
+            {sampleBookText}
+            targetLang={settings?.bilingualTarget || "zh"}
+          />
 
         {:else if subPage === "cache"}
           <CachePage host={translateHost} />
@@ -705,7 +894,7 @@
                 {#each group.rows as row, ri (gi + "-c" + ri)}
                   <RowControl
                     {settings}
-                    row={decorateRow(row)}
+                    row={decorateRow(row, entryStatus)}
                     {extra}
                     onChange={onRowChange}
                     onAction={onAction}
@@ -724,13 +913,16 @@
               {#each group.rows as row, ri (gi + "-" + ri)}
                 <RowControl
                   {settings}
-                  row={decorateRow(row)}
+                  row={decorateRow(row, entryStatus)}
                   {extra}
                   onChange={onRowChange}
                   onAction={onAction}
                 />
               {/each}
             </div>
+            {#if showGroupNote(group, settings, extra)}
+              <p class="rwd-group-note">{group.note?.text}</p>
+            {/if}
           {/if}
         {/each}
         {/if}
@@ -756,7 +948,7 @@
                       : t("词典为全局资源，切换后立即对所有书籍生效")}
           </span>
         {:else}
-          <button type="button" class="rwd-btn rwd-btn-ghost" on:click={() => dispatch("reset")}>
+          <button type="button" class="rwd-btn rwd-btn-ghost" on:click={askReset}>
             {t("重置为默认")}
           </button>
         {/if}
@@ -785,6 +977,41 @@
         {/if}
       </footer>
       </div>
+
+      <!-- ===== 重置确认层（覆盖整个面板，含左导航） ===== -->
+      {#if confirmReset}
+        <div
+          class="rwd-confirm-mask"
+          role="presentation"
+          on:click={(e) => { if (e.target === e.currentTarget) confirmReset = false; }}
+        >
+          <div
+            class="rwd-confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="rwd-confirm-title"
+            aria-describedby="rwd-confirm-text"
+          >
+            <h4 id="rwd-confirm-title" class="rwd-confirm-title">{t("重置所有阅读设置？")}</h4>
+            <p id="rwd-confirm-text" class="rwd-confirm-text">
+              {t("书本与 PDF 的全部阅读设置都会恢复默认。翻译凭据、术语表和缓存不受影响。")}
+            </p>
+            <div class="rwd-confirm-actions">
+              <button
+                type="button"
+                class="rwd-btn rwd-btn-ghost"
+                bind:this={resetCancelEl}
+                on:click={() => (confirmReset = false)}
+              >{t("取消")}</button>
+              <button
+                type="button"
+                class="rwd-btn rwd-btn-danger"
+                on:click={() => { confirmReset = false; dispatch("reset"); }}
+              >{t("确认重置")}</button>
+            </div>
+          </div>
+        </div>
+      {/if}
     </div>
   </div>
 {/if}

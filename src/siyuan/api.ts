@@ -563,6 +563,50 @@ export async function getFile(path: string): Promise<any> {
     });
 }
 
+// **************************************** 系统字体（2026-11-13） ****************************************
+
+/**
+ * 内核枚举到的系统字体 face（`/api/system/getSysFonts`，思源外观设置同源数据）。
+ *
+ * 一个**可变字体**会被展开成多条（同一 family 多个 weight），
+ * 例如本机 `Source Han Serif SC VF` 出 8 条（w=200…900）。
+ */
+export interface SysFontFace {
+    /** font-family 用的族名（CSS 可直接引用） */
+    family: string;
+    /** OS/2 usWeightClass 命名实例字重 */
+    weight: number;
+    /** 本地化显示名（如「宋体-简 常规体」「霞鹜文楷」） */
+    displayName: string;
+    /** 别名（PostScript 名 / 本地化名 / 兼容名），可反查旧设置里存的写法 */
+    aliases: string[];
+    /** proportional | monospace | dual */
+    spacing?: string;
+}
+
+/**
+ * 取系统字体清单。
+ *
+ * 为什么不用 `document.fonts` 或 canvas 探测：
+ * - `document.fonts` 只有**已注册**的 face（思源自用字体都在，系统字体大多不在）；
+ * - canvas 逐族探测不可靠：字体存在但缺字形时 Chrome 画 `.notdef` 而不是回退，
+ *   实测 379 族里 57 个"命中汉字"、约 15 个是误报（Zapfino / Savoye LET…），
+ *   而 `PingFang SC` 反而探不中。
+ * 内核这条路是思源「外观 → 字体」下拉的**同一份数据**，准且带别名。
+ *
+ * 失败（旧内核 / 权限）返回空数组，调用方按「未知」降级（不做未安装标记）。
+ */
+export async function getSysFonts(): Promise<SysFontFace[]> {
+    try {
+        const data = await request('/api/system/getSysFonts', {});
+        if (!Array.isArray(data)) return [];
+        return data.filter((f: any) => f && typeof f.family === 'string' && f.family);
+    } catch (e) {
+        getLogger().warn("getSysFonts 不可用，字体清单降级为预设:", { error: e });
+        return [];
+    }
+}
+
 
 /**
  * fetchPost will secretly convert data into json, this func merely return Blob

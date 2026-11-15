@@ -48,6 +48,8 @@ function maskCredential(authorization: string): string {
 
 export class TencentTranslator implements Translator {
   readonly name = "tencent" as const;
+  /** 空串 = 沿用旧版缓存键，历史腾讯译文继续命中 */
+  readonly cacheNs = "";
 
   private secretId: string;
   private secretKey: string;

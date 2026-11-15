@@ -154,11 +154,27 @@ export interface PretranslateProgress {
   cached: number;
   /** 待译段数（需走 AI 的；overwrite 时等于 total） */
   pending: number;
-  status: "idle" | "running" | "done" | "cancelled" | "error";
+  status: "idle" | "running" | "paused" | "done" | "cancelled" | "error";
   /** Token 估算（仅基于待译字数 /4，非实时用量） */
   estTokens?: number;
   /** 剩余秒数估算（运行中按已完成速率推算） */
   etaSeconds?: number;
+}
+
+/**
+ * 整书预扫描结果（P1-1）。
+ * 只读不译：枚举全书分节、按 locatorKey 去重后统计段数/字数/已缓存数，
+ * 供确认弹窗算「要不要花这笔钱」，也让 ETA 有分母。
+ */
+export interface PretranslateScan {
+  /** 枚举到的分节数（无 section 的格式按窗口统计，为 1） */
+  sections: number;
+  /** 去重后的总段数 */
+  total: number;
+  /** 去重后的总字符数 */
+  chars: number;
+  /** 其中已命中缓存的段数（未提供 checkCached 时恒为 0） */
+  cached: number;
 }
 
 /** 整书预翻译细化选项（来自弹窗） */
@@ -199,6 +215,15 @@ export interface BilingualHandle {
   segmentStats(): { count: number; chars: number };
   /** 列出本书全部段落原文（供预翻译弹窗按段精确计算「已缓存」命中，与 pretranslateAll 逻辑一致） */
   segmentTexts(): string[];
+  /**
+   * 整书预扫描（P1-1）：不送译、不花钱，只统计全书段数/字数/已缓存数。
+   * 确认弹窗用它展示成本与 ETA；结果同时被 pretranslateAll 的进度估算复用。
+   */
+  pretranslateScan(opts?: { full?: boolean; signal?: AbortSignal }): Promise<PretranslateScan>;
+  /** 暂停预翻译：停止派发新批次，在途批次跑完（结果照常入缓存，不浪费） */
+  pretranslatePause(): void;
+  /** 继续预翻译 */
+  pretranslateResume(): void;
   /**
    * 整书预翻译（细化版）：遍历全书所有段落，未缓存的送译并落盘（translationCache）；
    * 不在 DOM 注入译文——仅填充缓存，使后续开启双语 / 翻页 / 重开本书时命中缓存秒出。

@@ -116,6 +116,9 @@ export class ReaderTabController {
       onBack: opts?.onBack,
       mobileOverlay: !!opts?.mobileOverlay,
       onTitleChange,
+      // 2026-11-13：双语引擎选择（auto / qwen-mt / tencent）跟随「双语翻译」设置，
+      // 不再在阅读器里硬编码腾讯。
+      getTranslateEngine: () => (self.plugin as any)?.getTranslateSettings?.()?.engine || "auto",
       // 2026-08-28：连续朗读控制器设置透传（get 读 / save 写，结构 = reader-tts 的 RewordTtsSettings）
       getTtsSettings: () => (self.plugin as any)?.getTtsSettings?.() ?? null,
       saveTtsSettings: (s: any) => (self.plugin as any)?.saveTtsSettings?.(s) ?? Promise.resolve(),

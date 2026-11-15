@@ -138,6 +138,21 @@
   $: options = rawOptions as Option[];
 
   /**
+   * 当前值不在选项列表里时补一条（2026-11-13）。
+   *
+   * 场景：「衬线字体 / 无衬线字体」下拉不再列中文字体之后，老设置档里的
+   * `serifFont: "霞鹜文楷"` 在列表里找不到对应项 → `<select>` 回显空白，
+   * 用户会以为「我的设置丢了」。补一条「当前使用」保证回显，
+   * 用户改选别的字体时该条自然消失（值已被替换）。
+   */
+  $: optionsWithCurrent = (() => {
+    if (row.ctrl !== "select") return options;
+    const v = String(safeValue ?? "");
+    if (!v || options.some((o) => String(o.value) === v)) return options;
+    return [...options, { value: v, label: `${v} · ${t("当前使用")}` }];
+  })();
+
+  /**
    * 2026-10-07：运行时异步选项。
    * 例：TTS「中文/英文发音人」—— 系统音色列表来自 speechSynthesis.getVoices()，
    *   macOS/Electron 首次为空且需等 voiceschanged，只能异步取。
@@ -205,6 +220,37 @@
    * 这类「需要看见、但不允许在此改」的行。
    */
   $: ro = row.readonly === true;
+
+  /**
+   * 整行可点（2026-11-13，对标 Readest 的 SettingsRow / NavigationRow）。
+   *
+   * 只开放给两种行：
+   *  - switch：点标签/说明也能拨开关（原先只有 42×25 的小胶囊可点，命中区过小）；
+   *  - action：整行就是「进入二级页」的入口（原先是行尾一颗小按钮）。
+   *
+   * 其余控件（滑块/下拉/输入框）必须保持「只有控件自身可交互」——
+   * 整行点击会让拖滑块时误触，反而是倒退。
+   */
+  $: tappable = !ro && (row.ctrl === "switch" || row.ctrl === "action");
+
+  /**
+   * 行内点击是否落在「自己就能处理点击」的元素上。
+   * 命中则让原生行为接管，避免与整行 handler 叠加（开关会被拨两次、按钮会进两次二级页）。
+   */
+  function isOwnInteractive(t: EventTarget | null): boolean {
+    const el = t as HTMLElement | null;
+    if (!el || typeof el.closest !== "function") return false;
+    return !!el.closest("button, a, input, select, textarea, label, .rw-info");
+  }
+
+  function onRowClick(e: MouseEvent) {
+    if (!tappable || isOwnInteractive(e.target)) return;
+    if (row.ctrl === "switch") {
+      emit(safeValue === false);
+      return;
+    }
+    onAction(row.action || "dictManager");
+  }
 
   /**
    * 布尔↔可读值的双向转换（2026-10-07，当前只有 fontSizeSync 一处）。
@@ -345,6 +391,8 @@
     class:rw-row-pair={isMarginPair}
     class:rw-row-wide={isPresetCards}
     class:rw-row-readonly={ro}
+    class:rw-row-tappable={tappable}
+    on:click={onRowClick}
   >
     <div class="rw-label">
       <span class="rw-label-text">{row.label}{#if row.info}<button
@@ -433,7 +481,7 @@
           value={String(safeValue ?? "")}
           on:change={(e) => emit(e.currentTarget.value)}
         >
-          {#each options as o}
+          {#each optionsWithCurrent as o}
             <option value={String(o.value)}>{o.label}</option>
           {/each}
         </select>
@@ -580,6 +628,12 @@
           尤其 per-book 发送目标这种"每本书不同"的东西，不显示就完全不可见。
           ⚠️ 刻意不给文本框：值由各自的二级页持有，这里是**镜像**不是编辑器。
         -->
+        <!--
+          2026-11-13 改为「整行导航」形态（对齐 Readest NavigationRow）：
+          行尾不再是一颗实心小按钮，而是「当前值/状态 + ›」。
+          整行的点击由根节点的 onRowClick 接管，按钮只保留键盘可达性
+          （aria-label 用 actionLabel，视觉上不再重复写「打开」）。
+        -->
         <div class="rw-action-wrap">
           {#if row.displayValue}
             <span class="rw-action-current" class:empty={!row.displayValueSet}>
@@ -589,9 +643,9 @@
           <button
             type="button"
             class="rw-entry-go rw-action"
-            on:click={() => onAction(row.action || "dictManager")}
+            aria-label={row.actionLabel || row.label || t("打开")}
+            on:click|stopPropagation={() => onAction(row.action || "dictManager")}
           >
-            {row.actionLabel || t("打开")}
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
               <path d="M9 5l7 7-7 7" />

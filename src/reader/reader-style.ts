@@ -35,6 +35,7 @@ import {
   // 需要读THEME_PRESETS（原先按名字硬编码 ['night','dark']，会漏判 gold 等深色配色）。
   THEME_PRESETS,
 } from "./reader-settings.ts";
+import { resolveCjkFamily } from "./builtin-fonts.ts";
 
 export type ReaderStyleTheme = "light" | "almond" | "autumn" | "green" | "blue" | "night" | "dark" | "gold" | "custom";
 
@@ -154,6 +155,11 @@ export interface ReaderStyleInput {
    * （纯原文段不受影响，避免整页空白）。实现见 bilingualStyles 的 hideSource。
    */
   bilingualShowSource?: boolean;
+  /**
+   * 悬停显示译文（2026-11-13）：译文默认淡出，鼠标悬停原文段或译文本身时显形。
+   * 仅影响视觉，不改变注入/缓存；触屏设备（无 hover）自动退化为常显。
+   */
+  bilingualHoverShow?: boolean;
   /** 段落悬停高亮（运行时开关，2026-08-28）：鼠标悬停段落时轻微底色，提升阅读定位感 */
   /** 文本设置（2026-08-24 新增） */
   text?: { fontWeight: number; letterSpacing: number; wordSpacing?: number };
@@ -524,28 +530,50 @@ export function siyuanVarBridgeStyles(v: SiyuanThemeVars): string {
 
 /**
  * 跨平台 CJK 字体栈（macOS / Windows / Linux 都有像样的中文字体）
- * 顺序：macOS 优先 → Windows → Linux 通用 → Noto 系列 → 兜底 sans-serif
+ * 顺序：macOS 优先 → Windows → Linux 通用 → Noto 系列
+ *
+ * 2026-11-13：拆成「数组 + 通用族」两截 —— 三条字体链要在数组里做去重
+ * （中文候选池与兜底栈有大量重叠，如 PingFang SC 出现三次），
+ * 通用族统一由 composeChain 补在链尾，保证「衬线链最后落到 serif」而不是 sans-serif。
  */
+const CJK_FALLBACK_LIST: string[] = [
+  // macOS
+  "PingFang SC",
+  "Hiragino Sans GB",
+  "-apple-system",
+  "BlinkMacSystemFont",
+  // Windows
+  "Microsoft YaHei",
+  "微软雅黑",
+  // 跨平台
+  "Source Han Sans CN",
+  "Noto Sans CJK SC",
+  "Noto Sans SC",
+  // Linux
+  "WenQuanYi Micro Hei",
+  "WenQuanYi Zen Hei",
+];
+
 export function getDefaultCjkFontStack(): string {
-  return [
-    // macOS
-    '"PingFang SC"',
-    '"Hiragino Sans GB"',
-    "-apple-system",
-    "BlinkMacSystemFont",
-    // Windows
-    '"Microsoft YaHei"',
-    '"微软雅黑"',
-    // 跨平台
-    '"Source Han Sans CN"',
-    '"Noto Sans CJK SC"',
-    '"Noto Sans SC"',
-    // Linux
-    '"WenQuanYi Micro Hei"',
-    '"WenQuanYi Zen Hei"',
-    // 兜底
-    "sans-serif",
-  ].join(", ");
+  return [...CJK_FALLBACK_LIST, "sans-serif"].map(q).join(", ");
+}
+
+/** 链内去重：按族名字面量比较，保留首次出现的位置（掉重复的 PingFang SC 之类） */
+function dedupeChain(parts: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const p of parts) {
+    const key = p.replace(/["']/g, "").trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(p);
+  }
+  return out;
+}
+
+/** 去重 + 链尾补通用族（保证任何字符都有字形，且衬线链最后落到 serif） */
+function composeChain(parts: string[], generic: string): string {
+  return [...dedupeChain(parts), generic].join(", ");
 }
 
 /* ================= 分类字体（2026-08-28，参考 Readest utils/style.ts:30-63） ================= */
@@ -587,7 +615,7 @@ function q(name: string): string {
  * @param serif 衬线链首选字体（空=不指定，走候选池）
  * @param sansSerif 无衬线链首选字体
  * @param monospace 等宽链首选字体
- * @param defaultCJKFont 中文字体（插入西文段之后；空=不插入）
+ * @param defaultCJKFont 中文字体（插入西文段之后；空=自动配对内置字体）
  */
 export function buildFontFamilyLists(
   serif: string,
@@ -595,38 +623,39 @@ export function buildFontFamilyLists(
   monospace: string,
   defaultCJKFont: string
 ): FontFamilyLists {
-  const cjk = (defaultCJKFont || "").trim();
-  const cjkFallback = getDefaultCjkFontStack();
+  // 2026-11-13：中文字体槽改为「按分类自动配对」
+  //   空值（历史默认）/ __auto__ → 衬线链用内置思源宋体、无衬线链用内置思源黑体。
+  //   旧行为是空值 = 不插入，汉字落到候选池第一名（霞鹜文楷），
+  //   于是「切换到无衬线」只换英文、中文纹丝不动 —— 用户反馈「选什么都没反应」。
+  const cjkSerif = resolveCjkFamily(defaultCJKFont, "serif");
+  const cjkSans = resolveCjkFamily(defaultCJKFont, "sans");
 
   // 衬线链
-  const serifChain = [
+  const serifChain = composeChain([
     ...(serif ? [q(serif)] : []),
-    ...SERIF_LATIN_PRESETS.filter((f) => f !== serif && f !== cjk).map(q),
-    ...(cjk && cjk !== serif ? [q(cjk)] : []),
-    ...CJK_SERIF_PRESETS.filter((f) => f !== serif && f !== cjk).map(q),
-    cjkFallback,
-    "serif",
-  ].join(", ");
+    ...SERIF_LATIN_PRESETS.filter((f) => f !== serif).map(q),
+    ...(cjkSerif && cjkSerif !== serif ? [q(cjkSerif)] : []),
+    ...CJK_SERIF_PRESETS.filter((f) => f !== serif && f !== cjkSerif).map(q),
+    ...CJK_FALLBACK_LIST.map(q),
+  ], "serif");
 
   // 无衬线链
-  const sansSerifChain = [
+  const sansSerifChain = composeChain([
     ...(sansSerif ? [q(sansSerif)] : []),
-    ...SANS_SERIF_LATIN_PRESETS.filter((f) => f !== sansSerif && f !== cjk).map(q),
-    ...(cjk && cjk !== sansSerif ? [q(cjk)] : []),
-    ...CJK_SANS_SERIF_PRESETS.filter((f) => f !== sansSerif && f !== cjk).map(q),
-    cjkFallback,
-    "sans-serif",
-  ].join(", ");
+    ...SANS_SERIF_LATIN_PRESETS.filter((f) => f !== sansSerif).map(q),
+    ...(cjkSans && cjkSans !== sansSerif ? [q(cjkSans)] : []),
+    ...CJK_SANS_SERIF_PRESETS.filter((f) => f !== sansSerif && f !== cjkSans).map(q),
+    ...CJK_FALLBACK_LIST.map(q),
+  ], "sans-serif");
 
   // 等宽链：不插 CJK 指定字体（中文正文不该用等宽），但仍带 CJK 兜底
   // 保证代码注释里的中文有字形；ui-monospace 让 macOS/Windows 走系统最优等宽。
-  const monospaceChain = [
+  const monospaceChain = composeChain([
     ...(monospace ? [q(monospace)] : []),
     ...MONOSPACE_FONT_PRESETS.filter((f) => f !== monospace).map(q),
     "ui-monospace",
-    cjkFallback,
-    "monospace",
-  ].join(", ");
+    ...CJK_FALLBACK_LIST.map(q),
+  ], "monospace");
 
   return {
     serif: withDigitFix(serifChain),
@@ -829,6 +858,7 @@ export function buildReaderStyles(
       o.fg,
       settings.translationFontSize ?? 0.62,
       settings.bilingualShowSource !== false,
+      settings.bilingualHoverShow === true,
     ),
     headingStyles(),
     quoteStyles(),
@@ -2317,8 +2347,12 @@ export function bilingualStyles(
   translationFontSize: number,
   /** 2026-10-07 对标 Readest「显示原文」：false 时隐藏有译文的原文段 */
   showSource = true,
+  /** 2026-11-13 悬停显示译文（仅 showSource 为 true 时有意义） */
+  hoverShow = false,
 ): string {
   const fs = Number.isFinite(translationFontSize) && translationFontSize > 0 ? translationFontSize : 0.62;
+  // 表格单元格字号通常已小于正文，译文字号按比例放大一点，避免小到看不清。
+  const cellFs = Math.min(0.95, Math.round(fs * 1.35 * 100) / 100);
   /**
    * 「显示原文 = 关」时的隐藏规则。
    *
@@ -2326,6 +2360,12 @@ export function bilingualStyles(
    *   所以要隐藏的是「紧邻 .reword-bilingual 之前那个兄弟元素」。
    * 用 `p:has(+ .reword-bilingual)` 精准命中 —— 只隐藏**有译文**的那些段，
    *   纯原文段（没译文 / 预翻译还没跑到）保持可见，不会整页空白。
+   *
+   * 2026-11-13 修复：选择器原本带 `.reader-view:not(.rwd-show-source)` 前缀，
+   *   但这段 CSS 经 foliate `setStyles()` 注入**iframe 内部**，而 `.reader-view`
+   *   是父文档里的容器 class —— iframe 内永远匹配不到，导致「显示原文」开关
+   *   形同虚设。该规则本身就只在 showSource=false 时拼进样式串，前缀既无用又
+   *   有害，直接去掉。
    * 浏览器支持：Chrome 105+ / Safari 15.4+ / Firefox 121+（思源是 Electron，Chromium 内核，安全）。
    * 老引擎不支持时该规则被忽略 → 退化为「显示原文」，属于安全降级。
    */
@@ -2333,13 +2373,62 @@ export function bilingualStyles(
     ? ""
     : `
 /* ---- 2026-10-07「显示原文」关闭：隐藏有译文的原文段 ---- */
-.reader-view:not(.rwd-show-source) p:has(+ .reword-bilingual),
-.reader-view:not(.rwd-show-source) div:has(+ .reword-bilingual),
-.reader-view:not(.rwd-show-source) li:has(+ .reword-bilingual),
-.reader-view:not(.rwd-show-source) blockquote:has(+ .reword-bilingual) {
+p:has(+ .reword-bilingual),
+div:has(+ .reword-bilingual),
+li:has(+ .reword-bilingual),
+blockquote:has(+ .reword-bilingual) {
   display: none !important;
 }
+/* 单元格译文在 td 内部，无法按「隐藏兄弟」处理：
+   把单元格文字设为透明、只把译文块恢复为正文色。
+   不改 DOM，CFI 与文本偏移零影响。 */
+td:has(> .reword-bilingual),
+th:has(> .reword-bilingual) {
+  color: transparent !important;
+}
+td:has(> .reword-bilingual) > :not(.reword-bilingual),
+th:has(> .reword-bilingual) > :not(.reword-bilingual) {
+  color: transparent !important;
+}
+td:has(> .reword-bilingual) > .reword-bilingual,
+th:has(> .reword-bilingual) > .reword-bilingual {
+  color: var(--b3-theme-on-surface, ${fg}) !important;
+}
 `;
+  /**
+   * 悬停显示（2026-11-13）。
+   *
+   * 选择「淡出但保留占位」而不是 display:none：
+   * 译文块撑开的行高在 hover 前后保持不变，鼠标扫过段落时**正文不会上下跳**；
+   * 译文的 pointer-events 保持默认，鼠标直接移到「看似空白」的译文区域也能显形，
+   * 避免「原文 hover 显形 → 往下移动进入译文 → 先消失再出现」的闪烁。
+   * 未显形时禁用选中，防止整段复制时把不可见的译文一并带走。
+   *
+   * 触屏没有 hover：用 media query 限定，触屏下退化为常显。
+   * 与「显示原文 = 关」互斥：原文都藏了，译文再藏就等于整页空白。
+   */
+  const hoverShowCss: string =
+    hoverShow && showSource
+      ? `
+/* ---- 2026-11-13 悬停显示译文（淡出保留占位，无重排） ---- */
+@media (hover: hover) and (pointer: fine) {
+  .reword-bilingual[cfi-inert][data-translation-mark] {
+    opacity: 0;
+    user-select: none;
+  }
+  .reword-bilingual[cfi-inert][data-translation-mark]:hover,
+  p:hover + .reword-bilingual[cfi-inert][data-translation-mark],
+  div:hover + .reword-bilingual[cfi-inert][data-translation-mark],
+  li:hover + .reword-bilingual[cfi-inert][data-translation-mark],
+  blockquote:hover + .reword-bilingual[cfi-inert][data-translation-mark],
+  td:hover > .reword-bilingual[cfi-inert][data-translation-mark],
+  th:hover > .reword-bilingual[cfi-inert][data-translation-mark] {
+    opacity: 1;
+    user-select: text;
+  }
+}
+`
+      : "";
   // 按钮 hover/active 颜色：主题色取自传入 fg。背景用半透明灰，避免亮色/暗色主题下按钮浮起来。
   // 2026-08-30 段级"简洁版"按钮：右上角悬浮，hover 译文块时显形（避免干扰阅读）。
   return `
@@ -2508,7 +2597,16 @@ li > .reword-bilingual[cfi-inert][data-translation-mark] {
 }
 .reword-bilingual-failed-text { font-style: italic; opacity: 0.8; }
 
+/* ---- 表格单元格译文（2026-11-13）：作为 td/th 子节点注入 ---- */
+td > .reword-bilingual[cfi-inert][data-translation-mark],
+th > .reword-bilingual[cfi-inert][data-translation-mark] {
+  /* 单元格内没有段落 margin 可抵消，去掉基类的负顶边距，改为轻量分隔 */
+  margin: 0.18em 0 0 0 !important;
+  font-size: ${cellFs}em;
+}
+
 ${hideSource}
+${hoverShowCss}
 `.trim();
 }
 

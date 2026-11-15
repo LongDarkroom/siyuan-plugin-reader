@@ -28,10 +28,32 @@ export const REWORD_BILINGUAL_HIDE = "reword-bilingual-hide";
 /** 2026-09-02：段落级操作工具条（AI 重译 + 删除译文 合并为右上角玻璃药丸） */
 export const REWORD_BILINGUAL_ACTIONS = "reword-bilingual-actions";
 
-/** 该原文元素是否已通过「兄弟节点」注入译文（幂等判定） */
+/** 是否表格单元格（译文只能作为单元格子节点，tr 内不允许插 div 兄弟） */
+export function isTableCell(el: Element | null | undefined): boolean {
+  return !!el && (el.tagName === "TD" || el.tagName === "TH");
+}
+
+/** 该原文元素是否已注入译文（幂等判定：段落看兄弟，单元格看子节点） */
 export function isTranslatedPeer(el: Element): boolean {
   const sib = el.nextElementSibling;
-  return !!(sib && sib.classList && sib.classList.contains(REWORD_BILINGUAL));
+  if (sib && sib.classList && sib.classList.contains(REWORD_BILINGUAL)) return true;
+  return !!el.querySelector?.(":scope > ." + REWORD_BILINGUAL);
+}
+
+/**
+ * 取译文块对应的原文文本。
+ * 段落：译文是紧邻兄弟，前一个兄弟即原文；
+ * 单元格：译文是单元格最后一个子节点，兄弟不是原文 → 克隆单元格后剔除译文块再取文本。
+ */
+export function sourceTextOf(wrap: Element): string {
+  const parent = wrap.parentElement;
+  if (isTableCell(parent)) {
+    const clone = parent!.cloneNode(true) as Element;
+    clone.querySelectorAll("." + REWORD_BILINGUAL).forEach((n) => n.remove());
+    return (clone.textContent || "").trim();
+  }
+  const src = wrap.previousElementSibling;
+  return src ? (src.textContent || "").trim() : "";
 }
 
 /**
@@ -96,7 +118,8 @@ export function buildTranslationEl(
   actions.setAttribute("data-translation-mark", "1");
   actions.setAttribute("cfi-inert", "");
 
-  // 2026-08-31 Phase 3：段落级「用 AI 重译」。
+  // 2026-08-31 Phase 3：段落级「重译」。
+  // 2026-11-13：不再限定 AI，跟随当前翻译引擎（千问/大模型/腾讯）。
   // 默认不显示（靠 CSS hover 译文块时显形），点击走 doc 级事件委托。
   if (opts?.showAiRedo) {
     const btn = doc.createElement("button");
@@ -105,8 +128,8 @@ export function buildTranslationEl(
     btn.setAttribute("data-translation-mark", "1");
     btn.setAttribute("cfi-inert", "");
     btn.type = "button";
-    btn.textContent = "✨ AI 重译";
-    btn.title = "用 AI 重新翻译本段（覆盖缓存）";
+    btn.textContent = "✨ 重译";
+    btn.title = "用当前翻译引擎重新翻译本段（覆盖缓存）";
     actions.appendChild(btn);
   }
 
@@ -173,9 +196,7 @@ export function bindAiRedoDelegation(
     e.stopPropagation();
     const wrap = btn.closest("." + REWORD_BILINGUAL);
     if (!wrap) return;
-    // 兄弟节点方案：原文是译文块的前一个兄弟
-    const src = wrap.previousElementSibling;
-    const text = src ? (src.textContent || "").trim() : "";
+    const text = sourceTextOf(wrap);
     if (!text) return;
     const cb = d[AI_REDO_HANDLER_KEY];
     if (!cb) return;
@@ -198,6 +219,12 @@ export function bindAiRedoDelegation(
  */
 export function injectSibling(paragraphEl: Element, translationEl: HTMLElement): boolean {
   if (isTranslatedPeer(paragraphEl)) return false;
+  if (isTableCell(paragraphEl)) {
+    // 表格单元格：<tr> 只允许 td/th 子节点，插兄弟 div 会被浏览器重排成非法结构
+    // → 译文作为单元格最后一个子节点（td 内允许 block 元素）。
+    paragraphEl.appendChild(translationEl);
+    return true;
+  }
   paragraphEl.insertAdjacentElement("afterend", translationEl);
   return true;
 }
@@ -241,7 +268,9 @@ export function readParaStyle(el: Element): ParaStyle {
  * 左侧 2.5px 竖线因此落在左留白里，不挤占正文。
  */
 export function applyAlignment(translationEl: HTMLElement, style: ParaStyle): void {
-  const marginLeft = style.padLeft + style.textIndent - BORDER_LEFT_PX;
+  // 单元格内译文：已被单元格 padding 包裹，再叠加原文 padding 会双倍缩进
+  const inCell = isTableCell(translationEl.parentElement);
+  const marginLeft = inCell ? 0 : style.padLeft + style.textIndent - BORDER_LEFT_PX;
   try {
     translationEl.style.setProperty("margin-left", marginLeft + "px", "important");
     translationEl.style.setProperty("padding-left", "0px", "important");
@@ -251,8 +280,14 @@ export function applyAlignment(translationEl: HTMLElement, style: ParaStyle): vo
   }
 }
 
-/** 移除某段译文兄弟节点（关闭双语 / 重载时），零正文污染 */
+/** 移除某段译文（关闭双语 / 重载时），零正文污染 */
 export function removeTranslationSibling(paragraphEl: Element): void {
+  if (isTableCell(paragraphEl)) {
+    paragraphEl
+      .querySelectorAll(":scope > ." + REWORD_BILINGUAL)
+      .forEach((n) => n.remove());
+    return;
+  }
   const sib = paragraphEl.nextElementSibling;
   if (sib && sib.classList && sib.classList.contains(REWORD_BILINGUAL)) {
     sib.remove();
@@ -300,9 +335,7 @@ export function bindHideDelegation(
     e.stopPropagation();
     const wrap = btn.closest("." + REWORD_BILINGUAL);
     if (!wrap) return;
-    // 兄弟节点方案：原文是译文块的前一个兄弟
-    const src = wrap.previousElementSibling;
-    const text = src ? (src.textContent || "").trim() : "";
+    const text = sourceTextOf(wrap);
     if (!text) return;
     const cb = d[HIDE_HANDLER_KEY];
     if (!cb) return;

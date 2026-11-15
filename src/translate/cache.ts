@@ -49,6 +49,36 @@ export interface CachedBookInfo {
 type ModeCacheMap = Record<string, Record<string, string>>;
 /** mem 中每本书的缓存：mode -> 译文 hash map */
 type BookCacheMap = Record<TranslationMode, Record<string, string>>;
+/** 命名空间索引：mode -> hash -> 产出该译文的引擎命名空间（旧数据无记录） */
+type NsMap = Partial<Record<TranslationMode, Record<string, string>>>;
+
+/** 缓存条目按引擎聚合的统计（缓存管理面板用） */
+export interface CacheEngineStat {
+  /** 引擎标识：qwen-mt / openai-compat / tencent / ai / 其它命名空间原值 */
+  engine: string;
+  count: number;
+  chars: number;
+}
+
+export interface CacheStats {
+  /** 条目数（同一段在 default / concise 各算一条） */
+  total: number;
+  /** 译文总字符数（体积估算） */
+  chars: number;
+  engines: CacheEngineStat[];
+}
+
+/**
+ * 命名空间 → 引擎标识。
+ * 空串是历史/腾讯键（腾讯不隔离命名空间）；未知值原样返回，UI 兜底展示。
+ */
+export function engineFromNamespace(ns: string): string {
+  if (!ns) return "tencent";
+  if (ns.startsWith("qwen-mt")) return "qwen-mt";
+  if (ns.startsWith("openai")) return "openai-compat";
+  if (ns === "ai") return "ai";
+  return ns;
+}
 
 /** 译文条目状态（R0 地基：供「释义与英文表格」面板筛选） */
 export type TranslationStatus = "engine" | "ai" | "error" | "empty";
@@ -74,6 +104,12 @@ export class TranslationCache {
   /** 译文元数据（bookId → metaKey → meta），随 .meta.json 的 trMeta 字段落盘 */
   private trMeta = new Map<string, Record<string, TranslationMeta>>();
   private metaTimers = new Map<string, any>();
+  /**
+   * 引擎命名空间索引（2026-11-13 P1-3）：hash 是单向的，光看译文分不出
+   * 「这条是千问还是腾讯译的」。写入时顺手记一份 mode+hash → ns，
+   * 随 <bookId>.json 的 `_ns` 字段落盘；旧数据无记录按腾讯（空 ns）统计。
+   */
+  private nsMap = new Map<string, NsMap>();
 
   constructor(plugin: any, saltFn?: () => string) {
     this.plugin = plugin;
@@ -81,13 +117,16 @@ export class TranslationCache {
   }
 
   /**
-   * 2026-08-30 hash 加盐：salt + mode + text 三段拼接
-   * 这样不同 mode 的同段原文会产生不同 hash，缓存互不污染。
+   * 2026-08-30 hash 加盐：salt + mode + ns + text 四段拼接。
+   * 2026-11-13 新增 ns（引擎/模型命名空间）：同一段原文换引擎后必须产生新键，
+   * 否则「切到千问仍读到腾讯译文」且无从察觉。
+   * ns 为空串时保持旧键完全不变（filter(Boolean) 去掉空段），
+   * 历史腾讯缓存零迁移、继续命中。
    */
-  private hash(s: string, mode: TranslationMode = DEFAULT_TRANSLATION_MODE): string {
+  private hash(s: string, mode: TranslationMode = DEFAULT_TRANSLATION_MODE, ns = ""): string {
     const salt = this.saltFn ? this.saltFn() : "";
     // 使用 \u0001 作分隔符（罕见字符，几乎不会出现在原文 / 提示词中）
-    const input = [salt, mode, s].filter(Boolean).join("\u0001");
+    const input = [salt, mode, ns, s].filter(Boolean).join("\u0001");
     let h = 0x811c9dc5;
     for (let i = 0; i < input.length; i++) {
       h ^= input.charCodeAt(i);
@@ -103,6 +142,27 @@ export class TranslationCache {
 
   private path(bookId: string): string {
     return "translations/" + bookId + ".json";
+  }
+
+  /** 落盘（译文 + 引擎命名空间索引）；`_ns` 为空时不写，保持旧文件形态 */
+  private saveBook(bookId: string, bookMap: BookCacheMap): void {
+    const ns = this.nsMap.get(bookId);
+    const hasNs = !!ns && Object.keys(ns).length > 0;
+    const payload: any = hasNs ? { ...bookMap, _ns: ns } : bookMap;
+    this.plugin.saveData(this.path(bookId), payload).catch(() => {});
+  }
+
+  /** 记录某条译文的产出引擎（ns 为空 = 腾讯/历史，不落盘以省体积） */
+  private setNs(bookId: string, mode: TranslationMode, key: string, ns: string): void {
+    let all = this.nsMap.get(bookId);
+    if (!all) {
+      all = {};
+      this.nsMap.set(bookId, all);
+    }
+    const modeNs = all[mode] || (all[mode] = {});
+    if (ns) modeNs[key] = ns;
+    else delete modeNs[key];
+    if (!Object.keys(modeNs).length) delete all[mode];
   }
 
   /**
@@ -123,6 +183,15 @@ export class TranslationCache {
           const obj = raw as ModeCacheMap;
           if (obj.default && typeof obj.default === "object") empty.default = obj.default;
           if (obj.concise && typeof obj.concise === "object") empty.concise = obj.concise;
+          const ns = (raw as any)._ns;
+          if (ns && typeof ns === "object") {
+            const cleaned: NsMap = {};
+            for (const mode of ["default", "concise"] as TranslationMode[]) {
+              const m = (ns as any)[mode];
+              if (m && typeof m === "object") cleaned[mode] = { ...m };
+            }
+            this.nsMap.set(bookId, cleaned);
+          }
         }
       }
     } catch (__swallowErr) { logSwallow(__swallowErr, "cache.ts · load", "debug"); }
@@ -152,6 +221,7 @@ export class TranslationCache {
     bookId: string,
     texts: string[],
     mode: TranslationMode = DEFAULT_TRANSLATION_MODE,
+    ns = "",
   ): Promise<{ hits: Record<number, string>; misses: number[]; fromCache: boolean[] }> {
     const bookMap = await this.load(bookId);
     const modeMap = bookMap[mode] || {};
@@ -159,7 +229,7 @@ export class TranslationCache {
     const misses: number[] = [];
     const fromCache: boolean[] = new Array(texts.length).fill(false);
     texts.forEach((t, i) => {
-      const v = modeMap[this.hash(t, mode)];
+      const v = modeMap[this.hash(t, mode, ns)];
       if (v != null && v !== "") {
         // 2026-09-05 读侧净化：存量缓存里有「AI 解说体」脏值（**翻译：**…重点词组解释…），
         // 读出时统一规整为整洁单行；纯译文快路径零开销。
@@ -172,7 +242,7 @@ export class TranslationCache {
     // 只有 misses 非空才会发起查询，JSON 全命中时零额外开销。
     if (misses.length && isSqliteCacheReady()) {
       const stillMiss: number[] = [];
-      const missKeys = misses.map((i) => translationKey(bookId, mode, this.hash(texts[i], mode)));
+      const missKeys = misses.map((i) => translationKey(bookId, mode, this.hash(texts[i], mode, ns)));
       let found: Map<string, string>;
       try {
         found = await sqliteGetBatch(missKeys);
@@ -181,13 +251,13 @@ export class TranslationCache {
         found = new Map();
       }
       for (const i of misses) {
-        const k = translationKey(bookId, mode, this.hash(texts[i], mode));
+        const k = translationKey(bookId, mode, this.hash(texts[i], mode, ns));
         const v = found.get(k);
         if (v) {
           hits[i] = sanitizeTranslation(v);
           fromCache[i] = true;
           // 回写内存，下次直接命中，不必再查 SQLite
-          modeMap[this.hash(texts[i], mode)] = hits[i];
+          modeMap[this.hash(texts[i], mode, ns)] = hits[i];
         } else {
           stillMiss.push(i);
         }
@@ -198,7 +268,7 @@ export class TranslationCache {
         // 冷启动不再依赖 SQLite 二次查询（原只写内存，重启后仍查 SQLite）。
         clearTimeout(this.timers.get(bookId));
         this.timers.set(bookId, setTimeout(() => {
-          this.plugin.saveData(this.path(bookId), bookMap).catch(() => {});
+          this.saveBook(bookId, bookMap);
           this.timers.delete(bookId);
         }, 500));
         misses.length = 0;
@@ -210,26 +280,43 @@ export class TranslationCache {
   }
 
   /** 单条查询（用于单段补救时快速判断/取译） */
-  async getOne(bookId: string, text: string, mode: TranslationMode = DEFAULT_TRANSLATION_MODE): Promise<string | null> {
+  async getOne(
+    bookId: string,
+    text: string,
+    mode: TranslationMode = DEFAULT_TRANSLATION_MODE,
+    ns = "",
+  ): Promise<string | null> {
     const bookMap = await this.load(bookId);
     const modeMap = bookMap[mode] || {};
-    const v = modeMap[this.hash(text, mode)];
+    const v = modeMap[this.hash(text, mode, ns)];
     return v != null && v !== "" ? sanitizeTranslation(v) : null;
   }
 
   /** 单条写入（覆盖，用于单段重译后落盘） */
-  async setOne(bookId: string, text: string, tr: string, mode: TranslationMode = DEFAULT_TRANSLATION_MODE): Promise<void> {
-    await this.setBatch(bookId, [[text, tr]], mode);
+  async setOne(
+    bookId: string,
+    text: string,
+    tr: string,
+    mode: TranslationMode = DEFAULT_TRANSLATION_MODE,
+    ns = "",
+  ): Promise<void> {
+    await this.setBatch(bookId, [[text, tr]], mode, ns);
   }
 
   /**
    * 单条失效（用于单段删除：清除该段 AI 缓存，下次刷新不重现）。
    */
-  async deleteOne(bookId: string, text: string, mode: TranslationMode = DEFAULT_TRANSLATION_MODE): Promise<void> {
+  async deleteOne(
+    bookId: string,
+    text: string,
+    mode: TranslationMode = DEFAULT_TRANSLATION_MODE,
+    ns = "",
+  ): Promise<void> {
     const bookMap = await this.load(bookId);
     const modeMap = bookMap[mode] || {};
-    const k = this.hash(text, mode);
+    const k = this.hash(text, mode, ns);
     if (k in modeMap) delete modeMap[k];
+    this.setNs(bookId, mode, k, "");
     this.mem.set(bookId, bookMap);
     // Phase 2：同步删 SQLite 里的对应块
     if (isSqliteCacheReady()) {
@@ -237,28 +324,33 @@ export class TranslationCache {
     }
     clearTimeout(this.timers.get(bookId));
     this.timers.set(bookId, setTimeout(() => {
-      this.plugin.saveData(this.path(bookId), bookMap).catch(() => {});
+      this.saveBook(bookId, bookMap);
       this.timers.delete(bookId);
     }, 500));
   }
 
-  /** 批量写入（防抖落盘）。同 mode 内的 hash 会被覆盖（同段再次翻译以新值为准）。 */
+  /** 批量写入（防抖落盘）。同 mode + ns 内的 hash 会被覆盖（同段再次翻译以新值为准）。 */
   async setBatch(
     bookId: string,
     pairs: Array<[string, string]>,
     mode: TranslationMode = DEFAULT_TRANSLATION_MODE,
+    ns = "",
   ): Promise<void> {
     if (!pairs.length) return;
     const bookMap = await this.load(bookId);
     const modeMap = bookMap[mode] || (bookMap[mode] = {});
-    for (const [t, tr] of pairs) modeMap[this.hash(t, mode)] = tr;
+    for (const [t, tr] of pairs) {
+      const k = this.hash(t, mode, ns);
+      modeMap[k] = tr;
+      this.setNs(bookId, mode, k, ns);
+    }
     this.mem.set(bookId, bookMap);
     clearTimeout(this.timers.get(bookId));
     this.timers.set(
       bookId,
       setTimeout(() => {
         // 落盘多 mode 结构（一次性写整个 bookMap，旧版结构下次 load 时兼容回填）
-        this.plugin.saveData(this.path(bookId), bookMap).catch(() => {});
+        this.saveBook(bookId, bookMap);
         this.timers.delete(bookId);
       }, 500)
     );
@@ -268,7 +360,7 @@ export class TranslationCache {
     // 异步且不 await——SQLite 写入失败不应阻塞翻译主流程。
     if (isSqliteCacheReady()) {
       const sp = pairs.map(
-        ([t, tr]) => [translationKey(bookId, mode, this.hash(t, mode)), tr] as [string, string]
+        ([t, tr]) => [translationKey(bookId, mode, this.hash(t, mode, ns)), tr] as [string, string]
       );
       void sqliteSetBatch(sp, { bookId, mode }).catch(() => {});
     }
@@ -420,6 +512,37 @@ export class TranslationCache {
     const bookMap = await this.load(bookId);
     if (mode) return Object.keys(bookMap[mode] || {}).length;
     return Object.keys(bookMap.default || {}).length;
+  }
+
+  /**
+   * 按引擎汇总本书缓存（条目数 + 译文体积）。
+   * 没有任何 ns 记录的旧缓存统一计入 tencent（qwen 是后加的，历史只可能是腾讯）。
+   */
+  async stats(bookId: string): Promise<CacheStats> {
+    const bookMap = await this.load(bookId);
+    const nsAll = this.nsMap.get(bookId) || {};
+    const engines = new Map<string, CacheEngineStat>();
+    let total = 0;
+    let chars = 0;
+    for (const mode of Object.keys(bookMap) as TranslationMode[]) {
+      const modeMap = bookMap[mode] || {};
+      const modeNs = nsAll[mode] || {};
+      for (const [key, tr] of Object.entries(modeMap)) {
+        const len = (tr || "").length;
+        total++;
+        chars += len;
+        const engine = engineFromNamespace(modeNs[key] || "");
+        const e = engines.get(engine) || { engine, count: 0, chars: 0 };
+        e.count++;
+        e.chars += len;
+        engines.set(engine, e);
+      }
+    }
+    return {
+      total,
+      chars,
+      engines: [...engines.values()].sort((a, b) => b.count - a.count),
+    };
   }
 
   /** 元信息落盘：保存已缓存节集合（节号数组）+ 书名（用于「第 X-Y 页」+ 下拉书名） */
@@ -627,6 +750,7 @@ export class TranslationCache {
     this.cachedSections.delete(bookId);
     this.bookIndex.delete(bookId);
     this.trMeta.delete(bookId);
+    this.nsMap.delete(bookId);
     clearTimeout(this.metaTimers.get(bookId));
     this.metaTimers.delete(bookId);
     this.saveIndex();

@@ -18,10 +18,9 @@
 
   ## 数据流
 
-  本页不自己存数据，全部经 `onChange` 上报给 `SettingsDialog`，
-  由宿主（ReaderView）调 `plugin.updateTranslateSettings(patch)`落盘。
-  这样「设置项↔ 运行时」的唯一通路仍是 schema + onChange 一条，
-  与其它设置项保持一致。
+  本页不自己存数据，全部经 `host.update(patch)` 交给 TranslateHost 归一化并落盘
+  （`reader-translate.json`）。引擎开关、凭据、引擎选择都走同一条通路，
+  设置页与运行时读的是同一份配置，避免「界面改了、翻译链路没变」。
 -->
 <script lang="ts">
   import { createEventDispatcher, onMount } from "svelte";
@@ -66,9 +65,9 @@
 
   /**
    * 引擎元信息：顺序、显示名、各自需要的凭据字段。
-   * 2026-10-14 简化：双语只保留**腾讯机器翻译**，其余引擎卡（有道/百度/微软/
-   *   LibreTranslate/AI）已从配置面下架。下方 fetchModels / __model 等 AI 专属
-   *   逻辑因此成为不可达分支（保留不影响渲染，留待后续统一清理）。
+   * 2026-11-13：恢复双引擎 —— 千问 MT（首选）+ 腾讯机翻（兜底）。
+   *   其余引擎卡（有道/百度/微软/LibreTranslate/AI）仍不下架，
+   *   fetchModels / __model 等 AI 专属逻辑保留但不再渲染。
    */
   interface EngineMeta {
     id: string;
@@ -80,6 +79,39 @@
 
   const ENGINES: EngineMeta[] = [
     {
+      id: "qwen-mt",
+      name: t("Qwen 翻译"),
+      fields: [
+        { key: "qwenApiKey", label: "API Key", ph: "sk-…" },
+        {
+          key: "qwenBaseUrl",
+          label: t("接口地址"),
+          ph: "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        },
+        {
+          key: "qwenModel",
+          label: t("模型"),
+          ph: "qwen-mt-flash",
+          options: ["qwen-mt-flash", "qwen-mt-plus", "qwen-mt-lite"],
+        },
+      ],
+      doc: "https://help.aliyun.com/zh/model-studio/get-api-key",
+    },
+    {
+      id: "openai-compat",
+      name: t("通用大模型"),
+      fields: [
+        {
+          key: "openaiBaseUrl",
+          label: t("接口地址"),
+          ph: "https://api.deepseek.com/v1",
+        },
+        { key: "openaiApiKey", label: "API Key", ph: "sk-…" },
+        { key: "openaiModel", label: t("模型"), ph: "deepseek-chat" },
+      ],
+      doc: "",
+    },
+    {
       id: "tencent",
       name: t("腾讯翻译"),
       fields: [
@@ -90,9 +122,25 @@
     },
   ] as EngineMeta[];
 
-  /** 该引擎的启用开关字段名（AI 走 aiEnabled，其余走 xxxEnabled） */
+  /** 引擎选择（决定实际走哪家 / 自动按优先级） */
+  const ENGINE_MODES: Array<{ value: string; label: string }> = [
+    { value: "auto", label: t("自动（千问 → 大模型 → 腾讯）") },
+    { value: "qwen-mt", label: t("Qwen 翻译") },
+    { value: "openai-compat", label: t("通用大模型") },
+    { value: "tencent", label: t("腾讯翻译") },
+  ];
+
+  /** 该引擎的启用开关字段名（qwen-mt 用 qwenEnabled，AI 走 aiEnabled，其余走 xxxEnabled） */
   function enabledKey(id: string): string {
+    if (id === "qwen-mt") return "qwenEnabled";
+    if (id === "openai-compat") return "openaiEnabled";
     return id === "ai" ? "aiEnabled" : `${id}Enabled`;
+  }
+
+  /** 切换引擎链（auto / 千问 / 腾讯），立即落盘 */
+  async function setEngine(value: string) {
+    cfg = { ...cfg, engine: value };
+    await emit({ engine: value });
   }
 
   onMount(() => {
@@ -205,10 +253,29 @@
     cfg = { ...cfg, ...patch };
     testResult = { ...testResult, [id]: { ok: false, msg: "" } };
     await emit(patch);
+    // 清空后按归一化结果回读：qwenBaseUrl / qwenModel 有默认值，
+    // 若只看 patch 会显示成空框（实际运行时用的是默认值），造成误解。
+    load();
   }
 </script>
 
 <div class="rwd-tr-body">
+  <!-- 引擎选择：自动 = 千问优先、腾讯兜底；也可强制单引擎 -->
+  <div class="rwd-tr-field">
+    <label class="rwd-tr-label" for="tr-engine">{t("引擎选择")}</label>
+    <select
+      id="tr-engine"
+      class="rwd-tr-select"
+      value={cfg.engine ?? "auto"}
+      on:change={(e) => setEngine(e.currentTarget.value)}
+    >
+      {#each ENGINE_MODES as mode (mode.value)}
+        <option value={mode.value}>{mode.label}</option>
+      {/each}
+    </select>
+  </div>
+  <p class="rwd-tr-modeltip">{t("自动模式按千问 → 通用大模型 → 腾讯依次尝试，命中即可用。")}</p>
+
   <!-- 未配置总提示：这是最容易被忽略的「为什么没反应」 -->
   {#if !status.some((s) => s.ready)}
     <p class="rwd-tr-tip err">
@@ -376,4 +443,44 @@
       {/if}
     </div>
   {/each}
+
+  <!--
+    翻译提示（领域 / 翻译记忆）：
+    与引擎凭据分开——它们不属于某一家引擎，但对「译文口径」影响很大。
+    千问走原生 domains / tm_list；通用大模型拼进 system prompt；腾讯机翻忽略。
+    两者都并入缓存 salt：改完旧译文自动失效，不需要用户手动清缓存。
+  -->
+  <div class="rwd-tr-card">
+    <div class="rwd-tr-head">
+      <span class="rwd-tr-name">{t("翻译提示（可选）")}</span>
+      <span class="rwd-tr-badge">{t("影响译文口径")}</span>
+    </div>
+    <div class="rwd-tr-fields">
+      <div class="rwd-tr-field">
+        <label class="rwd-tr-label" for="tr-domains">{t("领域")}</label>
+        <input
+          id="tr-domains"
+          class="rwd-tr-input"
+          type="text"
+          placeholder={t("如：计算机 / 医学 / 文学")}
+          value={cfg.domains ?? ""}
+          on:change={(e) => setField("", "domains", e.currentTarget.value)}
+        />
+      </div>
+      <div class="rwd-tr-field">
+        <label class="rwd-tr-label" for="tr-tm">{t("翻译记忆")}</label>
+        <textarea
+          id="tr-tm"
+          class="rwd-tr-textarea"
+          rows="4"
+          placeholder={t("每行一条：原文 => 译文")}
+          value={cfg.translationMemory ?? ""}
+          on:change={(e) => setField("", "translationMemory", e.currentTarget.value)}
+        ></textarea>
+      </div>
+      <p class="rwd-tr-modeltip">
+        {t("领域提示用于专业术语口径；翻译记忆是整句参考译法（最多 50 条）。修改后旧译文会自动重译。")}
+      </p>
+    </div>
+  </div>
 </div>

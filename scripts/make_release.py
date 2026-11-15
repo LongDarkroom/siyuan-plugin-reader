@@ -5,8 +5,10 @@
   - zip 解压后必须【直接】是插件根文件，不能有外层父目录。
   - 必需：plugin.json, index.js, index.css, icon.png, 预览图（plugin.json 的 preview 字段，≤512KB）, README.md, i18n/（多语言时）。
   - 体积建议 < 10MB：词典(dict/，约 64MB) 与废弃 sql.js 资源不随包，运行时按需下载。
-    当前实际约 4-5MB：主包 index.js 之外，cmaps/(1.6M) + standard_fonts/(800K)
-    为 PDF CJK 渲染必需，虽占 2.4M 但不可省（见下方 INCLUDE_DIRS 注释）。
+    当前实际约 9MB：主包 index.js 之外，cmaps/(1.6M) + standard_fonts/(800K)
+    为 PDF CJK 渲染必需；assets/fonts/ 内置中文字体子集共 4.3MB
+    （思源宋体 2.36MB + 思源黑体 1.95MB，构建见 scripts/build_builtin_fonts.py）
+    —— 删掉它们，中文字体就会退回「23 个选项却是同一种观感」的旧状态。
 
 用法：先 `npm run build`，再 `python scripts/make_release.py`（或 `npm run make`）。
 产物：仓库根目录 package.zip
@@ -46,7 +48,7 @@ INCLUDE_FILES = [
     # 在非弱设备（桌面）上解析 PDF 元数据/封面时 worker 加载失败。
     "pdf.worker.mjs",
     "LICENSE",       # 许可证：集市校验要求仓库根目录与发布包均含许可证文件
-    # AGPL-3.0-or-later：分发时必须随包附第三方许可声明（js-mdict 为 AGPL，PDF.js 为 Apache-2.0 等）
+    # 分发时必须随包附第三方许可声明（js-mdict 6.0.8 为 MIT，PDF.js 为 Apache-2.0 等）
     "THIRD-PARTY-NOTICES.md",
     # "appreciate.jpg",  # 可选：赞赏码图片，自行放入仓库根目录后再取消注释以随包分发
 ]

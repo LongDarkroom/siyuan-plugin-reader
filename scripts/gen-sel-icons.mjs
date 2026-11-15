@@ -107,6 +107,9 @@ const ICONS = [
   { key: "checklist", file: "list-check", label: "书架·多选（原 ☑）" },
   { key: "stats", file: "chart-bar", label: "书架·阅读统计（原 📊）" },
   { key: "globe", file: "globe", label: "书架·OPDS 在线书源（原 🌐）" },
+  // 2026-11-15 云端书库：与 OPDS 同为「远端取书」，但语义要分开 ——
+  // globe 表示「公开书目目录」，cloud 表示「用户自己的网盘/对象存储」。
+  { key: "cloudShelf", file: "cloud", label: "书架·云端书库（WebDAV / S3）" },
   { key: "graph", file: "chart-network", label: "书架·阅读知识图谱（原 🕸️）" },
   // 工具栏
   { key: "sortAsc", file: "arrow-up", label: "书架·升序（原 ↑）" },
@@ -123,6 +126,11 @@ const ICONS = [
   { key: "fav", file: "star", label: "书架·收藏（原 ★/☆；实心态由 CSS 加 fill）" },
   { key: "edit", file: "pencil", label: "书架·编辑书籍信息（原 ✎）" },
   { key: "noteBound", file: "file-text", label: "书架·已绑定笔记发送目标（原 📄）" },
+  // 2026-11-15 云端书库面板内部：file 与 noteBound 的 file-text 刻意不同形，
+  // 前者是远端条目类型标记（16px 下要一眼区分「这是文件」），后者是本地笔记绑定。
+  { key: "cloudFile", file: "file", label: "云端书库·文件行" },
+  { key: "cloudFetch", file: "cloud-download", label: "云端书库·拉取到本地" },
+  { key: "refresh", file: "refresh-cw", label: "云端书库·刷新（refresh 在图标库不存在，必须用 refresh-cw）" },
   // 空态与兜底（尺寸由 CSS 放大，生成物本身仍是 16）
   { key: "dropImport", file: "inbox", label: "书架·拖拽导入（原 📥）" },
   { key: "bookFallback", file: "book", label: "书架·OPDS 无封面兜底（原 📖）" },

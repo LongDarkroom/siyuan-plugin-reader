@@ -92,6 +92,8 @@
      会把行压成两行；780 ≈ 196 + 584，是两侧都不拥挤的最小值。 */
   display: flex;
   flex-direction: row;
+  /* 重置确认层的定位基准（absolute inset:0 覆盖整个面板） */
+  position: relative;
   width: min(780px, calc(100% - 48px));
   height: min(600px, 84vh);
   /* 1px 描边算在 780 里面，否则面板实宽 782，和 rail 196 + 主区 584 对不上。 */
@@ -123,7 +125,17 @@
     inset 0 1px 0 color-mix(in srgb, var(--b3-theme-on-background, #fff) 22%, transparent);
   overflow: hidden;
   animation: rwd-rise 0.14s cubic-bezier(0.4, 0, 0.2, 1);
+}
 
+/*
+ * ===================== 面板令牌（共享） =====================
+ * 2026-11-15：这一族变量原先写在 `.rwd-panel { … }` 里面，只有设置面板能用。
+ * 云端书库面板（`.cloud-panel`）要做同一档观感，如果它自己再抄一遍数值，
+ * 两边迟早分叉（oil-ui「复用既有设计变量，不另造设计系统」）。
+ * 所以拆成共享选择器：这里**只放变量与字体声明**，面板几何尺寸仍各自定义。
+ */
+.rwd-panel,
+.cloud-panel {
   /* ---- 内部质感令牌（2026-11-06 对齐 demo） ----
    * 之前面板内所有面都吃 `--b3-theme-surface`，浅色主题下那是**灰**：
    * 灰卡片压在灰面板上，层次是反的，观感发闷。demo 的层级是
@@ -146,6 +158,22 @@
   --rwd-hover2: color-mix(in srgb, var(--b3-theme-on-background, #1c1d21) 10%, transparent);
   --rwd-pill-bg: var(--b3-theme-background, #fff);
   --rwd-pill-shadow: 0 1px 2px rgba(20, 28, 45, 0.10), 0 0 0 0.5px rgba(22, 26, 34, 0.06);
+  /*
+   * 2026-11-13 方案 A（对比度校准）：
+   * 说明文字原先吃 ink3（浅色主题下约 3.2:1），12px 正文达不到 4.5:1。
+   * 独立成 --rwd-hint 令牌，浅色取思源 daylight 的 on-surface #5f6368（6.05:1），
+   * 深色取 #b7bcc4（约 8:1）。分组标题同用这一档 —— 它也是「要读的文字」。
+   */
+  --rwd-hint: #5f6368;
+  /* 开关关闭态：浅轨 + 1px 内描边。原先纯 14% 灰无描边，与卡片底对比仅 1.3:1，
+     用户看不出「这里有一颗可拨的钮」。描边取 #8f9196（对白卡 3.15:1，满足图形 3:1）。 */
+  --rwd-switch-off: #dfe0e4;
+  --rwd-switch-off-border: #8f9196;
+  /* 入口行状态文字与底部主按钮：主色 #3575f0 配白字只有 4.24:1；
+     加深到 #2f6ae0 后 4.93:1，且去掉发光阴影（发光会进一步压低边缘对比）。 */
+  --rwd-done: #2f6ae0;
+  --rwd-done-hover: #2a60cc;
+  --rwd-focus: color-mix(in srgb, var(--b3-theme-primary, #3575f0) 70%, transparent);
   font-family: var(--rwd-font);
   -webkit-font-smoothing: antialiased;
 
@@ -178,10 +206,12 @@
   --rwd-ctrl-w: 176px;
 }
 
-/* 深色成对：思源的深色钩子在 <html> 上，部分主题版本改挂 html/body 类名。 */
-:root[data-theme-mode="dark"] .rwd-panel,
-html.theme--dark .rwd-panel,
-body.theme--dark .rwd-panel {
+/* 深色成对：思源的深色钩子在 <html> 上，部分主题版本改挂 html/body 类名。
+   2026-11-15 同步加上 .cloud-panel —— 浅色/深色必须成对覆写，否则云端面板
+   在深色主题下会拿到浅色的 hint 灰与 hover 白。 */
+:root[data-theme-mode="dark"] :is(.rwd-panel, .cloud-panel),
+html.theme--dark :is(.rwd-panel, .cloud-panel),
+body.theme--dark :is(.rwd-panel, .cloud-panel) {
   --rwd-ink2: var(--b3-theme-on-surface, #a8adb5);
   --rwd-card-bg: rgba(255, 255, 255, 0.045);
   --rwd-field: rgba(255, 255, 255, 0.07);
@@ -190,6 +220,11 @@ body.theme--dark .rwd-panel {
   --rwd-hover2: rgba(255, 255, 255, 0.11);
   --rwd-pill-bg: rgba(255, 255, 255, 0.14);
   --rwd-pill-shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 0 0 0.5px rgba(255, 255, 255, 0.08);
+  --rwd-hint: #b7bcc4;
+  --rwd-switch-off: rgba(255, 255, 255, 0.10);
+  --rwd-switch-off-border: rgba(255, 255, 255, 0.45);
+  --rwd-done: #3a5fe0;
+  --rwd-done-hover: #4468e8;
 }
 
 @keyframes rwd-rise {
@@ -394,7 +429,18 @@ body.theme--dark .rwd-panel {
   font-size: var(--rwd-fs-group);
   font-weight: 600;
   letter-spacing: 0.05em;
-  color: var(--rwd-ink3, #9a9aa0);
+  /* 2026-11-13：ink3 在浅色下只有约 3.2:1，分组标题是可读文字，改用 hint 档 */
+  color: var(--rwd-hint, #5f6368);
+}
+
+/* 分组补充说明（2026-11-13）：主开关关闭时填补本组空白的轻提示。
+ * 不放进卡片内部，避免与下一分组标题挤在一起；也不做成带底色的警告条 ——
+ * 它是「解释」不是「错误」，用普通说明文字即可。 */
+.rwd-group-note {
+  margin: 8px 4px 0;
+  font-size: var(--rwd-fs-hint);
+  line-height: 1.55;
+  color: var(--rwd-hint, #5f6368);
 }
 /* 第一个分组紧贴顶部，不留多余空白 */
 .rwd-body > .rwd-card:first-of-type { margin-top: 0; }
@@ -425,6 +471,12 @@ body.theme--dark .rwd-panel {
 }
 .rwd-card > .rw-row:last-child,
 .rwd-card > div:last-child .rw-row:last-child { border-bottom: none; }
+
+/* 整行可点的行（switch / action，2026-11-13）：命中区从 42px 胶囊 / 30px 按钮
+   扩到整行。只用背景变化反馈，不加位移动画 —— 行高不变，列表不抖。 */
+.rw-row-tappable { cursor: pointer; transition: background 0.14s ease; }
+.rw-row-tappable:hover { background: var(--rwd-hover); }
+.rw-row-tappable:active { background: var(--rwd-hover2); }
 
 /* 合并行（上下边距）：主行 + 副行 */
 .rw-row-pair { flex-wrap: wrap; padding-bottom: 8px; }
@@ -522,7 +574,8 @@ body.theme--dark .rwd-panel {
 .rw-label-text { font-size: var(--rwd-fs-label); font-weight: 500; line-height: 1.4; color: var(--rwd-ink, #e8e8ea); }
 .rw-hint {
   font-size: var(--rwd-fs-hint);
-  color: var(--rwd-ink3, #8a8a90);
+  /* 2026-11-13：ink3 → hint（浅色 6.05:1 / 深色 8:1），12px 正文才达标 */
+  color: var(--rwd-hint, #5f6368);
   line-height: 1.5;
   /*
    * 最多 2 行 + 超出省略（2026-10-10）。
@@ -606,8 +659,11 @@ body.theme--dark .rwd-panel {
   /* 无全局重置：不写 border-box 时 42×25 会被 2px 内边距撑成 46×29，
      滑块行程也从 17 变成 21，和 demo / iOS 的比例对不上。 */
   box-sizing: border-box;
-  background: var(--rwd-field2, rgba(255,255,255,0.17));
-  transition: background 0.18s ease;
+  background: var(--rwd-switch-off, #dfe0e4);
+  /* 关闭态描边（2026-11-13）：否则浅轨与白卡只差 1.3:1，看不出控件存在。
+     用 inset 描边而不是 border —— 不参与盒模型，42×25 与滑块行程都保持不变。 */
+  box-shadow: inset 0 0 0 1px var(--rwd-switch-off-border, #8f9196);
+  transition: background 0.18s ease, box-shadow 0.18s ease;
   display: flex; align-items: center; padding: 2px;
 }
 .rw-switch-thumb {
@@ -616,8 +672,20 @@ body.theme--dark .rwd-panel {
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.24);
   transition: transform 0.18s cubic-bezier(0.32, 0.72, 0, 1);
 }
-.rw-switch input:checked + .rw-switch-track { background: var(--b3-theme-primary, #5b7cfa); }
+.rw-switch input:checked + .rw-switch-track {
+  background: var(--b3-theme-primary, #5b7cfa);
+  /* 开启态不再需要描边（实心色块自身对比足够） */
+  box-shadow: none;
+}
 .rw-switch input:checked + .rw-switch-track .rw-switch-thumb { transform: translateX(17px); }
+/* 键盘焦点落在隐藏 checkbox 上时，环画在可见轨道上（checkbox 本身 0×0） */
+.rw-switch input:focus-visible + .rw-switch-track {
+  box-shadow: 0 0 0 2px var(--rwd-focus, rgba(53, 117, 240, 0.7));
+}
+.rw-switch input:checked:focus-visible + .rw-switch-track {
+  box-shadow: 0 0 0 2px var(--rwd-focus, rgba(53, 117, 240, 0.7));
+}
+.rw-switch input:disabled + .rw-switch-track { opacity: 0.55; cursor: default; }
 
 /* ---- 滑块 ---- */
 .rw-slider-wrap { display: flex; align-items: center; gap: 10px; }
@@ -855,26 +923,34 @@ body.theme--dark .rwd-panel {
 }
 
 /*
- * 入口按钮（ctrl:"action"，2026-10-07）。
- * 比「管理」这类纯文字按钮更像「可点进去的一行」，故加右箭头；
- * 底色用次级填充而非主色实心 —— 主色实心按钮在同一张卡片里会和开关/分段抢焦点。
+ * 入口行（ctrl:"action"，2026-11-13 改为整行导航）。
+ *
+ * 视觉只保留一个「›」：整行可点后，行尾再放一颗「打开」按钮是重复的；
+ * Readest 的 NavigationRow 也是「状态 + chevron」。
+ * 按钮保留 32px 高度与键盘可达性（aria-label 取自 actionLabel / 行标题），
+ * 视觉上透明 —— 只是焦点落点，不是主操作。
  */
 .rw-action {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  justify-content: center;
+  width: 30px;
   height: 32px;
+  padding: 0;
+  border: none;
   border-radius: 8px;
-  padding: 0 10px 0 13px;
-  font-size: var(--rwd-fs-ctrl);
+  background: transparent;
+  /* chevron 是唯一的「可进去」图形提示，须满足图形 3:1：
+     ink3（#8b919b）对白卡仅约 2.8:1，故用 ink2。 */
+  color: var(--rwd-ink2, #5f646d);
   font-family: inherit;
   cursor: pointer;
-  background: var(--rwd-field, rgba(255, 255, 255, 0.09));
-  border: 0.5px solid var(--rwd-line, rgba(255, 255, 255, 0.14));
-  color: var(--rwd-ink, #e8e8ea);
+  flex: none;
+  transition: color 0.14s ease;
 }
-.rw-action:hover { background: var(--rwd-hover2, rgba(255, 255, 255, 0.15)); }
-.rw-action svg { width: 13px; height: 13px; opacity: 0.7; }
+.rw-row-tappable:hover .rw-action,
+.rw-action:hover { color: var(--rwd-ink, #e8e8ea); }
+.rw-action svg { width: 15px; height: 15px; opacity: 0.9; }
 
 /* ===================== 底部操作条 ===================== */
 
@@ -891,12 +967,83 @@ body.theme--dark .rwd-panel {
 .rwd-btn:active { transform: scale(0.985); }
 .rwd-btn-ghost { background: none; color: var(--rwd-ink2, #9a9aa0); }
 .rwd-btn-ghost:hover { background: var(--rwd-hover); color: var(--rwd-ink, #e8e8ea); }
-.rwd-btn-primary { background: var(--b3-theme-primary, #5b7cfa); color: #fff; font-weight: 550; box-shadow: 0 2px 8px color-mix(in srgb, var(--b3-theme-primary, #5b7cfa) 35%, transparent); }
+.rwd-btn-primary { background: var(--rwd-done, #2f6ae0); color: #fff; font-weight: 550; }
+/* 2026-11-13：去掉发光阴影（会压低按钮边缘对比），加深底色到 4.9:1 */
+.rwd-btn-primary:hover { background: var(--rwd-done-hover, #2a60cc); }
+/* 破坏性操作按钮（重置确认）：红色只在这一处出现，避免面板里到处「报警」 */
+.rwd-btn-danger { background: #c93c3c; color: #fff; font-weight: 550; }
+.rwd-btn-danger:hover { background: #b63434; }
 /* 禁用态：文档树未打勾时「确定选择」不可点（灰底 + 禁止光标） */
 .rwd-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-.rwd-btn:disabled:hover { background: var(--b3-theme-primary, #5b7cfa); }
+.rwd-btn:disabled:hover { background: var(--rwd-done, #2f6ae0); }
 /* 底部右侧按钮组（docTree：「确定选择」+「完成」并排） */
 .rwd-footer-actions { display: flex; align-items: center; gap: 8px; }
+
+/* ===================== 重置确认层（2026-11-13） ===================== */
+
+.rwd-confirm-mask {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  box-sizing: border-box;
+  /* 半透明遮罩 + 模糊：确认层必须「盖住」后面的设置行，
+     但保留一点背景轮廓，让用户知道自己还在设置弹窗里（不是新开了一窗）。 */
+  background: color-mix(in srgb, var(--b3-theme-background, #fff) 55%, transparent);
+  backdrop-filter: blur(3px);
+  -webkit-backdrop-filter: blur(3px);
+}
+
+.rwd-confirm {
+  width: min(340px, 100%);
+  padding: 18px 18px 14px;
+  box-sizing: border-box;
+  border-radius: 14px;
+  /* 实色卡片：确认文案必须一次读清，不能受背后内容干扰 */
+  background: var(--b3-theme-background, #fff);
+  border: 1px solid var(--rwd-line, rgba(22, 26, 34, 0.12));
+  box-shadow: 0 16px 48px rgba(10, 12, 16, 0.28);
+  animation: rwd-confirm-in 0.14s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+@keyframes rwd-confirm-in {
+  from { opacity: 0; transform: translateY(4px) scale(0.99); }
+  to   { opacity: 1; transform: none; }
+}
+
+.rwd-confirm-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--rwd-ink, #1c1d21);
+}
+
+.rwd-confirm-text {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--rwd-hint, #5f6368);
+}
+
+.rwd-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+/* ===================== 键盘焦点环（2026-11-13） =====================
+ * 之前只有 ⓘ 有焦点样式，Tab 键走到下拉/按钮/滑块时看不出焦点在哪。
+ * 用 :focus-visible 而非 :focus —— 鼠标点击不出现，只有键盘导航才显示。
+ * checkbox 是 0×0 的隐藏输入，环由 .rw-switch-track 单独画（见上）。
+ */
+.rwd-panel :is(button, select, input[type="range"], input[type="text"], input[type="color"], textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--rwd-focus, rgba(53, 117, 240, 0.7));
+  outline-offset: 2px;
+}
 
 /* ===================== 搜索条（2026-11-06 移入左列） =====================
  * 宽度只有 176px（196 - 左右各 10），所以不再「图标 + 输入框」并排占两列，
@@ -1612,18 +1759,21 @@ body.theme--dark .rwd-panel {
 .rw-action-wrap {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  justify-content: flex-end;
+  gap: 8px;
   min-width: 0;
 }
 .rw-action-current {
-  font-size: 12px;
-  color: var(--b3-theme-on-background, #333);
-  /* 长文档名/长路径必须能截断，否则会把「打开」按钮挤出卡片 */
+  font-size: var(--rwd-fs-hint);
+  color: var(--rwd-ink2, #5f646d);
+  /* 长文档名/长路径必须能截断，否则会把行尾的 › 挤出卡片 */
   max-width: 220px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  text-align: right;
 }
 .rw-action-current.empty {
-  color: var(--b3-theme-on-surface-light, #999);
+  /* 2026-11-13：原来用 on-surface-light（浅色约 3.2:1），12px 状态文字不达标 */
+  color: var(--rwd-hint, #5f6368);
 }

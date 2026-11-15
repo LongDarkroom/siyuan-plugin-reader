@@ -20,6 +20,8 @@ import { getLogger } from "../core/logger.ts";
   import { getDeviceClass, isSmallMobile, isLargeMobile, isMobile } from "../core/env.ts";
   // 2026-10-24 移动端适配 Phase 1：响应式视口状态（断点 / 软键盘），根节点状态类 + 紧凑顶栏开关
   import { viewport, isPhoneBreakpoint, type ViewportBreakpoint } from "../core/viewport-store.ts";
+  // 2026-11-15 移动端全量走通 P0：AI 面板承载决策（内嵌 / 右栏、全屏 / 半屏）的唯一真源
+  import { decideAiEntry } from "./ai-entry.ts";
   // [REword 2026-09-02] 界面分流：按书籍格式自动切换「图书界面 / PDF 界面」。
   // 此前 PDF 与 EPUB 共用同一套模板、靠散落的 isPdfBook() 拼装控件，两类格式互相干扰。
   // 现在 PDF 专属控件收进 PdfToolbar / PdfOverlay，图书专属控件收进 BookToolbar，
@@ -177,6 +179,14 @@ import { getLogger } from "../core/logger.ts";
     captureSiyuanThemeVars,
     neutralizeBadFontFaces,
   } from "../reader/reader-style";
+  // 2026-11-13 内置中文字体（思源宋体 / 思源黑体，随插件分发，见 scripts/build_builtin_fonts.py）
+  import {
+    prepareBuiltinFontFaces,
+    readyBuiltinFaceCss,
+    cjkAliasFaceCss,
+  } from "../reader/builtin-fonts";
+  // 2026-11-15 开书加载态：把 markStage 的内部阶段翻成一句人话（移动端大书白屏等待的补救）
+  import { openStageLabel, isBigBook } from "./open-stage.ts";
   // 2026-10-06 竖排标点替换（仅竖排开启时生效，见 openBook 里的 transformTarget 钩子）
   import {
     transformVerticalPunctuation,
@@ -198,7 +208,11 @@ import { getLogger } from "../core/logger.ts";
   import { keepTextAlignment } from "../reader/reader-align.ts";
   // 2026-08-27 重设计：双语段落注入（顶栏「双语」开关）
   // 2026-08-31：v1（bilingual.ts）已删除，统一走 v2 兄弟节点渲染
-  import { type BilingualHandle } from "./bilingual-types";
+  import {
+    type BilingualHandle,
+    type PretranslateProgress,
+    type PretranslateScan,
+  } from "./bilingual-types";
   import { createBilingualV2 } from "./bilingual-v2/bilingual-v2";
   // 2026-09-05 R5：双语四层架构 —— L2 英文书籍识别（双语前置门槛，纯逻辑可单测）
   import { detectBookLanguage, collectSampleTexts } from "./bilingual/runtime/detector.ts";
@@ -469,6 +483,8 @@ import { getLogger } from "../core/logger.ts";
     | undefined = undefined;
   /** 是否已配置任一翻译引擎（用于双语开关前置提示） */
   export let isTranslationConfigured: (() => boolean) | undefined = undefined;
+  /** 当前翻译引擎选择（auto / qwen-mt / tencent），来自「双语翻译」设置 */
+  export let getTranslateEngine: (() => string) | undefined = undefined;
   /** 获取当前 AI 设置快照（用于预翻译弹窗判断可用引擎/模型） */
   export let getAiSettings: (() => AiSettings | null) | undefined = undefined;
   /** AI 会话持久化 IO（2026-11-08 P0）：注入后会话真源改为 petal 文件 */
@@ -603,6 +619,26 @@ import { getLogger } from "../core/logger.ts";
   let bilingualPendingRestore = false;
   // 2026-08-28：最近一次双语翻译的 AI token 用量（null = 无数据 / 未走 AI）
   let bilingualTokenUsage: { promptTokens: number; completionTokens: number; totalTokens: number } | null = null;
+  /* ================= 2026-11-14 P1-2：整本预翻译弹窗 =================
+   * 流程：打开 → 预扫（只读不花钱）→ 确认（段数/缓存/估算 Token/引擎）→
+   * 运行（进度/暂停/继续/停止）→ 完成。运行时关弹窗 = 收进右下悬浮条，
+   * 任务继续（已花的请求不浪费），点悬浮条随时回来。 */
+  type PtStage = "scanning" | "ready" | "running" | "done" | "cancelled" | "error";
+  let ptOpen = false;
+  let ptStage: PtStage = "scanning";
+  let ptScan: PretranslateScan | null = null;
+  let ptProgress: PretranslateProgress | null = null;
+  let ptPaused = false;
+  /** 运行中关弹窗 → 收成右下悬浮条 */
+  let ptMinimized = false;
+  let ptError = "";
+  let ptOverwrite = false;
+  /** 空串 = 跟随设置里的引擎选择 */
+  let ptEngine = "";
+  /** 弹窗打开时快照一份翻译设置（引擎可用性 / 腾讯用量），避免每次渲染都读宿主 */
+  let ptCfg: any = null;
+  let ptAbort: AbortController | null = null;
+  let ptScanAbort: AbortController | null = null;
   // ========== 2026-08-26 调试 HUD：高亮渲染链路诊断（foliate 原生管线） ==========
   // 退回 foliate 原生：view.addAnnotation + draw-annotation 事件 + Overlayer 静态方法。
   // 不再自建 SVG 层（rewordOverlays / rewordHighlights 已移除）。
@@ -1692,6 +1728,34 @@ import { getLogger } from "../core/logger.ts";
   // 问题 2（跟随思源）：宿主字体文件 blob 化缓存（fetch → blob → iframe 可加载的 @font-face）
   let hostFontBlobs: { family: string; blobUrl: string }[] = [];
   let hostFontBlobsReady = false;
+  /** 内置中文字体已就绪的 @font-face 段（异步取回后重刷样式，见 prepareBuiltinFonts） */
+  let builtinFaceCss = "";
+  let builtinFontsReady = false;
+
+  /**
+   * 预热内置中文字体（2026-11-13）。
+   *
+   * 与 prepareHostFontBlobs 同一个理由：`buildFontFamilyLists()` 是**同步纯函数**，
+   * 字体栈里只能写族名，所以字体文件必须在首次 applyStyles 之前变成可加载的 src。
+   * 这里走 fetch → blob → `@font-face`（和宿主字体、自定义导入字体同一条链路）。
+   *
+   * 只预热「自定义」档：跟随思源档用的是宿主字体栈，内置字体在其中没有位置。
+   * 失败不影响任何功能 —— 族名解析不到就照旧回退系统中文。
+   */
+  async function prepareBuiltinFonts(): Promise<void> {
+    if (builtinFontsReady) return;
+    if (settings.fontMode !== "custom" && settings.fontMode !== "classified") return;
+    builtinFontsReady = true;
+    try {
+      const css = await prepareBuiltinFontFaces(fontStore.pluginName);
+      if (css && !isDestroyed) {
+        builtinFaceCss = css;
+        applyStyles(); // 就绪后立即重刷 iframe 样式
+      }
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · prepareBuiltinFonts", "debug");
+    }
+  }
   /** 把宿主已加载的网页字体（霞鹜文楷等）blob 化，注入 iframe 后真正生效 */
   async function prepareHostFontBlobs(): Promise<void> {
     // 2026-08-30 修复：自定义档（分类字体链）同样需要宿主网页字体 blob，
@@ -2138,6 +2202,15 @@ import { getLogger } from "../core/logger.ts";
    */
   function buildFontInjection(): { fontFaceCss: string; fontFamilyStack: string } {
     const cjkFallback = getDefaultCjkFontStack();
+    /**
+     * 系统中文族名映射（2026-11-13，对标 Readest）。
+     *
+     * 书籍 CSS 常写 Windows 族名（`宋体` / `SimSun` / `FangSong`），macOS 上一个都没有。
+     * 这里给它们注册只用 local() 的 @font-face：命中本机近似字体就用，
+     * 全部 local() 失败则该 face 无效、浏览器照旧按未知族名回退（零风险）。
+     * 三种模式都注入 —— 它只影响「书籍显式指定了这些名字」的场景。
+     */
+    const aliasFaces = cjkAliasFaceCss();
     // 2026-10-07：原先此处有 system / classified / custom 三个并列分支，
     // 但它们其实只回答两个问题，砍档后合并如下：
     //   ① 「自定义」档下，是否选了一本**导入的**字体？选了就用那本，否则用下面的三条链。
@@ -2145,11 +2218,17 @@ import { getLogger } from "../core/logger.ts";
     //      注入宿主 blob 让「霞鹜文楷」等思源插件的网页字体在 iframe 内真正可用
     //      （未装到系统时只命中 local() 会失败）。
     if (settings.fontMode === "custom" || settings.fontMode === "classified") {
+      // 自愈：用户在设置里把「字体模式」从跟随思源切到自定义时，开书时的预热早已
+      // 因模式不符跳过。这里在首次需要时补一次（幂等，flag 已置位就直接返回）。
+      if (!builtinFontsReady) void prepareBuiltinFonts();
+      // 内置中文字体（思源宋/黑）的 @font-face —— 上面的链里写的就是这两个族名
+      const builtinFaces = builtinFaceCss || readyBuiltinFaceCss();
+      const faceHead = [builtinFaces, aliasFaces].filter(Boolean).join("\n");
       // ① 导入的单本字体优先（用户在字体管理页显式选中，意图最明确）
       if (settings.customFontId && fontBlobUrl) {
         const f = fontStore.get(settings.customFontId);
         if (f) {
-          const faceCss = customFontFaceCss(f, fontBlobUrl);
+          const faceCss = [faceHead, customFontFaceCss(f, fontBlobUrl)].filter(Boolean).join("\n");
           return { fontFaceCss: faceCss, fontFamilyStack: `"${f.name}", ${cjkFallback}, sans-serif` };
         }
       }
@@ -2169,7 +2248,7 @@ import { getLogger } from "../core/logger.ts";
       );
       const stack =
         settings.defaultFontFamily === "sans-serif" ? lists.sansSerif : lists.serif;
-      return { fontFaceCss: blobFaces, fontFamilyStack: stack };
+      return { fontFaceCss: [faceHead, blobFaces].filter(Boolean).join("\n"), fontFamilyStack: stack };
     }
     // follow-siyuan：宿主 @font-face（blob 真实字体文件 + local() fallback）注入，
     // 字体栈把宿主栈（含霞鹜文楷）前置，CJK 本机栈兜底 —— 跟随思源字体设置且不会乱码。
@@ -2183,8 +2262,9 @@ import { getLogger } from "../core/logger.ts";
           `@font-face{font-family:"${b.family}";src:url("${b.blobUrl}");font-display:swap;}`
       )
       .join("\n");
-    const fontFaceCss =
-      (blobFaces ? blobFaces + "\n" : "") + (faces.length ? faces.join("\n") + "\n" : "");
+    const fontFaceCss = [aliasFaces, blobFaces, faces.join("\n")]
+      .filter(Boolean)
+      .join("\n");
     // 关键改动：宿主字体栈（含霞鹜文楷）前置，CJK 本机栈做兜底，sans-serif 永远最后。
     // 这样正文字体跟随思源「霞鹜文楷」设置；若宿主字体不可用，浏览器自动回退到
     // CJK 本机栈（PingFang SC / 微软雅黑 等装机必有），不会无字形/乱码。
@@ -3452,6 +3532,8 @@ import { getLogger } from "../core/logger.ts";
       syncFontSizeFromSiyuan();
       // 问题 2：异步预热宿主字体 blob（完成后自动重刷 iframe 样式）
       prepareHostFontBlobs();
+      // 2026-11-13：内置中文字体同理（衬线→思源宋体 / 无衬线→思源黑体）
+      prepareBuiltinFonts();
       try {
         view.renderer?.focusView?.();
       } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · try { view.renderer?.focusView?.(); }", "debug"); }
@@ -4020,10 +4102,19 @@ import { getLogger } from "../core/logger.ts";
     // 只放行 Esc（点卡片外面再按 Esc 仍应能把卡片收掉）；翻页 / 缩放 / 全屏 / 提示面板
     // 等一律不响应 —— 卡片里打字时焦点若因重排短暂落到 body，也不会误触发这些动作。
     if (noteEditor.visible && e.key !== "Escape") return;
+    // 2026-11-14：整本预翻译弹窗是模态层 —— 除 Esc（关/收起弹窗）外，
+    // 空间键/方向键/缩放键都不能穿透去翻页或改字号。
+    if (ptOpen && e.key !== "Escape") return;
     // 矩形框选模式下 Esc 先退出（独立分支）
     if (e.key === "Escape" && pdfRectMode) {
       e.preventDefault();
       togglePdfRectMode();
+      return;
+    }
+    // 弹窗开着时 Esc 只收弹窗（运行中=收进悬浮条），不连带收两栏
+    if (e.key === "Escape" && ptOpen) {
+      e.preventDefault();
+      dismissPretranslate();
       return;
     }
     // Esc：先收浮层，再把顶/底两栏一起收起（微信读书同款）
@@ -4544,6 +4635,10 @@ import { getLogger } from "../core/logger.ts";
     showMoreMenu = false;
     void toggleBilingual();
   }
+  function onMorePretranslate() {
+    showMoreMenu = false;
+    void openPretranslate();
+  }
   function onMoreBilingualSettings() {
     showMoreMenu = false;
     openBilingualSettingsPanel();
@@ -5033,11 +5128,22 @@ import { getLogger } from "../core/logger.ts";
   // ⋯ 溢出菜单（紧凑顶栏专属）
   let showMoreMenu = false;
 
-  /* 2026-11-06 AI 阅读助手：桌面已全部交给思源右侧停靠栏，阅读器内不再停靠；
-   * 手机/大手机没有右栏，保留全屏覆盖层。 */
+  /* 2026-11-06 AI 阅读助手：桌面全部交给思源右侧停靠栏，阅读器内不再停靠。
+   * 2026-11-15 移动端全量走通 P0：**所有移动端**（手机 / 平板 / 手机浏览器）都走
+   * 阅读器内嵌面板。此前只按 viewportBp 判 phone/largePhone，平板（宽 >768 落进
+   * desktop 档）会去调思源右栏；而思源移动端没有右栏，dock / tab 两个控制器在
+   * isMobile() 又直接 return —— 两条路都堵死，点 ✨ 静默无反应。
+   * 现在：手机档（≤600px）全屏覆盖；平板 / 宽视口移动端用右侧半屏，保留正文对照。 */
   let showAiPanel = false;
   let aiPanelComp: any = undefined;
-  $: aiOverlay = viewportBp === "phone" || viewportBp === "largePhone";
+  /** 移动端（思源 App / 移动浏览器）：AI 一律内嵌，不再尝试右栏 */
+  const aiOnMobile = isMobile();
+  /** 承载决策唯一真源（8 种组合的决策表见 ./ai-entry.ts，有单测守护） */
+  $: aiEntry = decideAiEntry({ mobile: aiOnMobile, breakpoint: viewportBp });
+  /** 手机档：全屏覆盖层 */
+  $: aiFullScreen = aiEntry.fullScreen;
+  /** 是否用内嵌面板（窄视口桌面窗口沿用 2026-11-05 起的既有行为） */
+  $: aiOverlay = aiEntry.overlay;
 
   /**
    * 是否 PDF 书籍。
@@ -6422,7 +6528,9 @@ import { getLogger } from "../core/logger.ts";
 
   /* 文本设置 */
   function setTextWeight(v: number) {
-    settings = settingsStore.update({ text: { ...settings.text, fontWeight: clamp(Math.round(v / 10) * 10, 100, 900) } });
+    // 5 一档吸附：设置面板的步进是 25，按 10 吸附会把 125/175 改成 130/180，
+    // 面板显示值与实际生效值对不上。
+    settings = settingsStore.update({ text: { ...settings.text, fontWeight: clamp(Math.round(v / 5) * 5, 100, 900) } });
     applyStyles();
   }
   function setLetterSpacing(v: number) {
@@ -6672,7 +6780,10 @@ import { getLogger } from "../core/logger.ts";
     applyStyles();
   }
 
-  /** 重置为默认（按当前 Tab 所属的 scope 重置整份设置） */
+  /**
+   * 重置为默认：**书本与 PDF 两个分片一起**恢复出厂
+   * （确认层文案已如实写明范围；翻译凭据 / 术语表 / 缓存不在此列，属全局配置）。
+   */
   function onSettingsDialogReset() {
     if (isDestroyed) return;
     // ⚠️ resetAll() 返回 void（内部自行 update 两个 scope），不能拿它的返回值赋给 settings
@@ -12406,10 +12517,12 @@ import { getLogger } from "../core/logger.ts";
   let bilingualFailToastAt = 0;
 
   /**
-   * 2026-08-31 Phase 3：段落级「用 AI 重译」。
+   * 2026-08-31 Phase 3：段落级「重译」。
    *
-   * 走 `engine:"ai"` + `overwrite:true`：强制用 AI 重译这一段并覆盖缓存，
-   * 于是下次翻到该段读到的就是重译后的译文（translateBatch 内部会写回缓存）。
+   * 2026-11-13：不再硬编码 `engine:"ai"`（AI 引擎已不在链内，该值会被归一成
+   * auto）。改为跟随当前「双语翻译 → 引擎选择」，用户选千问就重走千问，
+   * 选自动就按 千问 → 大模型 → 腾讯 顺序重试。
+   * 固定 `overwrite:true`：跳过缓存重译并覆盖写回，下次翻到该段读到的就是新译文。
    *
    * 与「前文上下文」的关系：单段重译也带 ctxBefore，保证与前后文译法一致。
    */
@@ -12444,11 +12557,11 @@ import { getLogger } from "../core/logger.ts";
           author: meta?.author || undefined,
           language: meta?.language || undefined,
         },
-        { engine: "ai", overwrite: true }
+        { engine: getTranslateEngine?.() || "auto", overwrite: true }
       );
       const tr = (res?.[0] || "").trim();
       if (!tr) {
-        toast(t("AI 未返回译文，请稍后重试"), 2400, "error");
+        toast(t("未返回译文，请稍后重试"), 2400, "error");
         return;
       }
 
@@ -12465,12 +12578,12 @@ import { getLogger } from "../core/logger.ts";
       }
 
     } catch (e) {
-      console.warn("[REword] 段落 AI 重译失败:", e);
-      toast(t("AI 重译失败，请检查 AI 配置或稍后重试"), 2600, "error");
+      console.warn("[REword] 段落重译失败:", e);
+      toast(t("重译失败，请检查翻译引擎配置或稍后重试"), 2600, "error");
     } finally {
       if (btn) {
         btn.disabled = false;
-        btn.textContent = prevLabel || t("✨ AI 重译");
+        btn.textContent = prevLabel || t("✨ 重译");
       }
     }
   }
@@ -12516,6 +12629,44 @@ import { getLogger } from "../core/logger.ts";
     }
   }
 
+  /**
+   * 取样当前书籍正文（2026-11-13，术语自动提取用）。
+   *
+   * 只读「当前分节起最多 6 节」并封顶 6000 字符：
+   *  - 全书接进来既慢，又会把提取 prompt 撑爆；
+   *  - 当前分节前后已能覆盖人物/术语出现最密集的开头部分。
+   * 分节解析失败就跳过，不因一节坏书阻断整次取样。
+   */
+  async function sampleBilingualText(maxChars = 6000): Promise<string> {
+    const parts: string[] = [];
+    let total = 0;
+    const push = (raw: string) => {
+      const text = (raw || "").replace(/\s+/g, " ").trim();
+      if (!text || total >= maxChars) return;
+      const room = maxChars - total;
+      parts.push(text.slice(0, room));
+      total += Math.min(text.length, room);
+    };
+    const secs = (view as any)?.book?.sections as any[] | undefined;
+    if (Array.isArray(secs) && secs.length) {
+      const raw = (view as any)?.renderer?.getContents?.() as any[] | undefined;
+      const start = typeof raw?.[0]?.index === "number" ? raw[0].index : 0;
+      let used = 0;
+      for (let i = start; i < secs.length && total < maxChars && used < 6; i++) {
+        try {
+          const doc = await secs[i]?.createDocument?.();
+          if (doc) {
+            push(doc.body?.textContent || "");
+            used++;
+          }
+        } catch { /* 单节解析失败：跳过，继续取下一节 */ }
+      }
+    } else {
+      for (const doc of getContentDocs()) push(doc.body?.textContent || "");
+    }
+    return parts.join("\n\n").slice(0, maxChars);
+  }
+
   function ensureBilingualHandle(): BilingualHandle {
     if (bilingualHandle) return bilingualHandle;
     // 2026-08-31：载入本书已隐藏译文集合（关闭/重开双语后保持隐藏）
@@ -12545,10 +12696,9 @@ import { getLogger } from "../core/logger.ts";
       to: target,
       // 2026-08-31 重新启用简洁版：译文风格（直译/简洁）实时读设置，下一轮注入即生效
       getMode: () => (settingsStore.get().bilingualStyle || "default") as "default" | "concise",
-      // 2026-10-14 双语重设计：引擎收口为**腾讯机器翻译**单入口。
-      // 原「翻译服务」下拉（bilingualEngine，含 auto/AI 兜底/五免费引擎）已随设置简化下架，
-      // 这里固定透传 "tencent"，engine.ts 的 buildProviders 也只装配腾讯。
-      getEngine: () => "tencent" as string,
+      // 2026-11-13：引擎选择跟随「双语翻译」设置（auto / 千问 / 腾讯），
+      // 不再硬编码 tencent —— 否则用户在设置里选了千问，阅读器仍只用腾讯。
+      getEngine: () => getTranslateEngine?.() || "auto",
       // 2026-08-30：书籍元数据（书名/作者/语言/目录）注入翻译 system prompt，
       // 提升专有名词与语境一致性；仅 Prompt 文本，零额外 AI 推理成本。
       bookMeta: () => ({
@@ -12581,9 +12731,9 @@ import { getLogger } from "../core/logger.ts";
         const idx = raw?.[0]?.index;
         return typeof idx === "number" && Number.isFinite(idx) ? idx : 0;
       },
-      // 2026-10-14 双语重设计：段落级「✨ 用 AI 重译」入口下线——机翻单引擎下无 AI 可重译，
-      // 按钮留着只会「点了没反应」。redoWithAI 等实现暂留（无害），仅关掉渲染入口。
-      showAiRedo: false,
+      // 2026-11-13：段落级「✨ 重译」重新上线 —— 不再绑定 AI，改为跟随当前引擎
+      // （千问/大模型/腾讯），单段绕过缓存重译并覆盖写回，适合机翻结果不满意时重试。
+      showAiRedo: true,
       onAiRedo: (wrapEl: Element, sourceText: string) => {
         void redoWithAI(wrapEl, sourceText);
       },
@@ -12609,7 +12759,7 @@ import { getLogger } from "../core/logger.ts";
         // 否则 AI 配置错误/网络/限流被静默吞掉、用户无感知。8 秒冷却防刷屏。
         if (total > 0 && done === 0 && Date.now() - bilingualFailToastAt > 8000) {
           bilingualFailToastAt = Date.now();
-          toast(t("双语翻译失败：请检查「双语翻译 → 腾讯翻译凭据」的密钥与网络"), 3200, "error");
+          toast(t("双语翻译失败：请检查「双语翻译 → 翻译服务」的引擎配置与网络"), 3200, "error");
         }
         if (done >= total) {
           setTimeout(() => {
@@ -12641,7 +12791,7 @@ import { getLogger } from "../core/logger.ts";
       refreshCacheStats(bookId);
       refreshCacheBookList();
     } else {
-      toast(t("请先在「双语翻译 → 腾讯翻译凭据」中配置密钥"), 3200, "info");
+      toast(t("请先在「双语翻译 → 翻译服务」中启用引擎并填写密钥"), 3200, "info");
     }
   }
 
@@ -12694,7 +12844,7 @@ import { getLogger } from "../core/logger.ts";
       const configured = !isTranslationConfigured || isTranslationConfigured();
       console.log("[REword] 双语: 开启检查, isTranslationConfigured=", configured);
       if (!configured) {
-        toast(t("请先在「双语翻译 → 腾讯翻译凭据」中配置密钥"), 3200, "info");
+        toast(t("请先在「双语翻译 → 翻译服务」中启用引擎并填写密钥"), 3200, "info");
         return;
       }
       // 2026-10-14 双语重设计：运行时收敛为**渐进式单模式**——边读边按需翻译、命中即本地缓存。
@@ -12711,7 +12861,238 @@ import { getLogger } from "../core/logger.ts";
     }
   }
 
+  /* ================= 2026-11-14 P1-2：整本预翻译 ================= */
 
+  /** 本轮预翻译的序号：丢弃上一轮滞后到达的进度回调 */
+  let ptRunId = 0;
+
+  $: ptTotal = ptScan ? ptScan.total : (ptProgress?.total ?? 0);
+  $: ptDone = ptProgress?.done ?? 0;
+  $: ptPending = Math.max(0, ptTotal - ptDone);
+  $: ptPercent = ptTotal > 0 ? Math.min(100, Math.round((ptDone / ptTotal) * 100)) : 0;
+  /** 确认阶段「待译」：覆盖缓存时全部重译 */
+  $: ptPendingBefore = ptScan
+    ? ptOverwrite
+      ? ptScan.total
+      : Math.max(0, ptScan.total - ptScan.cached)
+    : 0;
+  /** Token 估算：运行中优先用宿主回传的实时估算，确认阶段按平均段长折算 */
+  $: ptEstTokens =
+    ptProgress?.estTokens ??
+    (ptScan && ptScan.total > 0
+      ? Math.round(((ptScan.chars * ptPendingBefore) / ptScan.total) / 4)
+      : 0);
+
+  $: ptEngineList = [
+    { value: "", label: t("跟随设置"), ready: true },
+    { value: "qwen-mt", label: t("Qwen 翻译"), ready: !!(ptCfg?.qwenEnabled && ptCfg?.qwenApiKey) },
+    {
+      value: "openai-compat",
+      label: t("通用大模型"),
+      ready: !!(ptCfg?.openaiEnabled && ptCfg?.openaiApiKey && ptCfg?.openaiBaseUrl && ptCfg?.openaiModel),
+    },
+    {
+      value: "tencent",
+      label: t("腾讯翻译"),
+      ready: !!(ptCfg?.tencentEnabled && ptCfg?.tencentSecretId && ptCfg?.tencentSecretKey),
+    },
+  ];
+
+  /** 腾讯是否在本轮链路上（只有它需要给免费额度上锁） */
+  $: ptTencentInChain =
+    (ptEngine === "" || ptEngine === "tencent") &&
+    !!(ptCfg?.tencentEnabled && ptCfg?.tencentSecretId && ptCfg?.tencentSecretKey);
+  $: ptTencentUsed = Number(ptCfg?.tencentCharsUsed || 0);
+  $: ptTencentLock = Number(ptCfg?.tencentCharsLock || 0);
+  $: ptLockWan = ptTencentLock > 0 ? String(+(ptTencentLock / 10000).toFixed(2)) : "";
+
+  $: ptEtaText = (() => {
+    const s = ptProgress?.etaSeconds;
+    if (ptPaused || ptStage !== "running" || !s || s <= 0) return "";
+    const m = Math.floor(s / 60);
+    return m > 0 ? t("约剩 {m} 分 {s} 秒", { m, s: s % 60 }) : t("约剩 {s} 秒", { s });
+  })();
+
+  /** 万字符 / Token 的紧凑显示（弹窗里的数字都以「万」为单位收敛） */
+  function fmtWan(n: number): string {
+    if (!n) return "0";
+    return n >= 10000 ? `${(n / 10000).toFixed(1)} 万` : String(n);
+  }
+
+  /**
+   * 打开整本预翻译弹窗。
+   * 前置门槛与 toggleBilingual 完全一致（英文书 + 引擎已配置），
+   * 只是这里先做只读扫描、不开启注入 —— 用户确认前一分钱都不花。
+   */
+  async function openPretranslate(): Promise<void> {
+    if (!caps.reflow) return;
+    // 运行中被收起时，入口语义是「回到进度」而不是再开一轮
+    if (ptMinimized && ptStage === "running") {
+      ptMinimized = false;
+      ptOpen = true;
+      return;
+    }
+    if (ptOpen) return;
+
+    if (isTranslationConfigured && !isTranslationConfigured()) {
+      toast(t("请先在「双语翻译 → 翻译服务」中启用引擎并填写密钥"), 3200, "info");
+      return;
+    }
+    const detection = detectBookLanguage({
+      metaLanguage: meta?.language || undefined,
+      sampleTexts: collectSampleTexts(getContentDocs(), { maxChars: 2000 }),
+    });
+    if (detection.verdict === "other") {
+      toast(t("未识别为英文书籍，整本预翻译暂不可用"), 2600, "info");
+      return;
+    }
+
+    ptOpen = true;
+    ptMinimized = false;
+    ptStage = "scanning";
+    ptScan = null;
+    ptProgress = null;
+    ptError = "";
+    ptPaused = false;
+    ptOverwrite = false;
+    ptEngine = "";
+    ptCfg = getAiSettings?.() ?? null;
+
+    ptScanAbort?.abort();
+    const ac = new AbortController();
+    ptScanAbort = ac;
+    try {
+      const r = await ensureBilingualHandle().pretranslateScan({ full: true, signal: ac.signal });
+      if (ac.signal.aborted || !ptOpen) return;
+      ptScan = r;
+      if (!r.total) {
+        ptError = t("这本书没有识别到可翻译的正文段落");
+        ptStage = "error";
+        return;
+      }
+      ptStage = "ready";
+    } catch (e) {
+      if (ac.signal.aborted) return;
+      ptError = String((e as Error)?.message || e);
+      ptStage = "error";
+    } finally {
+      if (ptScanAbort === ac) ptScanAbort = null;
+    }
+  }
+
+  /** 确认后开始：先开双语（窗口内即刻出译文），再交给后台队列跑全书 */
+  async function startPretranslate(): Promise<void> {
+    if (ptStage !== "ready" || !ptScan) return;
+    if (!bilingualOn) enableBilingual();
+    if (!bilingualOn) {
+      ptError = t("翻译引擎未就绪，请先在设置里启用引擎并填写密钥");
+      ptStage = "error";
+      return;
+    }
+
+    const run = ++ptRunId;
+    const ac = new AbortController();
+    ptAbort = ac;
+    ptStage = "running";
+    ptPaused = false;
+    ptMinimized = false;
+    ptProgress = {
+      done: 0,
+      total: ptScan.total,
+      cached: ptScan.cached,
+      pending: ptOverwrite ? ptScan.total : Math.max(0, ptScan.total - ptScan.cached),
+      status: "running",
+    };
+
+    const handle = bilingualHandle;
+    if (!handle) return;
+    try {
+      await handle.pretranslateAll({
+        full: true,
+        overwrite: ptOverwrite,
+        engine: ptEngine || undefined,
+        signal: ac.signal,
+        onProgress: (p) => {
+          if (run !== ptRunId) return; // 上一轮的滞后回调
+          ptProgress = p;
+          ptPaused = p.status === "paused";
+          if (p.status === "done") {
+            ptStage = "done";
+            ptMinimized = false;
+            toast(t("整本预翻译完成"), 2600, "info");
+            refreshCacheStats(bookId);
+            refreshCacheBookList();
+          } else if (p.status === "cancelled") {
+            ptStage = "cancelled";
+          } else if (p.status === "error") {
+            ptStage = "error";
+            ptError = t("预翻译中断，请查看日志后重试");
+          }
+        },
+      });
+    } catch (e) {
+      if (run !== ptRunId) return;
+      ptStage = "error";
+      ptError = String((e as Error)?.message || e);
+    } finally {
+      if (ptAbort === ac) ptAbort = null;
+    }
+  }
+
+  function pausePretranslate(): void {
+    bilingualHandle?.pretranslatePause();
+  }
+
+  function resumePretranslate(): void {
+    bilingualHandle?.pretranslateResume();
+  }
+
+  /** 停止：先唤醒暂停闸门再 abort，否则 paused 的 worker 会一直挂在等待里 */
+  function stopPretranslate(): void {
+    bilingualHandle?.pretranslateResume();
+    ptAbort?.abort();
+    ptScanAbort?.abort();
+  }
+
+  /** ✕ / 点遮罩：运行中不终止任务，收进右下悬浮条（已花的请求不能白花） */
+  function dismissPretranslate(): void {
+    if (ptStage === "scanning") {
+      ptScanAbort?.abort();
+      ptOpen = false;
+      return;
+    }
+    if (ptStage === "running") {
+      ptMinimized = true;
+      ptOpen = false;
+      return;
+    }
+    ptOpen = false;
+  }
+
+  function reopenPretranslate(): void {
+    ptMinimized = false;
+    ptOpen = true;
+  }
+
+  /** 错误态重试：先复位「已打开」守卫，再重走一次打开流程（重新扫描） */
+  function retryPretranslate(): void {
+    ptOpen = false;
+    ptStage = "scanning";
+    void openPretranslate();
+  }
+
+  /** 腾讯用量锁（单位：万字符；0 / 空 = 不限）。保存后回读宿主设置，弹窗立即同步 */
+  async function onTencentLockChange(e: Event): Promise<void> {
+    const el = e.currentTarget as HTMLInputElement;
+    const wan = Number(el.value || 0);
+    const chars = Math.max(0, Math.round((Number.isFinite(wan) ? wan : 0) * 10000));
+    try {
+      await onSaveTencentLock?.(chars);
+      ptCfg = getAiSettings?.() ?? { ...ptCfg, tencentCharsLock: chars };
+    } catch {
+      toast(t("保存腾讯用量锁失败"), 2400, "error");
+    }
+  }
 
   /**
    * F11 全屏：整块阅读区进入浏览器全屏（Esc 由浏览器原生退出）。
@@ -13564,6 +13945,11 @@ import { getLogger } from "../core/logger.ts";
     // v1.3.0：本书上下文编辑器销毁 + 落盘未保存内容
     flushPrimerSave();
     destroyPrimerEditor();
+    // 2026-11-14：预翻译的扫描/运行都必须随组件销毁中断，
+    // 否则关闭 Tab 后后台还在按节创建文档、继续消耗额度。
+    ptScanAbort?.abort();
+    ptAbort?.abort();
+    ptRunId++;
     // 2026-08-27：双语注入句柄销毁（移除全部译文节点，零残留）
     try { bilingualHandle?.destroy(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · try { bilingualHandle?.destroy(); }", "debug"); }
     bilingualHandle = null;
@@ -13781,6 +14167,8 @@ import { getLogger } from "../core/logger.ts";
             completionTokens={bilingualTokenUsage?.completionTokens ?? null}
             totalTokens={bilingualTokenUsage?.totalTokens ?? null}
             onToggleBilingual={toggleBilingual}
+            onPretranslate={() => void openPretranslate()}
+            onOpenSettings={openBilingualSettingsPanel}
           />
         {/if}
         <!-- 图书与 PDF 共用：阅读助手 + 设置 + 搜索 -->
@@ -14003,9 +14391,200 @@ import { getLogger } from "../core/logger.ts";
     </div>
   {/if}
 
+  {#if ptOpen}
+    <!-- 2026-11-14 P1-2：整本预翻译弹窗。
+         样式复用 18357 起的 .reword-pt-* 一套；毛玻璃用全局 .reword-glass 基类。
+         data-dismiss-ignore：弹窗内点击不能被 onContainerMouseDown 判为「点空白」。
+         运行中关弹窗 = 收进右下悬浮条，任务继续。 -->
+    <div
+      class="reword-pt-overlay"
+      data-dismiss-ignore
+      role="presentation"
+      on:mousedown|self={dismissPretranslate}
+    >
+      <div class="reword-pt-modal reword-glass" role="dialog" aria-modal="true" aria-label={t("整本预翻译")}>
+        <div class="reword-pt-header">
+          <span class="reword-pt-title">{t("整本预翻译")}</span>
+          <button
+            class="reword-pt-close"
+            aria-label={t("关闭")}
+            title={ptStage === "running" ? t("后台运行（点右下角悬浮条回来）") : t("关闭")}
+            on:click={dismissPretranslate}
+          >×</button>
+        </div>
+
+        <div class="reword-pt-book">
+          <div class="reword-pt-cover">{(meta?.format || "book").toUpperCase().slice(0, 4)}</div>
+          <div>
+            <div class="reword-pt-book-title">{title || t("当前书籍")}</div>
+            <div class="reword-pt-book-sub">
+              {meta?.author || t("未知作者")} · {t("{n} 个分节", { n: ptScan?.sections ?? "—" })}
+            </div>
+          </div>
+        </div>
+
+        {#if ptStage === "scanning"}
+          <div class="reword-pt-scanning">
+            <span class="reword-pt-floating-spinner"></span>
+            <span>{t("正在统计全书段落与缓存命中…")}</span>
+          </div>
+          <div class="reword-pt-footer">
+            <button class="reword-pt-btn reword-pt-btn-ghost" on:click={dismissPretranslate}>{t("取消")}</button>
+          </div>
+        {:else if ptStage === "error"}
+          <div class="reword-pt-error">{ptError || t("预翻译未能开始")}</div>
+          <div class="reword-pt-footer">
+            <button class="reword-pt-btn reword-pt-btn-ghost" on:click={dismissPretranslate}>{t("关闭")}</button>
+            <button class="reword-pt-btn reword-pt-btn-primary" on:click={retryPretranslate}>{t("重试")}</button>
+          </div>
+        {:else}
+          <div class="reword-pt-stats">
+            <div class="reword-pt-stat">
+              <span class="reword-pt-stat-label">{t("全书段落")}</span>
+              <span class="reword-pt-stat-num">{ptTotal}</span>
+            </div>
+            <div class="reword-pt-stat">
+              <span class="reword-pt-stat-label">{t("已缓存")}</span>
+              <span class="reword-pt-stat-num reword-pt-ok">{ptScan?.cached ?? 0}</span>
+            </div>
+            <div class="reword-pt-stat">
+              <span class="reword-pt-stat-label">{t("待翻译")}</span>
+              <span class="reword-pt-stat-num reword-pt-warn">
+                {ptStage === "ready" ? ptPendingBefore : ptPending}
+              </span>
+            </div>
+            <div class="reword-pt-stat">
+              <span class="reword-pt-stat-label">{t("预计 Token")}</span>
+              <span class="reword-pt-stat-num">{fmtWan(ptEstTokens)}</span>
+            </div>
+          </div>
+
+          <div class="reword-pt-options" class:reword-pt-disabled={ptStage !== "ready"}>
+            <div class="reword-pt-field">
+              <label for="pt-engine">{t("翻译引擎")}</label>
+              <select id="pt-engine" bind:value={ptEngine} disabled={ptStage !== "ready"}>
+                {#each ptEngineList as opt (opt.value)}
+                  <option value={opt.value} disabled={!opt.ready}>
+                    {opt.label}{opt.ready ? "" : `（${t("未配置")}）`}
+                  </option>
+                {/each}
+              </select>
+            </div>
+
+            {#if ptTencentInChain}
+              <div class="reword-pt-field reword-pt-tencent-lock">
+                <label for="pt-lock">{t("腾讯用量锁")}</label>
+                <div class="reword-pt-lock-input">
+                  <input
+                    id="pt-lock"
+                    type="number"
+                    min="0"
+                    step="10"
+                    placeholder={t("不限")}
+                    value={ptLockWan}
+                    disabled={ptStage !== "ready"}
+                    on:change={onTencentLockChange}
+                  />
+                  <span>{t("万字符")}</span>
+                </div>
+                <div class="reword-pt-lock-used">
+                  {t("已用 {used} / {lock}", {
+                    used: fmtWan(ptTencentUsed),
+                    lock: ptTencentLock > 0 ? fmtWan(ptTencentLock) : t("不限"),
+                  })}
+                </div>
+              </div>
+            {/if}
+
+            <label class="reword-pt-overwrite">
+              <input type="checkbox" bind:checked={ptOverwrite} disabled={ptStage !== "ready"} />
+              <span>{t("重新翻译已缓存段落（会再次消耗额度）")}</span>
+            </label>
+          </div>
+
+          {#if ptStage !== "ready"}
+            <div class="reword-pt-progress">
+              <div class="reword-pt-progress-top">
+                <span>
+                  {ptPaused
+                    ? t("已暂停")
+                    : ptStage === "running"
+                      ? t("正在翻译…")
+                      : ptStage === "done"
+                        ? t("已完成")
+                        : t("已停止")} · {ptDone}/{ptTotal}
+                </span>
+                <span class="reword-pt-eta">{ptEtaText}</span>
+              </div>
+              <div class="reword-pt-bar">
+                <div class="reword-pt-bar-fill" style="width:{ptPercent}%"></div>
+              </div>
+            </div>
+          {/if}
+
+          <p class="reword-pt-note">
+            {#if ptStage === "ready"}
+              {ptPendingBefore === 0
+                ? t("全部段落已有缓存，无需预翻译。")
+                : t("译文先写入本机缓存，只有翻到的页才显示，不会改动原文。")}
+            {:else if ptStage === "running"}
+              {t("可以关掉弹窗后台运行；翻页时命中的译文会直接显示。")}
+            {:else if ptStage === "done"}
+              {t("已写入缓存，之后翻到哪页都会秒出译文。")}
+            {:else}
+              {t("已停止；已译完的段落仍保留在缓存里。")}
+            {/if}
+          </p>
+
+          <div class="reword-pt-footer">
+            {#if ptStage === "ready"}
+              <button class="reword-pt-btn reword-pt-btn-ghost" on:click={dismissPretranslate}>{t("取消")}</button>
+              <button
+                class="reword-pt-btn reword-pt-btn-primary"
+                disabled={ptPendingBefore === 0}
+                on:click={() => void startPretranslate()}
+              >{t("开始预翻译")}</button>
+            {:else if ptStage === "running"}
+              {#if ptPaused}
+                <button class="reword-pt-btn reword-pt-btn-ghost" on:click={resumePretranslate}>{t("继续")}</button>
+              {:else}
+                <button class="reword-pt-btn reword-pt-btn-ghost" on:click={pausePretranslate}>{t("暂停")}</button>
+              {/if}
+              <button class="reword-pt-btn reword-pt-btn-ghost" on:click={dismissPretranslate}>{t("后台运行")}</button>
+              <button class="reword-pt-btn reword-pt-btn-warn" on:click={stopPretranslate}>{t("停止")}</button>
+            {:else}
+              <button class="reword-pt-btn reword-pt-btn-primary" on:click={dismissPretranslate}>{t("完成")}</button>
+            {/if}
+          </div>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if ptMinimized && ptStage === "running"}
+    <!-- 运行中收起 → 右下角悬浮条；点击回到弹窗。完成后自动消失（见 onProgress）。 -->
+    <div
+      class="reword-pt-floating reword-glass"
+      role="button"
+      tabindex="0"
+      data-dismiss-ignore
+      title={t("打开预翻译进度")}
+      on:click={reopenPretranslate}
+      on:keydown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          reopenPretranslate();
+        }
+      }}
+    >
+      <span class="reword-pt-floating-spinner" class:reword-pt-floating-paused={ptPaused}></span>
+      <span class="reword-pt-floating-text">{ptPaused ? t("已暂停") : t("预翻译中")} {ptDone}/{ptTotal}</span>
+      <span class="reword-pt-floating-hint">{t("点击查看")}</span>
+    </div>
+  {/if}
+
   {#if imgCtx.open}
-    <!-- 2026-11-04 图片右键菜单：正文（iframe 内右键）与灯箱共用同一份状态/动作 -->
-    <ImageContextMenu
+    <!-- 2026-11-04 图片右键菜单：正文（iframe 内右键）与灯箱共用同一份状态/动作 -->    <ImageContextMenu
       x={imgCtx.x}
       y={imgCtx.y}
       onCopy={copyContextImage}
@@ -14125,6 +14704,12 @@ import { getLogger } from "../core/logger.ts";
           <span class="reader-more-item-state">
             {bilingualProgress.active ? `${bilingualProgress.done}/${bilingualProgress.total}` : bilingualOn ? t("开") : t("关")}
           </span>
+        </button>
+        <button class="reader-more-item" role="menuitem" on:click={onMorePretranslate}>
+          <span>{t("整本预翻译…")}</span>
+          {#if ptStage === "running"}
+            <span class="reader-more-item-state">{ptDone}/{ptTotal}</span>
+          {/if}
         </button>
         <button class="reader-more-item" role="menuitem" on:click={onMoreBilingualSettings}>
           <span>{t("双语翻译设置")}</span>
@@ -14258,6 +14843,7 @@ import { getLogger } from "../core/logger.ts";
       {readerMode}
       dictManager={dictManagerRef}
       translateHost={translateHostRef}
+      sampleBookText={sampleBilingualText}
       siyuanApi={siyuanApiForPicker}
       fontStore={fontStore}
       store={store}
@@ -14428,6 +15014,20 @@ import { getLogger } from "../core/logger.ts";
     </div>
   {:else if errorMsg}
     <div class="reader-error">{t("打开失败：")}{errorMsg}</div>
+  {:else if !opened}
+    <!-- 2026-11-15 开书加载态：移动端点开一本书后原本是纯白屏，几秒内零反馈，
+         体感会被放大成「卡死了」。这里把 markStage 的内部阶段翻成一句人话。 -->
+    <div class="reader-opening">
+      <div class="reader-opening-spinner" aria-hidden="true"></div>
+      <div class="reader-opening-text">{t(openStageLabel(openStage))}</div>
+      {#if isBigBook(meta?.size)}
+        <div class="reader-opening-hint">
+          {t("这本书约 {mb} MB，首次打开需要几秒；读过的书会记在内存里，再次打开更快", {
+            mb: Math.max(1, Math.round((meta?.size ?? 0) / 1048576)),
+          })}
+        </div>
+      {/if}
+    </div>
   {/if}
 
   <!--
@@ -14877,12 +15477,17 @@ import { getLogger } from "../core/logger.ts";
   {/if}
   </div><!-- /.reader-floating-layer -->
 
-  <!-- 2026-11-05 P0：AI 阅读助手（右侧停靠 / 手机全屏）。
+  <!-- 2026-11-05 P0：AI 阅读助手（桌面右栏 / 移动端内嵌面板）。
        刻意放在 .reader-floating-layer **外面**：那层标了 aria-hidden="true"，
        只装瞬时浮层；对话面板是可长期停留、可键盘操作的实体内容。
-       2026-11-06：桌面已改用思源右栏，这里只剩手机全屏覆盖层。 -->
+       2026-11-06：桌面已改用思源右栏，这里只剩移动端。
+       2026-11-15 P0：移动端全覆盖（含平板）；手机全屏、平板右侧半屏。 -->
   {#if showAiPanel && aiOverlay}
-    <div class="reader-ai-dock reader-ai-dock--overlay">
+    <div
+      class="reader-ai-dock"
+      class:reader-ai-dock--overlay={aiFullScreen}
+      class:reader-ai-dock--tablet={!aiFullScreen}
+    >
       <AiPanel
         bind:this={aiPanelComp}
         open={showAiPanel}
@@ -14891,7 +15496,7 @@ import { getLogger } from "../core/logger.ts";
         bookAuthor={meta?.author || ""}
         chapterLabel={chapterLabel}
         resizable={false}
-        overlay={true}
+        overlay={aiFullScreen}
         getAiSettings={getAiSettings}
         saveAiSettings={onSaveAiSettings}
         getChapter={getChapterSnapshot}
@@ -17115,6 +17720,20 @@ import { getLogger } from "../core/logger.ts";
     z-index: 40;
     box-shadow: none;
   }
+  /* 2026-11-15 P0：平板 / 宽视口移动端的右侧半屏面板。
+     手机档仍走 --overlay 全屏；平板给一个「可对照正文」的宽度：
+     768 竖屏 ≈ 353px，1024 横屏封顶 420px。不铺满是为了不打断阅读。
+     z 取 40 与手机全屏同档：高于阅读器顶/底栏，低于图片查看器(60)/设置弹窗(100)。
+     打开时 retractChromeForAi() 已收起上下栏，故 top:0 不会压住可见控件。
+     安全区用 top/right/bottom 让位（overlay=false 时面板自身不补 safe-area）。 */
+  .reader-ai-dock--tablet {
+    top: env(safe-area-inset-top, 0px);
+    right: env(safe-area-inset-right, 0px);
+    bottom: env(safe-area-inset-bottom, 0px);
+    width: min(420px, 46%);
+    min-width: 300px;
+    z-index: 40;
+  }
   /* 拖宽把手（停靠栏右缘） */
   .reader-side-resizer {
     position: absolute;
@@ -18478,6 +19097,31 @@ import { getLogger } from "../core/logger.ts";
     opacity: 0.55;
     pointer-events: none;
   }
+  /* 预扫描态：转圈 + 一行说明（扫描只读，不动额度） */
+  .reword-pt-scanning {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: var(--reword-space-4) 0;
+    justify-content: center;
+    font-size: 12px;
+    opacity: 0.85;
+  }
+  .reword-pt-error {
+    padding: var(--reword-space-3);
+    margin-bottom: var(--reword-space-3);
+    border-radius: var(--reword-radius-md);
+    background: rgba(217, 83, 79, 0.16);
+    border: 1px solid rgba(217, 83, 79, 0.4);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+  .reword-pt-note {
+    margin: 0 0 var(--reword-space-3);
+    font-size: 11px;
+    line-height: 1.5;
+    opacity: 0.68;
+  }
   .reword-pt-field {
     display: flex;
     align-items: center;
@@ -18674,6 +19318,11 @@ import { getLogger } from "../core/logger.ts";
   @keyframes reword-pt-spin { to { transform: rotate(360deg); } }
   .reword-pt-floating-text { font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
   .reword-pt-floating-hint { font-size: 11px; opacity: 0.65; }
+  /* 暂停态：圈停转，提示「不是卡住了」 */
+  .reword-pt-floating-paused {
+    animation: none;
+    border-color: rgba(255, 255, 255, 0.45);
+  }
   .reword-pt-footer {
     display: flex;
     align-items: center;
@@ -18994,6 +19643,43 @@ import { getLogger } from "../core/logger.ts";
     justify-content: center;
     color: var(--b3-theme-error, #e24b4a);
     font-size: 13px;
+  }
+
+  /* 2026-11-15 开书加载态（模板同名注释）：只承担「有反应」这件事，不做进度条 —— 
+     读文件那一步拿不到百分比，画一条假的反而更让人焦虑。 */
+  .reader-opening {
+    position: absolute;
+    inset: 40px 0 0 0;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    padding: 0 28px;
+    text-align: center;
+    color: var(--b3-theme-on-surface, #666);
+    font-size: 13px;
+    pointer-events: none;
+  }
+  .reader-opening-spinner {
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    border: 2px solid var(--b3-border-color, rgba(0, 0, 0, 0.12));
+    border-top-color: var(--b3-theme-primary, #378add);
+    animation: reader-opening-spin 0.8s linear infinite;
+  }
+  @keyframes reader-opening-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  .reader-opening-hint {
+    max-width: 320px;
+    font-size: 12px;
+    line-height: 1.6;
+    color: var(--b3-theme-on-surface-light, #888);
   }
 
   /* 2026-08-26 调试 HUD：高亮渲染链路诊断 */

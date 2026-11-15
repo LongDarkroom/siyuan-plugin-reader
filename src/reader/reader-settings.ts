@@ -1,5 +1,7 @@
 import { logSwallow } from "../core/safe.ts";
 import { t } from "../i18n/index.ts";
+// 2026-11-13 内置中文字体：中文字体槽 / 下拉候选都要引用它们的 CSS 族名
+import { BUILTIN_SANS, BUILTIN_SERIF, CJK_AUTO } from "./builtin-fonts.ts";
 
 /** 阅读设置全局单例（供非 Svelte 模块如 graph.ts / index.ts 读取绑定文档 ID） */
 let _globalSettingsStore: any = null;
@@ -240,6 +242,31 @@ export const READER_FONT_SIZE_MAX = 72;
 /** 思源的默认编辑器字号（对齐思源，首次安装时的观感一致） */
 export const READER_FONT_SIZE_DEFAULT = 17;
 
+/**
+ * 正文字重的可调范围（2026-11-13）。
+ *
+ * 下界不是「产品口味」而是**字体本身的能力**：内置宋体是 wght 250–900 的
+ * 可变字体，请求低于 250 时浏览器把值钳到轴的下界，渲染结果与 250 逐像素
+ * 相同。把 min 写成 100 只会让 100 / 200 两档「点了没反应」，看着像控件坏了。
+ *
+ * ⚠️ schema 的 min/max 必须引用这两个常量（闭环测试会校验）。
+ */
+export const READER_FONT_WEIGHT_MIN = 250;
+export const READER_FONT_WEIGHT_MAX = 900;
+
+/**
+ * 把任意字重夹进可调范围（2026-11-13）。
+ *
+ * 存量设置档里可能有旧版 stepper 留下的 100 / 150 / 200，它们落在字体轴
+ * 之外：渲染时被钳到 250，stepper 按「−」又会算成 `100 − 25 → 夹回 250`，
+ * 表现成「按减反而变粗」。加载时统一走这里。
+ */
+export function clampFontWeight(w: number): number {
+  const n = Number(w);
+  if (!Number.isFinite(n)) return READER_DEFAULT_SETTINGS.text.fontWeight;
+  return Math.min(READER_FONT_WEIGHT_MAX, Math.max(READER_FONT_WEIGHT_MIN, n));
+}
+
 export interface ReaderSettings {
   /** 字号 12-28 px */
   fontSize: number;
@@ -312,13 +339,17 @@ export interface ReaderSettings {
   /* ---- 2026-08-28 分类字体（fontMode=classified，参考 Readest 字体面板） ---- */
   /** 正文默认走衬线还是无衬线链（默认 serif） */
   defaultFontFamily?: ReaderDefaultFontFamily;
-  /** 衬线链首选字体（默认「霞鹜文楷」，思源笔记常用） */
+  /** 衬线链首选字体（默认 Georgia，纯西文；汉字由 defaultCJKFont 决定） */
   serifFont?: string;
-  /** 无衬线链首选字体（默认「苹方」） */
+  /** 无衬线链首选字体（默认 Helvetica Neue，纯西文） */
   sansSerifFont?: string;
   /** 等宽链首选字体（默认「Fira Code」，代码块专用） */
   monospaceFont?: string;
-  /** 中文字体：插入每条链的次位（留空=不插入，仅用跨平台 CJK 兜底栈） */
+  /**
+   * 中文字体：**只作用于汉字**。
+   * 空值 = 自动配对内置字体（衬线链→思源宋体 / 无衬线链→思源黑体），
+   * 也可填内置字体的符号 id、系统中文族名、或用户导入的字体名。
+   */
   defaultCJKFont?: string;
   /** 强制正文使用阅读器字体（霞鹜文楷），覆盖书籍自带死字体；默认开（参考 Readest/思阅「覆盖出版商字体」） */
   overridePublisherFont?: boolean;
@@ -511,11 +542,19 @@ export interface ReaderSettings {
    * 双语模式是否显示原文（2026-10-07，对标 Readest 的「显示原文」开关）。
    *
    * 实现方式：译文是原文元素的**紧邻兄弟节点**（见 bilingual-v2/render.ts v2 方案），
-   * 故「隐藏原文」用 CSS 在 `.reader-view` 上加一个属性选择器即可，无需改 DOM 结构：
-   *   关闭时只隐藏有译文的那些段落，纯原文段（无译文）不受影响。
+   * 故「隐藏原文」只需一段 CSS：`p:has(+ .reword-bilingual) { display:none }`，
+   * 关闭时只隐藏有译文的那些段落，纯原文段（无译文）不受影响。
+   * 注意样式是注入 **iframe 内部**的（foliate setStyles），不能带 `.reader-view`
+   * 前缀 —— 那是父文档容器，iframe 内匹配不到（2026-11-13 修复）。
    * 默认 true（显示原文）—— 关掉后对照阅读时视野只有译文，更专注。
    */
   bilingualShowSource?: boolean;
+  /**
+   * 悬停显示译文（2026-11-13）：译文默认淡出，悬停原文段或译文时显形。
+   * 只淡出不收起，避免 hover 时正文上下跳动；触屏设备自动退化为常显。
+   * 与 `bilingualShowSource=false` 互斥（原文已隐藏时该开关被忽略）。
+   */
+  bilingualHoverShow?: boolean;
   /**
    * 翻译服务选择（2026-10-07，对标 Readest 的「翻译服务」）。
    *
@@ -702,6 +741,7 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
   bilingual: false,
   // 2026-10-07 对标 Readest 新增的三个字段（默认值必须给，否则面板读到 undefined 会崩）
   bilingualShowSource: true,   // 默认显示原文（关掉后只看译文）
+  bilingualHoverShow: false,   // 译文常显；开启后改为悬停显形（无重排）
   bilingualEngine: "auto",      // 自动：免费引擎链 → AI 兜底
   bilingualTarget: "zh",
   bilingualStyle: "default",
@@ -855,24 +895,31 @@ export const SERIF_LATIN_PRESETS: string[] = [
   "EB Garamond",
 ];
 
-/** 中文字体衬线候选池（中文槽 + 衬线链尾部兜底） */
+/** 中文字体衬线候选池（衬线链尾部兜底；只放**可能真实存在**的中文族名） */
 export const CJK_SERIF_PRESETS: string[] = [
-  "霞鹜文楷",
-  "LXGW WenKai",
-  "LXGW WenKai Screen",
-  "Songti SC",
-  "宋体",
-  "SimSun",
+  "Source Han Serif SC VF",
+  "Source Han Serif SC",
   "Source Han Serif CN",
   "Noto Serif CJK SC",
   "Noto Serif SC",
+  "Songti SC",
+  "STSong",
+  "霞鹜文楷",
+  "LXGW WenKai",
+  "LXGW WenKai Screen",
+  "宋体",
+  "SimSun",
 ];
 
-/** 衬线链候选池（西文优先）：衬线字体下拉 + 衬线链回退用 */
-export const SERIF_FONT_PRESETS: string[] = [
-  ...SERIF_LATIN_PRESETS,
-  ...CJK_SERIF_PRESETS,
-];
+/**
+ * 衬线字体下拉候选池 —— **只含西文**（2026-11-13 收敛）。
+ *
+ * 旧实现 = 西文池 + 中文池合并（23 项）。实测后果：西文衬线字体没有汉字字形，
+ * 汉字一路回退到链里第一个有汉字的字体 ⇒ 23 个选项里 22 个的中文渲染逐像素相同，
+ * 用户看到的就是「选什么都没反应」。
+ * 中文现在只有一个入口：「中文字体」槽（含两款内置字体）。职责不再重叠。
+ */
+export const SERIF_FONT_PRESETS: string[] = [...SERIF_LATIN_PRESETS];
 
 /** 西文无衬线候选池（英文正文首选；2026-11-01 与中文池分离） */
 export const SANS_SERIF_LATIN_PRESETS: string[] = [
@@ -888,22 +935,31 @@ export const SANS_SERIF_LATIN_PRESETS: string[] = [
   "Tahoma",
 ];
 
-/** 中文字体无衬线候选池（中文槽 + 无衬线链尾部兜底） */
+/**
+ * 中文字体无衬线候选池（无衬线链尾部兜底）。
+ *
+ * ⚠️ 实测（Chrome + macOS）：本地化族名 `苹方` **不生效** —— 只有 `PingFang SC` 能被
+ * CSS 匹配到（同一个字体，两个名字，Chrome 只认后者）。链里写 `苹方` 会静默跳过，
+ * 于是「选了苹方却显示成宋体」。故池里只留 `PingFang SC`。
+ * Windows 的 `微软雅黑` 反之是可用的（DirectWrite 暴露本地化族名），保留。
+ */
 export const CJK_SANS_SERIF_PRESETS: string[] = [
-  "苹方",
-  "PingFang SC",
-  "微软雅黑",
-  "Microsoft YaHei",
-  "思源黑体",
+  "Source Han Sans SC VF",
+  "Source Han Sans SC",
   "Source Han Sans CN",
+  "Noto Sans CJK SC",
   "Noto Sans SC",
+  "PingFang SC",
+  "Hiragino Sans GB",
+  "Heiti SC",
+  "Microsoft YaHei",
+  "微软雅黑",
+  "黑体",
+  "SimHei",
 ];
 
-/** 无衬线链候选池（西文优先） */
-export const SANS_SERIF_FONT_PRESETS: string[] = [
-  ...SANS_SERIF_LATIN_PRESETS,
-  ...CJK_SANS_SERIF_PRESETS,
-];
+/** 无衬线字体下拉候选池 —— **只含西文**（同 SERIF_FONT_PRESETS 的收敛理由） */
+export const SANS_SERIF_FONT_PRESETS: string[] = [...SANS_SERIF_LATIN_PRESETS];
 
 /** 等宽链候选池（代码块 / <pre> / <code> 专用） */
 export const MONOSPACE_FONT_PRESETS: string[] = [
@@ -918,21 +974,64 @@ export const MONOSPACE_FONT_PRESETS: string[] = [
   "Noto Sans Mono CJK SC",
 ];
 
-/** 中文字体候选池（插入每条链次位，留空则不插入） */
-export const CJK_FONT_PRESETS: string[] = [
-  "霞鹜文楷",
-  "LXGW WenKai",
-  "苹方",
-  "PingFang SC",
-  "微软雅黑",
-  "Microsoft YaHei",
-  "思源黑体",
-  "Source Han Sans CN",
-  "Noto Sans SC",
-  "Songti SC",
-  "宋体",
-  "SimSun",
+/**
+ * 中文字体下拉的**展示分组**（2026-11-13 三次收敛，用户定版：中文留 8 项）。
+ *
+ * 上一版靠「别名组 + 像素去重」做减法，结果是**机器相关、且不稳定**：
+ * 同一个族名在不同平台/不同 Chrome 版本下指纹可能略有差异，收敛结果就在 6～11 项之间飘。
+ * 用户要的是「只留真正分得开的那几个」，所以改成**白名单式**：
+ * 这里列出的组就是下拉的最终内容，每组只出一个族名（组内第一个本机存在的）。
+ * 不在表里的族名一律不显示 —— 包括 `Hiragino Sans GB`（与苹方几乎分不出）、
+ * 系统版思源宋/黑（与内置款重复）、以及 `微软雅黑`（无衬线风格已被内置思源黑体覆盖）。
+ *
+ * 为什么是一个组里放多个名字：同一款字体在 macOS / Windows / 思源内核清单里
+ * 叫法不同（`Songti SC` / `宋体` / `SimSun`），组内按优先级取第一个**本机有**的，
+ * 这样一份配置三个平台都能落到正确的那款，且下拉里只出现一行中文标签。
+ */
+export const CJK_VISIBLE_GROUPS: { label: string; names: string[] }[] = [
+  // 内置两款单独处理（排在建制最前、带「· 内置」后缀），这里放的是它们的
+  // 系统等价名：装了系统版思源宋/黑时，内置款吸收它们，不再多出一行。
+  {
+    label: "思源宋体",
+    names: [
+      BUILTIN_SERIF.id,
+      "Source Han Serif SC VF",
+      "Source Han Serif SC",
+      "Source Han Serif CN",
+      "Noto Serif CJK SC",
+      "Noto Serif SC",
+      "思源宋体",
+    ],
+  },
+  {
+    label: "思源黑体",
+    names: [
+      BUILTIN_SANS.id,
+      "Source Han Sans SC VF",
+      "Source Han Sans SC",
+      "Source Han Sans CN",
+      "Noto Sans CJK SC",
+      "Noto Sans SC",
+      "思源黑体",
+    ],
+  },
+  // 楷书（瘦长秀气，阅读观感最「软」的一款）
+  { label: "霞鹜文楷", names: ["霞鹜文楷", "LXGW WenKai", "LXGW WenKai Screen"] },
+  // 宋体：mac 的叫法在前，Windows 的「宋体/SimSun」在后 —— 各平台各自命中
+  { label: "宋体", names: ["Songti SC", "STSong", "华文宋体", "宋体", "SimSun"] },
+  // 楷体：`华文楷体` 是 macOS 的本地化名，与 `Kaiti SC`/`STKaiti` 同一款（实测 0.0% 差异）
+  { label: "楷体", names: ["Kaiti SC", "STKaiti", "华文楷体", "楷体", "KaiTi"] },
+  { label: "仿宋", names: ["STFangsong", "华文仿宋", "仿宋", "FangSong"] },
+  { label: "苹方", names: ["PingFang SC", "苹方"] },
 ];
+
+/**
+ * 中文字体下拉候选（系统字体部分）—— 由展示分组展开而来。
+ *
+ * 保留这个导出是因为布局/链构建模块把它当作「中文族池」使用；
+ * 内容与 `CJK_VISIBLE_GROUPS` 保持一致，避免两处名单打对不上。
+ */
+export const CJK_FONT_PRESETS: string[] = CJK_VISIBLE_GROUPS.flatMap((g) => g.names);
 
 /* ================= 动态字体枚举（2026-10-14 方案 A） =================
  * 用户反馈下拉字体太少。根因：以上 4 个数组是硬编码预设，不反映用户已安装的系统字体 /
@@ -1005,37 +1104,356 @@ function mergeDynamicWithPresets(presets: string[], dynamic: string[]): string[]
   return result;
 }
 
-/** 衬线字体下拉选项（Svelte store，初始值=预设，后续动态更新） */
-export const serifFontOptions = writable<string[]>([...SERIF_FONT_PRESETS]);
+/* ================= 字体下拉选项（2026-11-13 重构） =================
+ *
+ * 旧实现是 `string[]`，且「衬线字体」= 西文池 + 中文池合并 → 23 项里 22 项的中文
+ * 渲染结果逐像素相同（用户反馈「选什么都没反应」）。
+ * 现在的三个改动：
+ *   ① 西文槽只列西文（SERIF_FONT_PRESETS / SANS_SERIF_FONT_PRESETS 收窄）；
+ *   ② 选项带上「本机是否真有这个族」的信息，没装的标 `· 未安装`；
+ *   ③ 中文槽前两项是内置字体（思源宋体 / 思源黑体），永远可选。
+ *
+ * 判定「有」的两个来源：
+ *   · 内核 `/api/system/getSysFonts`（思源外观设置同一份数据，含别名）→ 系统字体；
+ *   · `document.fonts` 已注册 face → 网页字体（霞鹜文楷这类思源字体插件注入的，
+ *     没装到系统但**确实可用**，必须算「有」，否则会把能用的选项误标成未安装）。
+ */
+
+export interface FontOption {
+  value: string;
+  label: string;
+}
+
+/** 族名比较键：去引号、去空白、转小写（`"LXGW WenKai"` ≡ `LXGWWenKai`） */
+function fontKey(name: string): string {
+  return String(name || "").replace(/["']/g, "").replace(/\s+/g, "").toLowerCase();
+}
+
+/** 别名里混着的**样式名**（不是族名），参与匹配会让判定失真 */
+const STYLE_ALIAS_RE =
+  /^(regular|bold|italic|oblique|light|medium|thin|black|heavy|semibold|book|normal|常规|常规体|粗体|细体|中等|中黑|中粗体|特黑|黑体|纤细体|极细体|标准体)$/;
+
+/**
+ * 去掉显示名尾部的样式词：`宋体-简 常规体` → `宋体-简`，`苹方-简 中粗体` → `苹方-简`。
+ *
+ * 为什么要它：内核的 `aliases` 只有 PostScript 名与部分中文名，
+ * `微软雅黑` 这种**本地化族名只出现在 displayName 里**；
+ * 不剥样式词就会把「微软雅黑」判成未安装（而它其实能用）。
+ */
+function stripStyleSuffix(displayName: string): string {
+  const s = String(displayName || "").trim();
+  if (!s) return "";
+  const tail = s.split(/\s+/).pop() || "";
+  const head = s.slice(0, Math.max(0, s.length - tail.length)).trim();
+  if (head && STYLE_ALIAS_RE.test(tail.toLowerCase())) return head;
+  return s;
+}
+
+/** 内核系统字体索引；`null` = 尚未取到 → 一律不判「未安装」（宁可少标不可误标） */
+let sysFontKeys: Set<string> | null = null;
+
+/**
+ * 用内核清单建立索引（`getSysFonts()` 的结果）。
+ * 传空数组 / null 表示接口不可用：保持 `null`，不做任何未安装标记。
+ */
+export function setSysFontInventory(
+  faces: { family: string; displayName?: string; aliases?: string[] }[] | null | undefined
+): void {
+  if (!faces || !faces.length) return;
+  const keys = new Set<string>();
+  const add = (raw?: string) => {
+    const k = fontKey(raw || "");
+    if (k && !STYLE_ALIAS_RE.test(k)) keys.add(k);
+  };
+  for (const f of faces) {
+    add(f.family);
+    // displayName 是**本地化族名**的唯一来源（微软雅黑 / 宋体-简），必须收
+    add(f.displayName);
+    add(stripStyleSuffix(f.displayName || ""));
+    for (const a of f.aliases || []) add(a);
+  }
+  sysFontKeys = keys;
+}
+
+/** 测试用：读当前索引状态（未取到 → null） */
+export function getSysFontInventorySize(): number | null {
+  return sysFontKeys ? sysFontKeys.size : null;
+}
+
+/**
+ * 判断内核清单里是否有这个族（清单未取到 → false，交给渲染指纹判定）。
+ * 只当「指纹说是回退、但内核说有」时才会用到，属于双重保险。
+ */
+function isKnownSystemFamily(name: string): boolean {
+  if (!sysFontKeys) return false;
+  const k = fontKey(name);
+  return !!k && sysFontKeys.has(k);
+}
+
+/* ===== 渲染指纹（2026-11-13 二次收敛）=====
+ *
+ * 用户第二次反馈的核心是「很多选项点了长得一模一样」「没装的也在列表里，很离谱」。
+ * 上一版只是给没装的挂 `· 未安装`，仍在列表里 —— 这次改成**直接把这类项删掉**。
+ *
+ * 判定不用字体清单，也不用 `document.fonts.check()`（实测它对不存在的族名同样返回
+ * true：它只回答「这段 font 描述能不能渲染」，回退字体当然能）。改用最朴素也最准的
+ * 办法：**用 canvas 把同一句话画出来，比对像素**。
+ *
+ *   · 与「本机一定不存在的族名」画出的帧相同 → 这个族名根本没生效 → 删；
+ *   · 与前面某个保留项画出的帧相同     → 两者观感完全一致 → 删后者。
+ *
+ * 这两个判断正好对应用户说的「没用的」和「都一样的」，且跨平台自动成立。
+ */
+
+/** 拉丁样本：大小写 + 数字 + 标点，足以区分绝大多数西文字体 */
+const LATIN_SAMPLE = "Hamburgefonstiv 0123 &@%";
+/** 中文样本：常用字，宋/黑/楷/仿宋的差异一眼可分 */
+const CJK_SAMPLE = "为什么他们坐在讲台上读书";
+/** 拍「基准帧」用的族名：本机不可能存在 ⇒ 画出来的是浏览器默认回退 */
+const MISSING_FAMILY = "__REword_missing_family__";
+/**
+ * 相似度阈值：两项的墨迹差异低于这个比例就认为是「同一款字体的两个名字」，删后者。
+ *
+ * 为什么不是「完全相同才删」：同一款字体装了两份（子集版 / 完整版 / 系统与用户目录各一份）
+ * 时 hinting 会有细微差别，逐像素必然不同，但观感完全一致。实测参考值：
+ *   Times New Roman ↔ Times 13.3%、Helvetica ↔ Arial 26.9%（不同款，应各自保留）。
+ * 取 15% 正好卡在两者之间 —— 前者合并，后者不动。
+ */
+const SIMILAR_THRESHOLD = 0.15;
+/** 位图取样步长：隔一个像素取一个（内存降到 1/4，判定精度不受影响） */
+const MASK_STRIDE = 2;
+
+let probeCtx: CanvasRenderingContext2D | null | undefined;
+/** 指纹缓存：同一文档内字体不会变，避免 loadingdone 反复触发时重算 */
+const fpCache = new Map<string, { hash: string; mask: Uint8Array }>();
+
+function probeContext(): CanvasRenderingContext2D | null {
+  if (probeCtx !== undefined) return probeCtx;
+  probeCtx = null;
+  try {
+    if (typeof document === "undefined" || !document.createElement) return null;
+    const c = document.createElement("canvas");
+    c.width = 520;
+    c.height = 64;
+    probeCtx = c.getContext("2d", { willReadFrequently: true });
+  } catch {
+    probeCtx = null;
+  }
+  return probeCtx;
+}
+
+/** 把两个位图按「有墨迹的像素」算差异率，0 = 完全一致 */
+function pixelDiff(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  let diff = 0;
+  let ink = 0;
+  for (let i = 0; i < n; i++) {
+    const va = a[i];
+    const vb = b[i];
+    if (va > 0 || vb > 0) ink++;
+    if (Math.abs(va - vb) > 24) diff++;
+  }
+  return ink ? diff / ink : 0;
+}
+
+/**
+ * 画一次样本，同时返回指纹哈希（判「是否安装」）与位图（判「是否相似」）。
+ *
+ * @param suffix 追加在族名后面的兜底链（`", serif"` / `", monospace"`）。
+ *               用于「这个族名到底有没有生效」的判定，见 `tookOver()`。
+ */
+function fingerprint(
+  ctx: CanvasRenderingContext2D,
+  text: string,
+  family: string,
+  suffix = ""
+): { hash: string; mask: Uint8Array } {
+  const safe = family.replace(/"/g, "");
+  const key = `${safe}\u0000${text}\u0000${suffix}`;
+  const hit = fpCache.get(key);
+  if (hit) return hit;
+  const w = ctx.canvas.width;
+  const h = ctx.canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.fillStyle = "#000";
+  ctx.textBaseline = "top";
+  ctx.font = `32px "${safe}"${suffix}`;
+  ctx.fillText(text, 2, 4);
+  const d = ctx.getImageData(0, 0, w, h).data;
+  let hv = 2166136261;
+  for (let i = 0; i < d.length; i += 4) {
+    if (d[i + 3] > 0) {
+      hv ^= (d[i] << 16) ^ (d[i + 1] << 8) ^ d[i + 2];
+      // 必须用 Math.imul：hv * 16777619 会超过 2^53，浮点精度丢失后
+      // 结果塌缩成同一个值 —— 所有字体都会指纹相同。
+      hv = Math.imul(hv, 16777619) >>> 0;
+    }
+  }
+  // 位图只取 alpha 通道，且隔点取样：判相似度够用，内存降到 1/4
+  const mask = new Uint8Array(Math.ceil(w / MASK_STRIDE) * Math.ceil(h / MASK_STRIDE));
+  let m = 0;
+  for (let y = 0; y < h; y += MASK_STRIDE) {
+    for (let x = 0; x < w; x += MASK_STRIDE) {
+      mask[m++] = d[(y * w + x) * 4 + 3];
+    }
+  }
+  const probe = { hash: hv.toString(36), mask };
+  fpCache.set(key, probe);
+  return probe;
+}
+
+/**
+ * 这个族名有没有**真的接管渲染**（判定「是否安装」的第二个证据）。
+ *
+ * 原理：拿同一个样本渲两次，族名后面分别挂 `serif` 和 `monospace` 两个通用族。
+ *   · 族名存在  → 两次都由它渲染 → 两张图一模一样；
+ *   · 族名不存在 → 各自回退到 serif / monospace → 两张图不同。
+ *
+ * 为什么需要它：光看「和基准帧一不一样」有个盲点 —— 若某个族正好就是浏览器的
+ * **默认回退字体**（macOS 上的苹方就是），它渲出来的图和「不存在的族名」完全相同，
+ * 会被误判成未安装。实测就是苹方从下拉里消失。两个证据都指向「没有」才算没有。
+ */
+function tookOver(ctx: CanvasRenderingContext2D, text: string, family: string): boolean {
+  return (
+    fingerprint(ctx, text, family, ", serif").hash ===
+    fingerprint(ctx, text, family, ", monospace").hash
+  );
+}
+
+/**
+ * 过滤 + 去重：只返回「本机真的能变出不同样子」的项。
+ *
+ * @param items  `value` 是存进设置的值；`render` 是真正拿去渲染的族名
+ *               （内置字体两者不同：value 是 `__builtin_serif__`，render 是 woff2 的族名）
+ * @param sample 比对「是否重复」用的样本（西文槽用拉丁串，中文槽用中文串）
+ */
+function renderableValues(
+  items: { value: string; render?: string }[],
+  sample: string
+): string[] {
+  const ctx = probeContext();
+  // 无 canvas（Node 测试 / 极端环境）→ 不做判断，保留全部，宁可多不可少
+  if (!ctx) return items.map((i) => i.value);
+
+  // 「不存在」要三个样本**同时**与基准帧相同才成立。
+  // 只看一个样本会误杀：macOS 上「不存在的族名」渲染汉字用的就是 PingFang SC，
+  // 单看中文帧的话 PingFang SC 自己会被判成「未安装」。
+  const base = {
+    main: fingerprint(ctx, sample, MISSING_FAMILY),
+    latin: fingerprint(ctx, LATIN_SAMPLE, MISSING_FAMILY),
+    cjk: fingerprint(ctx, CJK_SAMPLE, MISSING_FAMILY),
+  };
+  const kept: { value: string; mask: Uint8Array }[] = [];
+  const out: string[] = [];
+  for (const item of items) {
+    const render = (item.render ?? item.value).replace(/"/g, "");
+    const probe = fingerprint(ctx, sample, render);
+    // 两个证据都指向「没有」才算没有 —— 只看「和基准帧相同」会把默认回退字体
+    // （macOS 的苹方）误杀，只看兜底链差异则可能在部分平台上漏判。
+    const missing =
+      probe.hash === base.main.hash &&
+      fingerprint(ctx, LATIN_SAMPLE, render).hash === base.latin.hash &&
+      fingerprint(ctx, CJK_SAMPLE, render).hash === base.cjk.hash &&
+      !tookOver(ctx, sample, render);
+    const builtin = item.value.startsWith("__builtin_");
+    if (missing) {
+      // 画出来和「不存在的字体」一模一样 = 本机没有这个族。
+      // 例外：内置字体此刻可能还没加载完（face 未注册），永远保留；
+      //       内核清单确认存在的族也保留（可能只是样本里的字它没有）。
+      if (builtin || isKnownSystemFamily(item.value)) out.push(item.value);
+      continue;
+    }
+    // 与已保留项相似度过高 → 观感就是同一款，删后者。
+    // 用相似度而非哈希相等：同一款字体的两份（子集/完整、系统/用户目录）hinting
+    // 略有差别，逐像素必然不同，但人眼看着一模一样。
+    if (kept.some((k) => pixelDiff(k.mask, probe.mask) < SIMILAR_THRESHOLD)) continue;
+    kept.push({ value: item.value, mask: probe.mask });
+    out.push(item.value);
+  }
+  return out;
+}
+
+/** 西文槽选项：预设里「本机真的有」且「彼此长得不一样」的那些 */
+function latinOptionList(presets: string[]): FontOption[] {
+  const kept = renderableValues(presets.map((v) => ({ value: v })), LATIN_SAMPLE);
+  return kept.map((v) => ({ value: v, label: v }));
+}
+
+/**
+ * 中文槽选项：自动 → 七个展示组各一项（内置宋/黑永远在最前）。
+ *
+ * 为什么不再用「别名组 + 像素去重」：那套办法只能保证「不重复」，
+ * 保证不了「一共有几项」—— 结果会随平台和字体版本在 6～11 项之间飘，
+ * 用户看到的清单每次重开面板都可能不一样。现在改成白名单：
+ * **有几组就几项**，组内只取第一个本机存在的族名。
+ *
+ * 一个组的名字全都不可用（比如 Windows 上没有苹方）时整组消失，
+ * 于是 Windows 用户看到的是 自动/思源宋体/思源黑体/宋体/楷体/仿宋（6 项），
+ * macOS 用户看到 8 项 —— 都是「本机真能用」的集合。
+ */
+function cjkOptionList(): FontOption[] {
+  // 内置两款的 `value` 是内部 id，真正拿去渲染的是 woff2 的族名，必须分开传，
+  // 否则指纹判定会拿 `__builtin_serif__` 这个不存在的族名去画（虽然内置项有豁免，
+  // 但这样画出来的帧没有意义，也会让它和别的项比对失真）。
+  const items = CJK_VISIBLE_GROUPS.flatMap((g) =>
+    g.names.map((v) => ({
+      value: v,
+      render: v === BUILTIN_SERIF.id ? BUILTIN_SERIF.cssFamily : v === BUILTIN_SANS.id ? BUILTIN_SANS.cssFamily : undefined,
+    }))
+  );
+  const available = new Set(renderableValues(items, CJK_SAMPLE));
+  const out: FontOption[] = [
+    // 值用空串（历史默认值）：`resolveCjkFamily()` 把空串和 `__auto__` 都当自动，
+    // 用空串可以让老设置档直接回显，不必写迁移。
+    { value: "", label: t("自动（衬线→思源宋体 · 无衬线→思源黑体）") },
+  ];
+  for (const group of CJK_VISIBLE_GROUPS) {
+    // 组内顺序即优先级：mac 上 `Songti SC` 命中，Windows 上才轮到 `宋体`
+    const hit = group.names.find((name) => available.has(name));
+    if (!hit) continue;
+    const builtin = hit.startsWith("__builtin_");
+    out.push({
+      value: hit,
+      // 系统字体用中文标签（`Songti SC` 这种名字对用户没有信息量），
+      // 内置款加后缀说明「随插件分发、不依赖本机安装」
+      label: builtin ? `${t(group.label)} · ${t("内置")}` : t(group.label),
+    });
+  }
+  return out;
+}
+
+/** 衬线字体下拉选项（Svelte store；模块加载时先算一次，面板打开后由 refreshFontOptions 重算） */
+export const serifFontOptions = writable<FontOption[]>(latinOptionList(SERIF_FONT_PRESETS));
 
 /** 无衬线字体下拉选项（Svelte store） */
-export const sansSerifFontOptions = writable<string[]>([...SANS_SERIF_FONT_PRESETS]);
+export const sansSerifFontOptions = writable<FontOption[]>(
+  latinOptionList(SANS_SERIF_FONT_PRESETS)
+);
 
 /** 等宽字体下拉选项（Svelte store） */
-export const monospaceFontOptions = writable<string[]>([...MONOSPACE_FONT_PRESETS]);
+export const monospaceFontOptions = writable<FontOption[]>(
+  latinOptionList(MONOSPACE_FONT_PRESETS)
+);
 
-/** 中文字体下拉选项（Svelte store，首项为「自动（跟随书籍）」对应空串 value） */
-export const cjkFontOptions = writable<{ value: string; label: string }[]>([
-  { value: "", label: t("自动（跟随书籍）") },
-  ...CJK_FONT_PRESETS.map((v) => ({ value: v, label: v })),
-]);
+/** 中文字体下拉选项（Svelte store，首项「自动」对应 CJK_AUTO） */
+export const cjkFontOptions = writable<FontOption[]>(cjkOptionList());
 
-/** 刷新所有字体下拉选项（合并 document.fonts 动态枚举结果） */
-export function refreshFontOptions(doc?: Document): void {
-  const dynamic = enumerateAvailableFontFamilies(doc);
-  serifFontOptions.set(mergeDynamicWithPresets(SERIF_FONT_PRESETS, dynamic));
-  sansSerifFontOptions.set(mergeDynamicWithPresets(SANS_SERIF_FONT_PRESETS, dynamic));
-  monospaceFontOptions.set(mergeDynamicWithPresets(MONOSPACE_FONT_PRESETS, dynamic));
-  // CJK：首项保留翻译标签，其余合并动态字体
-  const cjkPresets = [...CJK_FONT_PRESETS];
-  const seen = new Set(cjkPresets);
-  for (const f of dynamic) {
-    if (!seen.has(f)) { seen.add(f); cjkPresets.push(f); }
-  }
-  cjkFontOptions.set([
-    { value: "", label: t("自动（跟随书籍）") },
-    ...cjkPresets.map((v) => ({ value: v, label: v })),
-  ]);
+/**
+ * 刷新所有字体下拉选项。
+ *
+ * 每次都要清空指纹缓存：网页字体（内置宋/黑、思源字体插件注入的霞鹜文楷）
+ * 在 face 注册前后渲染结果不同 —— 不清缓存，第一次算出的「回退帧」会一直被沿用，
+ * 内置字体就永远被判成「未安装」。
+ *
+ * @param _doc 保留参数位（历史调用点传入 document；判定已改为直接在 document 上画）
+ */
+export function refreshFontOptions(_doc?: Document): void {
+  fpCache.clear();
+  probeCtx = undefined;
+  serifFontOptions.set(latinOptionList(SERIF_FONT_PRESETS));
+  sansSerifFontOptions.set(latinOptionList(SANS_SERIF_FONT_PRESETS));
+  monospaceFontOptions.set(latinOptionList(MONOSPACE_FONT_PRESETS));
+  cjkFontOptions.set(cjkOptionList());
 }
 
 /** 笔记插入位置选项（设置面板「发送位置」分段控件；2026-10-10 收敛为 2 选 1） */
@@ -1448,6 +1866,25 @@ export class ReaderSettingsStore {
     }
   }
 
+  /**
+   * 存量设置迁移：字重下界对齐字体轴 250（2026-11-13）。
+   *
+   * 旧版 schema 的 min 写 100，但内置宋体的 wght 轴是 250–900。存了
+   * 100 / 150 / 200 的用户，值在字体上被钳到 250 —— 而 stepper 按「−」
+   * 走的是 `100 − 25 = 75` 再夹回 250，表现成「按减反而变粗」。
+   * 这里一次性提到下界，让控件与字体能力对齐。
+   */
+  private _migrateFontWeight(data: any): void {
+    if (!data || typeof data !== "object") return;
+    if (data.__migratedFontWeight === true) return;
+    data.__migratedFontWeight = true;
+    const text = data.text;
+    if (!text || typeof text !== "object") return;
+    const w = Number(text.fontWeight);
+    if (!Number.isFinite(w)) return;
+    text.fontWeight = clampFontWeight(w);
+  }
+
   /** 旧数据 → 补齐默认值（顶层 + text/paragraph/layout/note 子对象逐层合并） */
   private _mergeDefaults(data: any): ReaderSettings {
     this._migrateTheme(data);
@@ -1463,6 +1900,8 @@ export class ReaderSettingsStore {
     this._migrateTextAlign(data);
     // 2026-11-04：字距/词距 px → em（依赖 fontSize，须在合并默认值前跑）。
     this._migrateSpacingEm(data);
+    // 2026-11-13：字重下界对齐字体轴（wght 250），越界的存量值提到下界。
+    this._migrateFontWeight(data);
     // 2026-11-01：拉丁/中文字体分工迁移（把旧默认的中文字体搬进「中文字体」槽）。
     // 放在最后：它依赖 defaultFontFamily 与另两个字体槽的**旧值**，需在其它迁移后判定。
     this._migrateFontChain(data);

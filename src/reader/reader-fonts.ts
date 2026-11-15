@@ -57,6 +57,11 @@ export class FontStore {
     return [...this.fonts].sort((a, b) => b.addedAt - a.addedAt);
   }
 
+  /** 插件名（内置字体要把 `assets/fonts/*` 拼成 `/plugins/<name>/...` 取回） */
+  get pluginName(): string {
+    return this.plugin?.name ?? "";
+  }
+
   get(id: string): CustomFont | undefined {
     return this.fonts.find((f) => f.id === id);
   }

@@ -31,13 +31,16 @@
  */
 import { getLogger } from "../core/logger.ts";
 import { showMessage } from "siyuan";
-import { TranslationCache, type TranslationMode } from "./cache.ts";
+import { TranslationCache, type TranslationMode, type CacheStats } from "./cache.ts";
 import { runTranslate, type TranslateBatchMeta, type TranslateBatchOpts, type TranslateRunDeps } from "./run.ts";
 import { AiTranslateService } from "./host-service.ts";
 import { DEFAULT_AI_SETTINGS, normalizeAiSettings } from "../ai/ai-settings.ts";
-import { fetchModelList } from "../ai/ai-client.ts";
-import { isEngineAvailable, type EngineConfig } from "./engine.ts";
+import { fetchModelList, requestAIGenerate } from "../ai/ai-client.ts";
+import type { AiSettings as EngineAiSettings } from "../ai/types.ts";
+import { isEngineAvailable, hasEngine, cacheNamespaceOf, type EngineConfig, type EngineChoice } from "./engine.ts";
+import { DEFAULT_QWEN_BASE_URL, DEFAULT_QWEN_MT_MODEL } from "./providers/qwen-mt.ts";
 import { GlossaryStore, type GlossaryTerm } from "./glossary.ts";
+import { toQwenLang } from "./lang-names.ts";
 import { t } from "../i18n/index.ts";
 
 /** 思源存储 key（本插件私有，不与主插件的 hiword-ai.json 共用） */
@@ -46,15 +49,23 @@ const TRANSLATE_SETTINGS_KEY = "reader-translate.json";
 const GLOSSARY_KEY = "reader-glossary.json";
 
 /**
- * 2026-10-14 简化：双语只支持**腾讯机器翻译**单引擎。
- * 引擎集合收窄成只含 tencent —— engineStatus/isConfigured 据此只报腾讯，
- * AI 兜底与其余四家（有道/百度/微软/LibreTranslate）不再作为可选项呈现。
- * （TranslateSettings / normalizeTranslateSettings 仍**容忍**旧持久化里的
- *  其它字段，避免用户历史数据报错，但运行链路已不消费它们。）
+ * 2026-11-13：双语恢复双引擎 —— 千问 MT（首选）+ 腾讯机翻（兜底）。
+ * 2026-11-13 P2：新增「通用大模型」（任意 OpenAI 兼容端点），自动链夹在中间。
+ * 顺序即「自动」模式的尝试顺序；engineStatus/isConfigured 据此报状态。
  */
-const ENGINE_IDS = ["tencent"] as const;
+const ENGINE_IDS = ["qwen-mt", "openai-compat", "tencent"] as const;
 
 export type EngineId = (typeof ENGINE_IDS)[number];
+
+/** 引擎显示名（不走 t(id)：id 是内部标识，不是中文原文 key） */
+const ENGINE_LABELS: Record<EngineId, string> = {
+  "qwen-mt": "Qwen 翻译",
+  "openai-compat": "通用大模型",
+  tencent: "腾讯翻译",
+};
+
+/** 「自动」链的默认顺序（新增引擎时同步这里） */
+const DEFAULT_PRIORITY: EngineId[] = ["qwen-mt", "openai-compat", "tencent"];
 
 /**
  * 翻译设置（全量）。
@@ -66,6 +77,28 @@ export type EngineId = (typeof ENGINE_IDS)[number];
  * 由 `normalizeTranslateSettings` 负责填充。
  */
 export interface TranslateSettings {
+  /** 引擎选择：auto = 千问 → 腾讯；也可强制单引擎（2026-11-13 新增） */
+  engine?: EngineChoice;
+
+  // ---- 千问 MT（DashScope 兼容模式）----
+  qwenEnabled?: boolean;
+  qwenApiKey?: string;
+  /** 默认官方兼容端点，可填代理网关 */
+  qwenBaseUrl?: string;
+  /** qwen-mt-flash / qwen-mt-plus / qwen-mt-lite */
+  qwenModel?: string;
+  /** 千问累计提交字符数（仅展示，不做用量锁） */
+  qwenCharsUsed?: number;
+
+  // ---- 通用大模型（任意 OpenAI 兼容端点）----
+  openaiEnabled?: boolean;
+  openaiApiKey?: string;
+  /** 不含 /chat/completions 的 baseUrl（如 https://api.deepseek.com/v1） */
+  openaiBaseUrl?: string;
+  openaiModel?: string;
+  /** 通用大模型累计提交字符数（仅展示） */
+  openaiCharsUsed?: number;
+
   // ---- 免费引擎凭据 ----
   tencentEnabled?: boolean;
   tencentSecretId?: string;
@@ -113,6 +146,18 @@ export interface TranslateSettings {
   aiEnabled?: boolean;
   /** 翻译提示词（改它会通过缓存 salt 让旧译文自动失效） */
   translatePrompt?: string;
+  /**
+   * 领域提示（2026-11-13）：如「计算机 / 医学 / 文学」。
+   * 千问 MT 走原生 `domains` 参数，通用大模型拼进 system prompt；腾讯忽略。
+   * 改动会并入缓存 salt（领域不同译文口径不同）。
+   */
+  domains?: string;
+  /**
+   * 翻译记忆（2026-11-13）：整句级参考译法，每行「原文 => 译文」。
+   * 千问走 `tm_list`，通用大模型拼进 prompt；与术语表（词级）互补。
+   * 改动会并入缓存 salt。
+   */
+  translationMemory?: string;
   /** 翻译专用模型（留空则用全局 model） */
   translateModel?: string;
   aiApiKey?: string;
@@ -146,11 +191,16 @@ export class TranslateHost {
     this.plugin = plugin;
     this.settings = normalizeTranslateSettings({});
     this.cache = new TranslationCache(plugin, () => {
-      // salt 带翻译提示词（AI 风格）+ 术语表版本：任一改了就自动失效旧译文（不删，手动清也行）。
-      // 腾讯机翻无 prompt，实际只有 glossary.version 在变动时影响命中——这正是「改术语即重译」的兑现。
-      const p = this.settings.translatePrompt || "";
+      // salt 带翻译提示词（AI 风格）+ 术语表版本 + 领域提示 + 翻译记忆：
+      // 任一改了就自动失效旧译文（不删，手动清也行）。
+      // 空值不拼入，保证「从未配置过」的用户缓存键与旧版一致、历史缓存继续命中。
+      const s = this.settings;
+      const parts = [s.translatePrompt || ""];
+      if (s.domains?.trim()) parts.push(`d:${s.domains.trim()}`);
+      if (s.translationMemory?.trim()) parts.push(`tm:${s.translationMemory.trim()}`);
       const gv = this.glossary.version;
-      return gv > 0 ? `${p}#g${gv}` : p;
+      const salt = parts.join("#");
+      return gv > 0 ? `${salt}#g${gv}` : salt;
     });
     this.ai = new AiTranslateService(plugin, () => this.settings);
   }
@@ -191,34 +241,45 @@ export class TranslateHost {
     await this.save();
   }
 
-  /** 是否有任何可用引擎（设置界面据此提示「还没配置」）。腾讯单引擎。 */
+  /** 是否有任何可用引擎（设置界面据此提示「还没配置」）。按当前选择判定。 */
   isConfigured(): boolean {
-    return isEngineAvailable("tencent", this.engineConfig());
+    return hasEngine(this.engineConfig(), this.settings.engine);
   }
 
   /**
    * 已配置引擎清单（设置界面高亮用）。
    * 返回 `{ id, label, ready }`——ready=false 表示勾选了开关但缺凭据。
-   * 简化后只报腾讯。
    */
   engineStatus(): Array<{ id: EngineId; label: string; ready: boolean; enabled: boolean }> {
     const cfg = this.engineConfig();
     return ENGINE_IDS.map((id) => ({
       id,
-      label: t(id),
+      label: t(ENGINE_LABELS[id]),
       ready: isEngineAvailable(id, cfg),
       enabled: this.isEngineEnabled(id),
     }));
   }
 
   private isEngineEnabled(id: EngineId): boolean {
-    return id === "tencent" && this.settings.tencentEnabled === true;
+    if (id === "qwen-mt") return this.settings.qwenEnabled === true;
+    if (id === "openai-compat") return this.settings.openaiEnabled === true;
+    return this.settings.tencentEnabled === true;
   }
 
   /** 构造引擎链要的配置视图 */
   private engineConfig(): EngineConfig {
     const s = this.settings;
     return {
+      qwenEnabled: s.qwenEnabled,
+      qwenApiKey: s.qwenApiKey,
+      qwenBaseUrl: s.qwenBaseUrl,
+      qwenModel: s.qwenModel,
+      qwenCharsUsed: s.qwenCharsUsed ?? 0,
+      openaiEnabled: s.openaiEnabled,
+      openaiApiKey: s.openaiApiKey,
+      openaiBaseUrl: s.openaiBaseUrl,
+      openaiModel: s.openaiModel,
+      openaiCharsUsed: s.openaiCharsUsed ?? 0,
       tencentEnabled: s.tencentEnabled,
       tencentSecretId: s.tencentSecretId,
       tencentSecretKey: s.tencentSecretKey,
@@ -244,11 +305,11 @@ export class TranslateHost {
       aiModels: s.aiModels,
       aiTokenUsed: s.aiTokenUsed ?? 0,
       aiTokenLimit: s.aiTokenLimit ?? 0,
-      priority: Array.isArray(s.priority) && s.priority.length ? s.priority : ["tencent"],
+      priority: Array.isArray(s.priority) && s.priority.length ? s.priority : [...DEFAULT_PRIORITY],
     };
   }
 
-  /** 用量预警（60s 节流）。腾讯单引擎：仅在设了用量锁且接近上限时提示。 */
+  /** 用量预警（60s 节流）。当前仅腾讯设了用量锁；千问按量计费不做硬锁。 */
   private warnUsage(): void {
     const s = this.settings;
     const now = Date.now();
@@ -272,16 +333,25 @@ export class TranslateHost {
     if (this.quotaNotified) return;
     this.quotaNotified = true;
     try {
-      showMessage(t("腾讯翻译不可用：请在「双语翻译」设置中检查密钥或用量上限"), 5000);
+      showMessage(t("翻译引擎不可用：请在「双语翻译」设置中检查引擎开关、密钥或用量上限"), 5000);
     } catch { /* ignore */ }
   }
 
-  /** 按实际命中的引擎累计用量并落盘（腾讯单引擎） */
+  /** 按实际命中的引擎累计用量并落盘 */
   private async recordUsage(provider: string | undefined, submitChars: number): Promise<void> {
     if (!provider || provider === "none") return;
+    if (provider === "qwen-mt") {
+      this.settings.qwenCharsUsed = (this.settings.qwenCharsUsed ?? 0) + submitChars;
+      await this.save();
+      return;
+    }
+    if (provider === "openai-compat") {
+      this.settings.openaiCharsUsed = (this.settings.openaiCharsUsed ?? 0) + submitChars;
+      await this.save();
+      return;
+    }
     if (provider === "tencent") {
-      const s = this.settings;
-      s.tencentCharsUsed = (s.tencentCharsUsed ?? 0) + submitChars;
+      this.settings.tencentCharsUsed = (this.settings.tencentCharsUsed ?? 0) + submitChars;
       await this.save();
     }
   }
@@ -298,8 +368,16 @@ export class TranslateHost {
       warnUsage: () => this.warnUsage(),
       notifyQuotaExhausted: () => this.notifyQuotaExhausted(),
       recordUsage: (provider, chars) => this.recordUsage(provider, chars),
+      // 译前术语约束（千问原生 terms 参数）；不支持的引擎忽略
+      glossaryTerms: () =>
+        this.glossary.terms
+          .filter((term) => term.src && term.dst)
+          .map((term) => ({ source: term.src, target: term.dst })),
       // 译后术语兜底替换：GlossaryStore 空表时 apply 原样返回，零开销
       postProcess: (text) => this.glossary.apply(text),
+      // 领域 / 翻译记忆（空串 = undefined / 空数组，provider 侧零开销）
+      domains: () => this.settings.domains?.trim() || undefined,
+      tm: () => parseTranslationMemory(this.settings.translationMemory),
     };
   }
 
@@ -332,9 +410,12 @@ export class TranslateHost {
       this.notifyQuotaExhausted();
       return { texts: [], providers: [], fromCache: [] };
     }
+    // 调用方未显式指定时用设置里的引擎选择（auto / qwen-mt / tencent）
+    const engine = opts?.engine || this.settings.engine;
     try {
       return await runTranslate(this.deps("translateBatch"), {
-        texts, from, to, bookId, ctxBefore, meta, opts,
+        texts, from, to, bookId, ctxBefore, meta,
+        opts: { ...(opts || {}), engine },
       });
     } catch (e) {
       getLogger().error("[RE 阅读器] 批量翻译失败", { error: e });
@@ -363,11 +444,39 @@ export class TranslateHost {
     }
   }
 
-  /** 查某书某批原文的缓存命中（整书预翻译弹窗统计用） */
+  /**
+   * 当前引擎选择对应的缓存命名空间。
+   * 缓存是纯本地读取，不依赖凭据是否填好 —— 即使用户刚关掉引擎，
+   * 也应能看见「这本书已经缓存了多少」。
+   */
+  private cacheNamespaces(): string[] {
+    const want = this.settings.engine;
+    const ids: EngineId[] =
+      want === "qwen-mt" || want === "openai-compat" || want === "tencent"
+        ? [want]
+        : [...DEFAULT_PRIORITY];
+    const cfg = this.engineConfig();
+    const out: string[] = [];
+    for (const id of ids) {
+      const ns = cacheNamespaceOf(id, cfg);
+      if (!out.includes(ns)) out.push(ns);
+    }
+    return out;
+  }
+
+  /** 查某书某批原文的缓存命中（整书预翻译弹窗统计用；跨引擎命名空间取并集） */
   async checkCacheHits(bookId: string, texts: string[], mode?: TranslationMode): Promise<boolean[]> {
     try {
-      const r = await this.cache.getBatch(bookId, texts, mode ?? "default");
-      return texts.map((_, i) => !!r.fromCache[i]);
+      const namespaces = this.cacheNamespaces();
+      const hits = texts.map(() => false);
+      let pending = texts.map((_, i) => i);
+      for (const ns of namespaces) {
+        if (!pending.length) break;
+        const r = await this.cache.getBatch(bookId, pending.map((i) => texts[i]), mode ?? "default", ns);
+        for (const k in r.hits) hits[pending[+k]] = true;
+        pending = r.misses.map((j) => pending[j]);
+      }
+      return hits;
     } catch {
       return texts.map(() => false);
     }
@@ -393,6 +502,92 @@ export class TranslateHost {
     return this.glossary.isEmpty();
   }
 
+  /**
+   * 从书籍样本自动提取术语（2026-11-13）。
+   *
+   * 只「产出候选」，不落盘：术语译法需要用户确认，错误词条会污染整本书。
+   * 走对话模型（通用大模型 / AI 配置）；千问 MT 是专用翻译模型，不会按
+   * 「提取 JSON」的指令输出，强制调用只会得到一段翻译，故不作为候选源。
+   */
+  async extractGlossaryTerms(sample: string, target = "zh"): Promise<ExtractTermsResult> {
+    const text = String(sample || "").replace(/\s+/g, " ").trim().slice(0, 6000);
+    if (!text) return { ok: false, terms: [], error: t("没有可用的书籍样本文本") };
+    const chat = this.chatConfig();
+    if (!chat) {
+      return {
+        ok: false,
+        terms: [],
+        error: t("术语提取需要对话模型：请先在「翻译引擎与凭据」配置「通用大模型」"),
+      };
+    }
+    try {
+      const lang = toQwenLang(target) || target;
+      const res = await requestAIGenerate({
+        settings: chat,
+        messages: [
+          {
+            role: "system",
+            content:
+              `You extract glossary terms from a book excerpt for translation into ${lang}. ` +
+              `Return ONLY a JSON array (no prose, no code fence). Each item: ` +
+              `{"source":"term in the original language","target":"suggested ${lang} translation"}. ` +
+              `Include proper nouns (people, places, organizations, invented terms), technical terms ` +
+              `and recurring key phrases. Exclude common words. 8-40 items, no duplicates.`,
+          },
+          { role: "user", content: text },
+        ],
+        jsonMode: false,
+        timeout: 45000,
+      });
+      const terms = parseExtractedTerms(res?.content || "");
+      if (!terms.length) {
+        return { ok: false, terms: [], error: t("模型没有返回可解析的术语，请重试") };
+      }
+      return { ok: true, terms };
+    } catch (e: any) {
+      getLogger().warn("[RE 阅读器] 术语自动提取失败", { error: e });
+      return { ok: false, terms: [], error: String(e?.message ?? e) };
+    }
+  }
+
+  /**
+   * 术语提取用的对话模型配置。
+   * 优先「通用大模型」（用户为此专门配过）；否则回退到 AI 一组配置。
+   * 千问 MT / 腾讯不在此列（前者不会按指令输出 JSON，后者是纯机翻）。
+   */
+  private chatConfig(): EngineAiSettings | null {
+    const s = this.settings;
+    if (s.openaiEnabled && s.openaiBaseUrl && s.openaiApiKey && s.openaiModel) {
+      return {
+        enabled: true,
+        baseUrl: s.openaiBaseUrl,
+        apiKey: s.openaiApiKey,
+        model: s.openaiModel,
+        temperature: 0.2,
+        maxTokens: 2048,
+        systemPrompt: "",
+        jsonMode: false,
+      };
+    }
+    const aiOn = s.aiEnabled !== false && s.enabled !== false;
+    const baseUrl = (s.baseUrl || "").trim();
+    const apiKey = (s.aiApiKey || s.apiKey || "").trim();
+    const model = (s.translateModel || s.model || "").trim();
+    if (aiOn && baseUrl && apiKey && model) {
+      return {
+        enabled: true,
+        baseUrl,
+        apiKey,
+        model,
+        temperature: 0.2,
+        maxTokens: 2048,
+        systemPrompt: "",
+        jsonMode: false,
+      };
+    }
+    return null;
+  }
+
   // ===== 翻译缓存管理（供「双语翻译」设置子页列书 / 清空；从独立弹窗迁入）=====
 
   /** 列出所有已有翻译缓存的书（bookId + 书名 + 段数） */
@@ -416,6 +611,53 @@ export class TranslateHost {
   /** 清空某书的翻译缓存（含 .json / meta / 修订） */
   async clearCacheBook(bookId: string): Promise<void> {
     await this.cache.clear(bookId);
+  }
+
+  /** 某书缓存按引擎汇总（缓存面板展示「千问 120 段 / 腾讯 30 段」） */
+  async cacheStats(bookId: string): Promise<CacheStats> {
+    try {
+      return await this.cache.stats(bookId);
+    } catch {
+      return { total: 0, chars: 0, engines: [] };
+    }
+  }
+
+  /** 清空全部书的翻译缓存，返回清掉的书数 */
+  async clearAllCaches(): Promise<number> {
+    const books = await this.listCachedBooks();
+    for (const b of books) await this.cache.clear(b.bookId);
+    return books.length;
+  }
+
+  /**
+   * 清理孤儿缓存（书架里已不存在的书）。
+   * 书架为空 / 未加载时直接返回 0 —— 宁可不清，也不能把在读书的缓存全删掉。
+   */
+  async cleanOrphanCaches(): Promise<number> {
+    const list = (this.plugin as any)?.readerDock?.storeRef?.list;
+    if (!Array.isArray(list) || !list.length) return 0;
+    const valid = new Set<string>();
+    for (const b of list) if (b?.id) valid.add(String(b.id));
+    if (!valid.size) return 0;
+    return this.cache.cleanOrphanCaches(valid);
+  }
+
+  /**
+   * 清理 N 天未更新的翻译缓存（含「最近翻译」时间来自 readDir）。
+   * 取不到时间的书**不删** —— 无法判定新旧时宁可留着。
+   */
+  async cleanOldCaches(days: number): Promise<number> {
+    if (!Number.isFinite(days) || days <= 0) return 0;
+    const cutoff = Date.now() / 1000 - days * 86400;
+    const books = await this.listCachedBooks();
+    let removed = 0;
+    for (const b of books) {
+      if (typeof b.updated !== "number") continue;
+      if (b.updated >= cutoff) continue;
+      await this.cache.clear(b.bookId);
+      removed++;
+    }
+    return removed;
   }
 
   /**
@@ -446,10 +688,24 @@ export class TranslateHost {
 /** 把任意 raw（可能是 undefined / 旧版格式 / 脏数据）归一为完整设置 */
 export function normalizeTranslateSettings(raw: any): TranslateSettings {
   const base = normalizeAiSettings(raw || {}) as TranslateSettings;
-  // 免费引擎默认关闭：用户必须显式开开关 + 填凭据才启用
-  // （默认开启会导致「以为在用腾讯其实没配」的困惑）
+  // 免费/付费引擎默认关闭：用户必须显式开开关 + 填凭据才启用
+  // （默认开启会导致「以为在用千问其实没配」的困惑）
   return {
     ...base,
+    engine:
+      raw?.engine === "qwen-mt" || raw?.engine === "openai-compat" || raw?.engine === "tencent"
+        ? raw.engine
+        : "auto",
+    qwenEnabled: raw?.qwenEnabled === true,
+    qwenApiKey: raw?.qwenApiKey || "",
+    qwenBaseUrl: raw?.qwenBaseUrl || DEFAULT_QWEN_BASE_URL,
+    qwenModel: raw?.qwenModel || DEFAULT_QWEN_MT_MODEL,
+    qwenCharsUsed: num(raw?.qwenCharsUsed),
+    openaiEnabled: raw?.openaiEnabled === true,
+    openaiApiKey: raw?.openaiApiKey || "",
+    openaiBaseUrl: raw?.openaiBaseUrl || "",
+    openaiModel: raw?.openaiModel || "",
+    openaiCharsUsed: num(raw?.openaiCharsUsed),
     tencentEnabled: raw?.tencentEnabled === true,
     tencentSecretId: raw?.tencentSecretId || "",
     tencentSecretKey: raw?.tencentSecretKey || "",
@@ -473,15 +729,108 @@ export function normalizeTranslateSettings(raw: any): TranslateSettings {
     aiEnabled: raw?.aiEnabled !== false,
     translateModel: raw?.translateModel || base.model,
     translatePrompt: raw?.translatePrompt || DEFAULT_AI_SETTINGS.translatePrompt || "",
+    domains: raw?.domains || "",
+    translationMemory: raw?.translationMemory || "",
     aiTokenUsed: num(raw?.aiTokenUsed),
     aiTokenLimit: num(raw?.aiTokenLimit),
     priority: Array.isArray(raw?.priority) && raw.priority.length
       ? raw.priority
-      : ["tencent"],
+      : [...DEFAULT_PRIORITY],
   };
 }
 
 function num(v: any): number {
   const n = Number(v);
   return Number.isFinite(n) ? n : 0;
+}
+
+/** 翻译记忆行数上限：与千问 tm_list 条数上限对齐，超出截断避免撑爆请求体 */
+const MAX_TM_LINES = 50;
+
+/** 自动提取术语的结果（失败时 error 给用户看，不抛异常到 UI） */
+export interface ExtractTermsResult {
+  ok: boolean;
+  terms: Array<{ src: string; dst: string }>;
+  error?: string;
+}
+
+/** 单次自动提取的术语条数上限 */
+const MAX_EXTRACTED_TERMS = 50;
+
+/**
+ * 解析模型返回的术语 JSON。
+ *
+ * 容错三类常见偏差（不要因为一个格式问题让整次提取白费）：
+ *  1. 包了 ```json 代码围栏或前后带解释文字 → 截取第一个 `[` 到最后一个 `]`；
+ *  2. 字段名写法不一 → source/src/term/original 与 target/dst/translation 都认；
+ *  3. 模型完全不按 JSON 输出 → 退化为逐行「原文 => 译法」（与翻译记忆同格式）。
+ */
+export function parseExtractedTerms(raw: string): Array<{ src: string; dst: string }> {
+  const text = String(raw || "").trim();
+  if (!text) return [];
+  const out: Array<{ src: string; dst: string }> = [];
+  const seen = new Set<string>();
+  const push = (srcRaw: unknown, dstRaw: unknown) => {
+    const src = String(srcRaw ?? "").trim();
+    const dst = String(dstRaw ?? "").trim();
+    if (!src || !dst || src.length > 80 || dst.length > 120) return;
+    const key = src.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ src, dst });
+  };
+
+  const l = text.indexOf("[");
+  const r = text.lastIndexOf("]");
+  let data: any = null;
+  if (l >= 0 && r > l) {
+    try {
+      data = JSON.parse(text.slice(l, r + 1));
+    } catch {
+      data = null;
+    }
+  }
+  const rows: any[] = Array.isArray(data) ? data : Array.isArray(data?.terms) ? data.terms : [];
+  for (const row of rows) {
+    if (Array.isArray(row)) push(row[0], row[1]);
+    else if (row && typeof row === "object") {
+      push(
+        row.source ?? row.src ?? row.term ?? row.original,
+        row.target ?? row.dst ?? row.translation,
+      );
+    }
+    if (out.length >= MAX_EXTRACTED_TERMS) return out;
+  }
+  if (!out.length) {
+    for (const line of text.split(/\r?\n/)) {
+      const m = line.trim().match(/^(.+?)\s*(?:=>|\t)\s*(.+)$/);
+      if (m) push(m[1], m[2]);
+      if (out.length >= MAX_EXTRACTED_TERMS) break;
+    }
+  }
+  return out;
+}
+
+/**
+ * 解析翻译记忆文本（每行「原文 => 译文」，也接受 Tab 分隔）。
+ *
+ * 空行 / `#` 注释行 / 不含分隔符的行一律跳过：用户多半从表格或笔记里
+ * 直接粘贴，脏行不应让整份记忆失效。解析结果交给 provider：
+ * 千问透传 `tm_list`，通用大模型拼进 prompt，腾讯忽略。
+ */
+export function parseTranslationMemory(
+  raw: string | undefined,
+): Array<{ source: string; target: string }> {
+  const out: Array<{ source: string; target: string }> = [];
+  for (const line of String(raw || "").split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s || s.startsWith("#")) continue;
+    const m = s.match(/^(.+?)\s*(?:=>|\t)\s*(.+)$/);
+    if (!m) continue;
+    const source = m[1].trim();
+    const target = m[2].trim();
+    if (source && target) out.push({ source, target });
+    if (out.length >= MAX_TM_LINES) break;
+  }
+  return out;
 }

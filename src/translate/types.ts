@@ -6,14 +6,22 @@
  * 返回「同序同长的译文数组」，便于调用方按索引回填，也便于按书缓存。
  */
 
-/** 翻译引擎提供方标识（2026-08-30 新增腾讯/有道/百度三个免费引擎） */
+/** 翻译引擎提供方标识（2026-08-30 新增腾讯/有道/百度三个免费引擎；2026-11-13 接入千问 MT） */
 export type TranslateProviderName =
+  | "qwen-mt"
+  | "openai-compat"
   | "tencent"
   | "youdao"
   | "baidu"
   | "microsoft"
   | "libretranslate"
   | "ai";
+
+/** 译前术语约束（术语表 → 引擎原生术语参数） */
+export interface TranslateTerm {
+  source: string;
+  target: string;
+}
 
 /** 一次翻译请求（批量） */
 export interface TranslateRequest {
@@ -38,6 +46,18 @@ export interface TranslateRequest {
    * 未来可扩展 literal / literary 等。
    */
   mode?: "default" | "concise";
+  /**
+   * 译前术语约束（2026-11-13 新增）。
+   * 支持原生术语参数的引擎（千问 MT）直接透传，让模型在生成时就采用指定译法；
+   * 不支持的引擎忽略，仍由 run.ts 的译后替换兜底。
+   */
+  terms?: TranslateTerm[];
+  /** 翻译记忆（千问 MT 的 tm_list）：整句级参考译法，优先级高于通用规则 */
+  tm?: TranslateTerm[];
+  /** 领域提示（千问 MT 的 domains，可选） */
+  domains?: string;
+  /** 取消信号（调用方停止整书预翻译时中断在途请求） */
+  signal?: AbortSignal;
 }
 
 /** 翻译结果（含实际命中的提供方，便于统计 / 调试） */
@@ -54,5 +74,12 @@ export interface TranslateOutcome {
 export interface Translator {
   readonly name: TranslateProviderName;
   readonly available: boolean;
+  /**
+   * 缓存命名空间（2026-11-13 新增）。
+   * 同一段原文用不同引擎/模型译出的结果不通用，缓存键必须隔离，
+   * 否则「换引擎后仍读到旧引擎译文」且毫无提示。
+   * 空串 = 旧版腾讯缓存键（保持历史缓存继续命中）。
+   */
+  readonly cacheNs?: string;
   translate(req: TranslateRequest): Promise<string[]>;
 }

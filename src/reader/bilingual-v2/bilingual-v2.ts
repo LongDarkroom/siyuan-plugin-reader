@@ -19,6 +19,7 @@ import type {
   BilingualHandle,
   PretranslateOptions,
   PretranslateProgress,
+  PretranslateScan,
 } from "../bilingual-types.ts";
 import { PRETRANSLATE_DEFAULTS } from "../bilingual/core/types.ts";
 import { createSegmenter } from "../bilingual/runtime/segmenter.ts";
@@ -32,6 +33,12 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
   let enabled = false;
   let injectTimer: any = null;
   let injecting = false;
+  /**
+   * 整书预翻译进行中：暂停「窗口注入」这条通路。
+   * 预翻译队列自己会注入闸门内的段（getLiveSegment + injectBatch），
+   * 若 injectAll 同时在跑，同一段会被两条链路各送译一次 —— 按量计费就是白花钱。
+   */
+  let pretranslating = false;
   const from = opts.from || "auto";
   const to = opts.to || "zh";
   const getMode = (): "default" | "concise" =>
@@ -103,14 +110,37 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
 
   /** 预翻译进度转发：把队列状态翻译成弹窗用的 PretranslateProgress */
   let lastPo: PretranslateOptions | undefined;
+  /** 本轮开始时间与起始进度（ETA 速率的分母） */
+  let startedAt = 0;
+  let startDone = 0;
+  /** 预扫描得到的全书段数/字数（用于 estTokens 与进度占比；未扫描则为 null） */
+  let scanTotals: { total: number; chars: number } | null = null;
+
   function emitProgress(status: PretranslateProgress["status"]): void {
     const st = queue.state();
+    // 队列的 total 是「已切到的分节」累计值，逐节增长会让进度条反复跳回低值；
+    // 有预扫结果时统一用全书段数作分母，才是用户理解的「整本进度」。
+    const total = scanTotals && scanTotals.total > 0 ? scanTotals.total : st.total;
+    const pending = Math.max(0, total - st.done);
+    const elapsed = startedAt ? (Date.now() - startedAt) / 1000 : 0;
+    const speed = elapsed > 0 ? (st.done - startDone) / elapsed : 0;
+    const etaSeconds =
+      status === "running" && speed > 0.01 && pending > 0
+        ? Math.round(pending / speed)
+        : undefined;
+    // Token 估算：按「剩余段数 × 全书平均每段字符 / 4」粗算，仅用于事前提醒
+    const estTokens =
+      scanTotals && scanTotals.total > 0
+        ? Math.max(0, Math.round(((scanTotals.chars * pending) / scanTotals.total) / 4))
+        : undefined;
     lastPo?.onProgress?.({
       done: st.done,
-      total: st.total,
+      total,
       cached: st.cachedOnly,
-      pending: Math.max(0, st.total - st.done),
+      pending,
       status,
+      estTokens,
+      etaSeconds,
     });
   }
 
@@ -134,7 +164,7 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
       }
       return undefined;
     },
-    onProgress: () => emitProgress("running"),
+    onProgress: () => emitProgress(queue.state().status),
   });
 
   /** 收集「窗口内 + 未注入 + 未被退避挡住 + 跨文档去重」的待处理段 */
@@ -154,6 +184,7 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
 
   async function injectAll(): Promise<void> {
     if (!enabled) return;
+    if (pretranslating) return; // 预翻译队列负责窗口内注入，避免同一段重复送译
     if (injecting) return; // 防重入
     injecting = true;
     let total = 0;
@@ -271,6 +302,8 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     const lanes = po?.concurrency && po.concurrency > 0 ? po.concurrency : PRETRANSLATE_DEFAULTS.lanes;
     const blocksPerLane = po?.batchSize && po.batchSize > 0 ? po.batchSize : PRETRANSLATE_DEFAULTS.blocksPerLane;
     queue.cancel(); // 重入时先停掉上一轮
+    startedAt = Date.now();
+    startDone = 0;
 
     // 缓存短路（防白烧 token）：仅在 progressive 模式下成立 ——
     // progressive 的视野就是窗口，checkCached 全命中 = 真的没事可做。
@@ -292,16 +325,39 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     }
 
     emitProgress("running");
-    await queue.start({
-      bookId: opts.bookId,
-      mode: po?.full === false ? "progressive" : "full",
-      lanes,
-      blocksPerLane,
-      aheadSections: aheadOf(),
-      signal,
-    });
-    emitProgress(signal?.aborted ? "cancelled" : "done");
+    pretranslating = true;
+    try {
+      await queue.start({
+        bookId: opts.bookId,
+        mode: po?.full === false ? "progressive" : "full",
+        lanes,
+        blocksPerLane,
+        aheadSections: aheadOf(),
+        signal,
+      });
+    } finally {
+      pretranslating = false;
+    }
+    const finalStatus = queue.state().status;
+    emitProgress(
+      finalStatus === "cancelled" ? "cancelled" : finalStatus === "error" ? "error" : "done",
+    );
     telemetry.emit({ phase: "done", bookId: opts.bookId, segmentCount: queue.state().done, runId });
+    // 收尾补一次窗口注入：预翻译期间被抑制的 injectAll 在这里补上
+    if (enabled) scheduleInject();
+  }
+
+  /**
+   * 预扫描（P1-1）：不送译、不花钱，只统计全书段数/字数/已缓存数。
+   * 结果缓存在 scanTotals，后续进度里的 Token 估算直接复用。
+   */
+  async function pretranslateScan(
+    scanOpts?: { full?: boolean; signal?: AbortSignal },
+  ): Promise<PretranslateScan> {
+    // progressive 的扫描范围就是窗口：无法提供 setSections 时 scan 会走窗口分支
+    const r = await queue.scan(scanOpts?.signal);
+    scanTotals = { total: r.total, chars: r.chars };
+    return r;
   }
 
   return {
@@ -327,6 +383,13 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     },
     segmentStats,
     segmentTexts,
+    pretranslateScan,
+    pretranslatePause(): void {
+      queue.pause();
+    },
+    pretranslateResume(): void {
+      queue.resume();
+    },
     pretranslateAll,
     destroy(): void {
       enabled = false;
