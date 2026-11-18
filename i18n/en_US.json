@@ -3324,5 +3324,16 @@
   "正在应用排版…": "Applying typography…",
   "正在准备批注与译文…": "Preparing annotations and translations…",
   "这本书约 {mb} MB，首次打开需要几秒；读过的书会记在内存里，再次打开更快": "This book is about {mb} MB, so the first open takes a few seconds. Books you have opened stay in memory for faster reopening.",
-  "Bucket": "Bucket"
+  "Bucket": "Bucket",
+  "翻译整本 PDF 并导出「原文 + 中文」对照 PDF": "Translate the whole PDF and export a side-by-side PDF",
+  "翻译中…": "Translating…",
+  "双语 PDF": "Bilingual PDF",
+  "该功能只对 PDF 生效": "This feature only works for PDFs",
+  "读不到 PDF 文件": "Cannot read the PDF file",
+  "缺少 PDF 中文字体，无法生成译文页": "Missing the PDF CJK font; cannot render the translation column",
+  "翻译通道不可用": "Translation channel unavailable",
+  "已生成：{name}": "Generated: {name}",
+  "双语 PDF 已生成：{name}": "Bilingual PDF generated: {name}",
+  "这份 PDF 是扫描版（没有文字层），无法翻译": "This is a scanned PDF (no text layer) and cannot be translated",
+  "翻译失败：{msg}": "Translation failed: {msg}"
 }

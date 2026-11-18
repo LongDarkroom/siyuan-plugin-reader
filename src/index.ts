@@ -623,6 +623,19 @@ export class ReaderPlugin extends Plugin {
     return h.checkCacheHits(bookId, texts);
   }
 
+  /**
+   * 2026-11-17：读缓存里的译文（PDF 整本翻译用）。
+   * 返回 原文 → 译文 的映射（只含命中的）。
+   */
+  public async getTranslationCache(
+    bookId: string,
+    texts: string[],
+  ): Promise<Map<string, string>> {
+    const h = this.getTranslate();
+    if (!h) return new Map();
+    return h.getCachedTranslations(bookId, texts);
+  }
+
   /** 是否有可用翻译引擎（设置界面「未配置」提示依据） */
   public isTranslationConfigured(): boolean {
     return this.getTranslate()?.isConfigured() ?? false;

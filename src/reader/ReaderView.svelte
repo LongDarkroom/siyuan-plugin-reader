@@ -224,6 +224,8 @@ import { getLogger } from "../core/logger.ts";
   // 2026-08-28：连续朗读控制器（参考 Readest：多引擎 system/youdao/edge + 句子高亮 + 控制条）
   import { ReaderTtsController, DEFAULT_REWORD_TTS, type RewordTtsSettings, type TtsState } from "./reader-tts";
   import { getFileBlob, putFile, removeFile } from "../siyuan/api";
+  // 2026-11-17：PDF 整本翻译 → 双语对照 PDF（静态 import：catch 块里要用 PdfTranslateError）
+  import { runPdfBilingualTranslate, PdfTranslateError } from "./pdf-translate-pipeline.ts";
   // 2026-09-09 P1：矩形框选标注默认色
   import { DEFAULT_ANNOTATION_COLOR } from "../annotation/annotation-store.ts";
   // 2026-09-08 启动卡死修复：onMount 自动开书前等空闲窗口（与 restoreSession 同一套闸门）
@@ -469,6 +471,19 @@ import { getLogger } from "../core/logger.ts";
     | undefined = undefined;
   /** 批量查询缓存命中（委托 plugin.checkTranslationCacheHits），供预翻译弹窗精确计算待译数 */
   export let onCheckCache: ((texts: string[]) => Promise<boolean[]>) | undefined = undefined;
+  /**
+   * 2026-11-17：读缓存里的译文（委托 plugin.getTranslationCache）。
+   * PDF 整本翻译用：命中段的译文必须取出来填进结果，否则该页只有未命中段有译文。
+   */
+  export let onGetCachedTranslations:
+    | ((texts: string[]) => Promise<Map<string, string>>)
+    | undefined = undefined;
+  /**
+   * 2026-11-17：取 PDF 用中文字体字节（TrueType/glyf）。
+   * ⚠️ 必须是 glyf 轮廓的 TTF——pdf-lib 遇到 CFF 会嵌成 CIDFontType0，
+   *    Chrome 画不出来（文本能提取但页面空白）。
+   */
+  export let onGetPdfFont: (() => Promise<Uint8Array | null>) | undefined = undefined;
   /** 2026-08-30 详细翻译（回传 provider/fromCache），供成本与引擎统计；未提供时回落 onTranslateBatch
    *  2026-08-30 修复：ctxBefore/meta 透传（语义同 onTranslateBatch） */
   export let onTranslateBatchDetailed:
@@ -12919,6 +12934,116 @@ import { getLogger } from "../core/logger.ts";
     return n >= 10000 ? `${(n / 10000).toFixed(1)} 万` : String(n);
   }
 
+  /* ================= 2026-11-17：PDF 整本翻译 → 双语对照 PDF ================= */
+
+  /** 翻译进行中（工具栏按钮禁用） */
+  let pdfTranslating = false;
+  /** 翻译进度（弹窗显示） */
+  let pdfTrStage: "" | "extracting" | "translating" | "building" | "done" | "error" = "";
+  let pdfTrDone = 0;
+  let pdfTrTotal = 0;
+  let pdfTrEta = 0;
+  let pdfTrMsg = "";
+  /** 打开 PDF 用的 pdf.js document（用完要 destroy，worker 占内存） */
+  let pdfTrDoc: any = null;
+
+  /**
+   * 翻译整本 PDF 并导出「原文 + 中文」对照 PDF。
+   *
+   * 流程（详见 src/reader/pdf-translate-pipeline.ts）：
+   *   抽取全文 → 批量翻译（qwen-mt，带缓存与 TPM 限流）→ 生成双语 PDF → 落盘
+   *
+   * 成本参考（实测 800 页英文 PDF）：约 ¥1.3、约 36 分钟（TPM 35k 限流）。
+   * 缓存命中的页不重复花钱 ⇒ 中断后重跑只补没译的。
+   */
+  async function translatePdfToBilingual(): Promise<void> {
+    if (pdfTranslating) return;
+    if (!isPdfBook()) {
+      toast(t("该功能只对 PDF 生效"), 2600, "info");
+      return;
+    }
+    if (!isTranslationConfigured || !isTranslationConfigured()) {
+      toast(t("请先在「双语翻译 → 翻译服务」中启用引擎并填写密钥"), 3200, "info");
+      return;
+    }
+    const blob = await store.getBlob(bookId);
+    if (!blob) {
+      toast(t("读不到 PDF 文件"), 2600, "error");
+      return;
+    }
+    const fontBytes = onGetPdfFont ? await onGetPdfFont() : null;
+    if (!fontBytes) {
+      toast(t("缺少 PDF 中文字体，无法生成译文页"), 3200, "error");
+      return;
+    }
+
+    pdfTranslating = true;
+    pdfTrStage = "extracting";
+    pdfTrDone = 0;
+    pdfTrTotal = 0;
+    pdfTrEta = 0;
+    pdfTrMsg = "";
+    try {
+      const { loadPdfjsLib } = await import("./pdf-outline.ts");
+
+      const res = await runPdfBilingualTranslate(
+        { originalBytes: new Uint8Array(await blob.arrayBuffer()), bookId },
+        {
+          openPdf: async (bytes) => {
+            const pdfjsLib = await loadPdfjsLib();
+            if (!pdfjsLib?.getDocument) throw new Error("PDF.js 未就绪");
+            const task = pdfjsLib.getDocument({ data: bytes });
+            pdfTrDoc = await task.promise;
+            return pdfTrDoc;
+          },
+          translateBatch: async (texts, from, to, _bid, extra) => {
+            if (!onTranslateBatch) throw new Error("翻译通道不可用");
+            // onTranslateBatch 的签名没有 bookId（bookId 由 bridge 端闭包捕获）
+            return onTranslateBatch(texts, from, to, undefined, null, extra);
+          },
+          checkCached: onCheckCache ? (texts) => onCheckCache!(texts) : undefined,
+          getCached: onGetCachedTranslations ? (texts) => onGetCachedTranslations!(texts) : undefined,
+          onProgress: (p) => {
+            pdfTrStage = "translating";
+            pdfTrDone = p.done;
+            pdfTrTotal = p.total;
+            pdfTrEta = p.etaSeconds;
+          },
+        },
+        fontBytes,
+      );
+
+      pdfTrStage = "building";
+      // 落盘：与原书同目录，文件名加「-双语」后缀
+      const dir = (meta?.path || "").replace(/\/[^/]*$/, "");
+      const base = (meta?.title || bookId || "book").replace(/[\\/:*?"<>|]/g, "_").slice(0, 60);
+      const outName = `${base}-双语.pdf`;
+      const outPath = dir ? `${dir}/${outName}` : outName;
+      const ok = await putFile(outPath, false, new Blob([res.bytes as BlobPart], { type: "application/pdf" }));
+      if (!ok) throw new Error("保存失败");
+      pdfTrStage = "done";
+      pdfTrMsg = t("已生成：{name}", { name: outPath });
+      toast(t("双语 PDF 已生成：{name}", { name: outPath }), 5000);
+    } catch (e) {
+      const reason = e instanceof PdfTranslateError ? e.reason : "";
+      pdfTrStage = "error";
+      pdfTrMsg = e instanceof Error ? e.message : String(e);
+      toast(
+        reason === "no-text"
+          ? t("这份 PDF 是扫描版（没有文字层），无法翻译")
+          : t("翻译失败：{msg}", { msg: pdfTrMsg }),
+        5000,
+        "error",
+      );
+    } finally {
+      try {
+        await pdfTrDoc?.destroy?.();
+      } catch { /* ignore */ }
+      pdfTrDoc = null;
+      pdfTranslating = false;
+    }
+  }
+
   /**
    * 打开整本预翻译弹窗。
    * 前置门槛与 toggleBilingual 完全一致（英文书 + 引擎已配置），
@@ -14216,6 +14341,8 @@ import { getLogger } from "../core/logger.ts";
           onGoPage={goPdfPage}
           onPageInputKeydown={onPageInputKeydown}
           onPageInputChange={onPageInputChange}
+          onTranslateBilingual={() => void translatePdfToBilingual()}
+          translating={pdfTranslating}
         />
       {/if}
     </div>

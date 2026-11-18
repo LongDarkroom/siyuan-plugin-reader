@@ -1,6 +1,6 @@
 {
   "name": "siyuan-plugin-reader",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "RE Reader - standalone EPUB/PDF reader for SiYuan (split from siyuan-plugin-reword)",
   "license": "AGPL-3.0-or-later",
   "scripts": {
@@ -31,9 +31,11 @@
     "vite": "^5.4.0"
   },
   "dependencies": {
+    "@pdf-lib/fontkit": "^1.1.1",
     "construct-style-sheets-polyfill": "^3.1.0",
     "fflate": "^0.8.3",
     "js-mdict": "6.0.8",
+    "pdf-lib": "^1.17.1",
     "siyuan": "^1.0.0"
   }
 }

@@ -36,8 +36,13 @@ interface PdfRawOutlineItem {
   items?: PdfRawOutlineItem[];
 }
 
-/** 懒加载 PDF.js(全局挂载,foliate-js 的 pdf.mjs 副作用) */
-async function loadPdfjsLib(): Promise<any | null> {
+/**
+ * 懒加载 PDF.js(全局挂载,foliate-js 的 pdf.mjs 副作用)。
+ *
+ * 2026-11-17 导出：PDF 整本翻译（抽全文）要用同一个 pdf.js 实例——
+ * 重复 import 虽不会出错，但这里明确暴露给调用方更清晰。
+ */
+export async function loadPdfjsLib(): Promise<any | null> {
   try {
     // foliate-js 的 pdf.mjs 第 45 行 `var __webpack_exports__ = globalThis.pdfjsLib = {};` 自挂载
     // 动态 import 一次触发副作用,即可拿到 pdfjsLib 全局

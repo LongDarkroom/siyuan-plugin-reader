@@ -21,6 +21,10 @@
   export let onGoPage: (page: number) => void = () => {};
   export let onPageInputKeydown: (e: KeyboardEvent) => void = () => {};
   export let onPageInputChange: (e: Event) => void = () => {};
+  /** 2026-11-17：翻译整本 PDF 并导出双语对照 PDF */
+  export let onTranslateBilingual: () => void = () => {};
+  /** 2026-11-17：翻译进行中（按钮禁用 + 文案变化） */
+  export let translating = false;
 </script>
 
 <!-- PDF 缩放工具栏 -->
@@ -77,4 +81,19 @@
     disabled={!pdfTotalPages}
     on:click={() => onGoPage(Math.min(pdfTotalPages, pdfCurrentPage + 1))}
   ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.chevronRight}</svg></button>
+</span>
+
+<!--
+  2026-11-17：翻译整本 PDF → 双语对照 PDF。
+  放在页码组之后：它是「整本级」动作（要跑几分钟、几分钱），不该挤在缩放组里。
+  文案随状态变（进行中显示进度），按钮在此期间禁用，避免重复触发。
+-->
+<span class="reader-page-group">
+  <button
+    class="reader-btn reader-zoom-btn"
+    title={t("翻译整本 PDF 并导出「原文 + 中文」对照 PDF")}
+    disabled={translating}
+    on:click={onTranslateBilingual}
+  ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.translate}</svg></button>
+  <span class="reader-page-label">{translating ? t("翻译中…") : t("双语 PDF")}</span>
 </span>

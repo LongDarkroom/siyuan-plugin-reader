@@ -19,6 +19,7 @@ import type { BookshelfStore } from "./bookshelf-store";
 import type { ReaderSettingsStore } from "./reader-settings";
 import type { FontStore } from "./reader-fonts";
 import { resolveReaderMode } from "./reader-mode.ts";
+import { loadPdfFontBytes } from "./pdf-font.ts";
 // 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
 // `/// #if MOBILE` → `openTab = () => {} // TODO: Mobile`），页签路径整条不可用。
 // 2026-10-26 路线 A：移动端承载从思源 Dialog 换成**全屏浮层**（对标「思阅」SiReader
@@ -162,6 +163,11 @@ export class ReaderTabController {
       // 2026-08-30：整书预翻译弹窗「已缓存统计」——按书查询每段缓存命中，返回同序 boolean[]
       onCheckCache: (texts: string[]) =>
         self.plugin?.checkTranslationCacheHits?.(bookId, texts) ?? Promise.resolve(new Array(texts.length).fill(false)),
+      // 2026-11-17：读缓存里的译文（PDF 整本翻译用）——命中段的译文必须取出来填进结果
+      onGetCachedTranslations: (texts: string[]) =>
+        self.plugin?.getTranslationCache?.(bookId, texts) ?? Promise.resolve(new Map<string, string>()),
+      // 2026-11-17：PDF 用中文字体（TrueType/glyf，pdf-lib 硬要求）
+      onGetPdfFont: () => loadPdfFontBytes(self.plugin?.name ?? ""),
       isTranslationConfigured: () => !!self.plugin?.isTranslationConfigured?.(),
       getAiSettings: () => (self.plugin as any)?.getAiSettings?.() ?? null,
       // 2026-11-08 P0：手机端全屏 AI 面板同样接 petal 真源，避免换端口丢历史

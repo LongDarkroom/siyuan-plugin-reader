@@ -482,6 +482,44 @@ export class TranslateHost {
     }
   }
 
+  /**
+   * 读缓存里的译文（2026-11-17，PDF 整本翻译用）。
+   *
+   * 为什么需要它：`checkCacheHits` 只回「有没有命中」，不回译文内容。
+   * PDF 流程里命中段的译文**必须取出来填进结果**，否则那一页只有未命中段有译文
+   * （实测踩过：结果变成「原文\n\n原文\n\n译文」这种前后拼接的怪东西）。
+   *
+   * @returns 原文 → 译文（只含命中的）
+   */
+  async getCachedTranslations(
+    bookId: string,
+    texts: string[],
+    mode?: TranslationMode,
+  ): Promise<Map<string, string>> {
+    const out = new Map<string, string>();
+    try {
+      const namespaces = this.cacheNamespaces();
+      const pending = texts.map((_, i) => i);
+      for (const ns of namespaces) {
+        if (!pending.length) break;
+        const r = await this.cache.getBatch(bookId, pending.map((i) => texts[i]), mode ?? "default", ns);
+        for (const k in r.hits) {
+          const idx = pending[+k];
+          const src = idx !== undefined ? texts[idx] : undefined;
+          const val = r.hits[k];
+          if (src !== undefined && val) out.set(src, val);
+        }
+        const stillPending = new Set(r.misses);
+        for (let i = pending.length - 1; i >= 0; i--) {
+          if (!stillPending.has(i)) pending.splice(i, 1);
+        }
+      }
+    } catch {
+      // 缓存读失败不该中断翻译（顶多是重新译一遍）
+    }
+    return out;
+  }
+
   // ===== 术语表（供「双语翻译」设置子页读写；2026-10-14 接活）=====
 
   /** 当前术语词条（返回副本，外部改动不回灌内部状态） */
