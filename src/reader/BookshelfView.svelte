@@ -2630,6 +2630,20 @@
     height: 100%;
     overflow: hidden;
   }
+  /* 2026-11-19 P2-14：手机端书架的四边安全区。
+     移动端书架跑在 `#re-mobile-overlay`（position:fixed; inset:0）里，
+     等于直接铺满物理屏幕 ⇒ iOS 的刘海/Home Indicator、横屏的圆角
+     会压住顶栏按钮与最底一行书卡。桌面端不加（思源 tab 自带 padding）。
+     `box-sizing:border-box` 必须一起写：根节点是 `height:100%`，
+     默认 content-box 会把 padding 撑出容器（底部出现一条空白滚动区）。 */
+  .bookshelf-view.re-phone,
+  .bookshelf-view.re-large-phone {
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+  }
   /* ================================================================
    * 2026-11-19 动效基建
    * ================================================================

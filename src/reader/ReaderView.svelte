@@ -7328,7 +7328,11 @@ import { getLogger } from "../core/logger.ts";
   let selToolbarOutTimer: any = null;
   // 2026-10-12 P1-§6.4 窄屏兜底阈值：可读区比「主栏 min-width 300 + 两侧各 8px」还窄时，
   // 放弃留白预留、按内容宽度排布（见 CSS 的 .reader-sel-toolbar.narrow）。
-  const TOOLBAR_NARROW_BELOW = 316;
+  // 2026-11-19 P1-4：316 → 340。316 只够判「胶囊都塞不下」的极端情况；
+  // 而窄屏真正难受的是 320–356px 档 —— 主栏 300 + 8×2 留白 = 316 刚好卡在边界上，
+  // 被判成「不窄」后仍按 300 排，两侧只剩 8px 且视觉上贴边。抬到 340 后这一档
+  // 统一走 narrow（压留白、min-width 归零，自然宽 ≈251），留出真实呼吸空间。
+  const TOOLBAR_NARROW_BELOW = 340;
   // 运行时实测高度缓存（渲染后实测，避免硬估值误差）。
   let toolbarH = TOOLBAR_BAR_ONLY_H;
   // 2026-08-25 延迟关闭：foliate 区域点击不立即关工具栏（避免与 show-annotation 竞争），
@@ -9111,6 +9115,28 @@ import { getLogger } from "../core/logger.ts";
    * @param popupW 弹窗宽度 px（必须与 CSS .reader-note-editor width 一致，含 padding）
    * @param popupH 弹窗预估高度 px（用于左右空间判定）
    */
+  /**
+   * 2026-11-19 P1-5：弹窗在**当前可用宽度**下的真实宽度。
+   *
+   * CSS 侧是 `width: 400px; max-width: calc(100% - 16px)`（100% = `.reader-view`），
+   * 所以手机上真实渲染是 `min(400, 容器宽 - 16)`；而定位算法（positionPopupNear /
+   * 首帧预估）过去一直按设计值 400 算夹紧范围 ⇒ 卡片被多推
+   * `(400 - 实际)/2` 贴到右缘（360px 屏上是 28px），要等下一帧实测才纠正。
+   *
+   * 这里把「设计宽度」收敛成「实际可用宽度」，**不改 NOTE_CARD_W 常量本身** ——
+   * 它仍是设计宽度、也是与 CSS `--note-card-w` 的对照值
+   * （`smoke-note-card.test.mjs` 按它守 CSS/JS 同步，别动）。
+   */
+  function fitPopupWidth(designW: number): number {
+    try {
+      const avail = (readerViewEl?.clientWidth ?? 0) - 16;
+      if (avail > 0) return Math.min(designW, avail);
+    } catch {
+      /* 容器未挂载：回落到设计值 */
+    }
+    return designW;
+  }
+
   function positionPopupNear(rect: SelRect | null | undefined, popupW: number, popupH: number): { x: number; y: number; place: ToolbarPlace } {
     if (!rect) {
       // 无矩形（C 跳转后）：在内容区顶部居中（下方展开，不被顶栏遮挡）
@@ -9120,15 +9146,17 @@ import { getLogger } from "../core/logger.ts";
     const gap = 8;
     const padding = 8;
     const bounds = getContentBounds();
+    // 2026-11-19 P1-5：按「实际可用宽度」算夹紧（见 fitPopupWidth 的说明）
+    const w = fitPopupWidth(popupW);
     // 导航栏/底栏取其在视口中的真实下沿/上沿，与 rect（视口坐标）同基准比较。
     const navBottom = bounds.top;
     const bottomTop = bounds.bottom;
     // 2026-08-29 四向避让：复用工具栏同款决策（绝不压住选中文本 + 避让导航/底栏 + 避让左右 Dock）。
-    const { place, anchorX, anchorY } = toolbarPlacement(rect, popupH, popupW, navBottom, bottomTop, bounds.left, bounds.right, gap);
+    const { place, anchorX, anchorY } = toolbarPlacement(rect, popupH, w, navBottom, bottomTop, bounds.left, bounds.right, gap);
     let c = toContainerCoords(anchorX, anchorY);
     if (place === "above" || place === "below") {
       // 水平夹紧：弹窗以 x 为中心（CSS translate(-50%,...)），保证不溢出/不压侧栏
-      const half = popupW / 2 + padding;
+      const half = w / 2 + padding;
       const minX = bounds.left + half;
       const maxX = Math.max(minX, bounds.right - half);
       c.x = Math.min(Math.max(c.x, minX), maxX);
@@ -9374,7 +9402,8 @@ import { getLogger } from "../core/logger.ts";
     const seq = noteLayoutSeq;
     stopNoteCardObserver();
     noteCardBox = {
-      left: Math.max(0, noteEditor.x - NOTE_CARD_W / 2),
+      // 2026-11-19 P1-5：预估落点也按「实际可用宽度」算，否则首帧会偏 (400-实际)/2
+      left: Math.max(0, noteEditor.x - fitPopupWidth(NOTE_CARD_W) / 2),
       top: Math.max(0, noteEditor.y + NOTE_CARD_GAP),
       ready: false,
     };
@@ -16426,7 +16455,10 @@ import { getLogger } from "../core/logger.ts";
     /* 标签已提供呼吸感，gap 只需把按钮分开 2px（微信读书等距、偏松） */
     gap: 2px;
     height: 54px;
-    min-width: 300px;                 /* 两态 7×36 等宽 + 零位移，见上方规格注释 */
+    /* 2026-11-19 P1-4：300 是不可压缩的下限，会顶破窄屏（320–340px 档）。
+       改成 min() —— 空间够时仍是 300（两态 7×36 等宽 + 零位移这条设计不变），
+       不够时让到 100vw-24。配合 `.narrow`（JS 判定后 min-width 归零）双保险。 */
+    min-width: min(300px, calc(100vw - 24px));
     padding: 0 6px;
     box-sizing: border-box;
     background: var(--rwd-pop-bg);
@@ -17769,19 +17801,42 @@ import { getLogger } from "../core/logger.ts";
    * ① 侧栏 popover（目录/书签摘录/搜索）→ 底部 sheet：
    *    280px 窄 popover 在手机上又窄又矮还遮正文；改为贴底全宽 sheet，
    *    底部让出 44px 给进度条区。角标小三角一并隐藏（锚点语义不再成立）。
-   * ② TTS 朗读条：横向一长条在窄屏溢出 → 允许横向滚动（改动最小的方案）。 */
+   * ② TTS 朗读条：横向一长条在窄屏溢出 → 允许横向滚动（改动最小的方案）。
+   *
+   * 2026-11-19 移动端 P1-1：**两档合并**。
+   * 此前 re-phone(≤480) 有 26 条规则、re-large-phone(481–600) 只有 4 条
+   * （而且那 4 条只改了 `width:320px` 与 `max-height`，形态仍是**桌面 popover**）。
+   * 而 JS 侧 `isPhoneBreakpoint()` 把 largePhone 也算「手机」（长按菜单、抽屉开关都按
+   * 手机逻辑走）⇒ 481–600px 这段是「JS 认为是手机、CSS 认为是桌面」的错位区：
+   * 目录弹出来是个 320px 窄 popover 浮在正文上，长按却能弹 action sheet。
+   * 现在统一：**凡 re-phone 有的形态改造，re-large-phone 一律跟随**；
+   * 只有确实需要更宽空间的属性才单独立规则。
+   * ⚠️ 刻意用展开的逗号组而不是 `:is()` —— Svelte 的 scope 类展开对 `:is()`
+   * 支持不稳（会把哈希加到 `:is()` 里层），可读性换稳定性。 */
   .reader-view.re-phone .reader-toc,
   .reader-view.re-phone .reader-bookmarks,
   .reader-view.re-phone .reader-annots,
   .reader-view.re-phone .reader-marks,
-  .reader-view.re-phone .reader-search {
+  .reader-view.re-phone .reader-search,
+  .reader-view.re-large-phone .reader-toc,
+  .reader-view.re-large-phone .reader-bookmarks,
+  .reader-view.re-large-phone .reader-annots,
+  .reader-view.re-large-phone .reader-marks,
+  .reader-view.re-large-phone .reader-search {
     top: auto;
-    bottom: 44px;
+    /* 2026-11-19 P2-8：贴底 sheet 让出 Home Indicator 的高度。
+       进度条区本身已经吃掉了 safe-area（见 .reader-progress 的 padding-bottom），
+       所以这里在 44 的基础上再叠一层，避免 sheet 底边被系统手势条压住。 */
+    bottom: calc(44px + env(safe-area-inset-bottom, 0px));
     left: 0;
     right: 0;
     width: auto;
     min-width: 0;
+    /* 2026-11-19 P1-17：vh → dvh。移动端地址栏收起/展开时 `vh` 是「最大视口」，
+       键盘或地址栏一出现就比可视区高 ⇒ sheet 底边被推出屏外。
+       先写 vh 兜不支持 dvh 的老 WebView，再写 dvh 覆盖（后者不认识时整行被忽略）。 */
     max-height: min(78vh, calc(100% - 104px));
+    max-height: min(78dvh, calc(100% - 104px));
     border-radius: 16px 16px 0 0;
     border-bottom: none;
     transform-origin: bottom center;
@@ -17790,39 +17845,49 @@ import { getLogger } from "../core/logger.ts";
   .reader-view.re-phone .reader-toc::before,
   .reader-view.re-phone .reader-bookmarks::before,
   .reader-view.re-phone .reader-annots::before,
-  .reader-view.re-phone .reader-marks::before {
+  .reader-view.re-phone .reader-marks::before,
+  .reader-view.re-large-phone .reader-toc::before,
+  .reader-view.re-large-phone .reader-bookmarks::before,
+  .reader-view.re-large-phone .reader-annots::before,
+  .reader-view.re-large-phone .reader-marks::before {
     display: none;
-  }
-  .reader-view.re-large-phone .reader-toc,
-  .reader-view.re-large-phone .reader-bookmarks,
-  .reader-view.re-large-phone .reader-annots,
-  .reader-view.re-large-phone .reader-marks {
-    /* 大手机（480-600px）保持锚定 popover 形态，但放宽到 320px 并提高高度上限 */
-    width: 320px;
-    max-height: 78vh;
   }
   @keyframes reader-sheet-in {
     from { opacity: 0; transform: translateY(12px); }
     to   { opacity: 1; transform: translateY(0); }
   }
-  .reader-view.re-phone .reader-tts-bar {
+  .reader-view.re-phone .reader-tts-bar,
+  .reader-view.re-large-phone .reader-tts-bar {
     overflow-x: auto;
     overscroll-behavior-x: contain;
     scrollbar-width: none;
   }
-  .reader-view.re-phone .reader-tts-bar::-webkit-scrollbar {
+  .reader-view.re-phone .reader-tts-bar::-webkit-scrollbar,
+  .reader-view.re-large-phone .reader-tts-bar::-webkit-scrollbar {
     display: none;
   }
   /* 2026-11-06：手机端圆点是显式主入口（中心点按默认关），
      所以命中区贴顶、保持可点，圆点略小不压字。 */
-  .reader-view.re-phone .reader-top-handle {
+  .reader-view.re-phone .reader-top-handle,
+  .reader-view.re-large-phone .reader-top-handle {
     top: 0;
     height: 22px;
   }
-  .reader-view.re-phone .reader-top-handle-dot {
+  .reader-view.re-phone .reader-top-handle-dot,
+  .reader-view.re-large-phone .reader-top-handle-dot {
     width: 5px;
     height: 5px;
     margin-top: 4px;
+  }
+  /* 2026-11-19 P1-11：翻页悬浮箭头在 481–600px 也隐藏。
+     原来只有 `@media (max-width:479px)` 一条，而「触屏靠滑动翻页」这个理由
+     与宽度无关、与**是否触屏**有关 —— 481–600px 的大屏手机上箭头仍在，
+     而且是 opacity:.3 的幽灵按钮（既糊在正文上又容易被误点）。
+     改判据为设备类（JS 侧 isMobile 口径），与抽屉/长按菜单同一口径。
+     桌面窄窗（可能 500px 宽但用鼠标）不再被误伤。 */
+  .reader-view.re-phone .reader-side-tap,
+  .reader-view.re-large-phone .reader-side-tap {
+    display: none;
   }
   /* 2026-10-25 移动端适配 B3：手机上中心点按 toggle 是主路径，栏内点击目标已在
      coarse 指针媒体查询里放大；这里只保留极小屏的工具栏紧凑化。 */
@@ -20050,6 +20115,79 @@ import { getLogger } from "../core/logger.ts";
     .reader-progress-bar::-moz-range-thumb {
       width: 13px;
       height: 13px;
+    }
+  }
+
+  /* ================================================================
+   * 2026-11-19 移动端 P1-3：触屏触摸目标 —— 集中放大块
+   * ----------------------------------------------------------------
+   * 问题：项目里 `@media (pointer: coarse)` 只放大过 3 组（`.reader-btn`、
+   * `.reader-mini-btn`、`.reader-chrome-btn*` 与目录返回键），而**浮层内部的
+   * 按钮**（批注卡 / 词典卡 / 脚注 / 灯箱 / 划词样式行）完全沿用桌面尺寸：
+   * 26×26、18×18、高 22 —— 手指必然点偏，且点了没反应时用户会以为功能坏了。
+   *
+   * 为什么**集中写在一个块**里，而不是回各组件处就地改：
+   *   ① 触摸目标是一整套规格，散着写必然漏（本次审计就是漏了 5 组）；
+   *   ② 真机调参只看这一块，一轮调完；散着改要翻 20 处、还容易改漏暗态；
+   *   ③ 放在文件末尾 ⇒ 同权重下天然压过上面的基础尺寸（不必处处提权重）。
+   *
+   * 原则：**只放大命中区，不放大视觉** —— 图标尺寸、字号、圆角一律不动，
+   * 看起来与桌面一致，只是更容易点中。
+   *
+   * ⚠️ 四处刻意的例外（都写了理由，别「顺手统一」）：
+   *   1. `.reader-chrome-btn*` 保持已有 40×40，**不升 44**：
+   *      底栏 9 个控件 × 44 = 396 > 360 屏宽，升了会把工具栏撑出屏外。
+   *   2. `.reader-sel-color-dot` 只到 32：5 颗横排 44 会撑爆 300 宽的划词主栏。
+   *   3. `.reader-toc-caret` 只到 28：它挂每行标题左侧，44 会把深层目录文字挤没。
+   *   4. `.reader-note-opt` 到 40：批注卡那一排选项 + 色板本来就紧，44 会换行。
+   */
+  @media (pointer: coarse) {
+    /* 批注卡：图标按钮 / 折叠触发器 / 选项 */
+    .reader-note-icon {
+      min-width: 44px;
+      min-height: 44px;
+    }
+    .reader-note-fold {
+      min-height: 44px;
+    }
+    .reader-note-opt {
+      min-width: 40px;
+      min-height: 40px;
+    }
+    /* 词典卡 / 脚注气泡 / 灯箱：关闭键与跳转键 */
+    .reader-dict-close,
+    .reader-footnote-close,
+    .reader-footnote-jump,
+    .reader-imgv-btn {
+      min-width: 44px;
+      min-height: 44px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    /* 划词样式行（只在 edit 态出现，行高靠内容撑，放大不破坏 --note-card-w 推导） */
+    .reader-sel-style-btn {
+      min-height: 40px;
+      padding: 0 8px;
+    }
+    .reader-sel-color-dot {
+      width: 32px;
+      height: 32px;
+    }
+    /* 目录展开箭头 */
+    .reader-toc-caret {
+      width: 28px;
+      height: 28px;
+    }
+    /* 底部进度条滑块：15/13 → 24，并同步 margin-top（(6-24)/2 = -9） */
+    .reader-progress-bar::-webkit-slider-thumb {
+      width: 24px;
+      height: 24px;
+      margin-top: -9px;
+    }
+    .reader-progress-bar::-moz-range-thumb {
+      width: 24px;
+      height: 24px;
     }
   }
 </style>
