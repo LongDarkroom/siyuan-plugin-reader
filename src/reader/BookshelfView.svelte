@@ -4507,6 +4507,27 @@
       pointer-events: auto;
     }
   }
+  /* ================================================================
+   * 2026-11-19 P2-18：分组行的编辑 / 改色小图标（18px、hover-only）
+   * ----------------------------------------------------------------
+   * 它们只在 `.shelf-sb-group:hover` 时才 opacity:1 ⇒ 平板触屏（601–768px，
+   * 既不在 re-phone 也不在 re-large-phone 的隐藏名单里）**永远点不到**。
+   * 口径与手机档一致：触屏上不给两个 18px 的小图标，改装一个 32px 的 ⋯
+   * （菜单里有重命名 / 颜色 / 删除，能力完全等价）；两个小图标直接
+   * `display:none`，避免 opacity:0 但 pointer-events:auto 的「看不见却能点」暗雷。
+   * ⚠️ 手机档已经在上面那条按类隐藏了，这里用能力查询兜平板 —— 两者叠加无副作用。
+   * 鼠标 + 触控笔笔电（pointer: fine）不受影响，仍保留 hover 浮出。 */
+  @media (hover: none) and (pointer: coarse) {
+    .shelf-sb-more {
+      display: inline-flex;
+      width: 32px;
+      height: 32px;
+    }
+    .shelf-sb-item.shelf-sb-group .shelf-sb-edit,
+    .shelf-sb-item.shelf-sb-group .shelf-sb-colorbtn {
+      display: none;
+    }
+  }
   /* 笔记发送目标角标（2026-10-09；2026-10-13 从 .book-meta 收进 .book-sub、右对齐）
      —— 纯展示，不响应点击。只显示已绑定，未绑定不做灰色警告。 */
   .book-note-target {

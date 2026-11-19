@@ -45,6 +45,7 @@ import { installEsPolyfills } from "./core/es-polyfill.ts";
 // `navigator.clipboard?.writeText()` 静默短路、界面却弹「已复制」（复制假成功）。
 // 装一次垫片，旧调用点一行都不用改就有 execCommand 兜底。
 import { installClipboardFallback } from "./core/clipboard.ts";
+import { applyViewportTiers } from "./core/responsive.ts";
 import { logSwallow } from "./core/safe.ts";
 import { getLogger } from "./core/logger.ts";
 import { DictManager } from "./dict/dict-manager.ts";
@@ -132,6 +133,15 @@ export class ReaderPlugin extends Plugin {
       installClipboardFallback();
     } catch (e) {
       getLogger().warn("[RE 阅读器] 剪贴板降级安装失败", { error: e });
+    }
+
+    /* 宽度档位类（body 上的 re-w380 … re-w768）：四个二级面板与书架右键菜单都
+     * portal 到 document.body，不在阅读器/书架子树里，靠这套类替代各自写的
+     * `@media (max-width:600px)`。提前落一次，避免首帧面板按桌面尺寸闪一下。 */
+    try {
+      applyViewportTiers();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 视口档位类安装失败", { error: e });
     }
 
     /* ============ 0.1 注册自定义图标（必须在 addTopBar / addTab 之前）===========

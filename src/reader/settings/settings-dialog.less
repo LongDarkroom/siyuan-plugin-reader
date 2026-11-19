@@ -1289,7 +1289,12 @@ body.theme--dark :is(.rwd-panel, .cloud-panel) {
  * 主区占满剩余高度。面板仍是固定高度（理由见主 .rwd-panel 注释），
  * 底部抽屉形态下给 88vh，Home Indicator 区不被内容压住。
  */
-@media (max-width: 720px) {
+/* 2026-11-19 P2-3：原 `@media (max-width:720px)`，改用 body 档位类。
+ * 真源是 responsive.ts 的 BREAKPOINTS.dialogDrawer（720），由 applyViewportTiers()
+ * 投射成 `body.re-w720`（语义完全等价 max-width:720px）。
+ * 为什么不用媒体查询：宽度断点必须只有一套值，否则又会出现「JS 判 720、CSS 判 700」。
+ */
+body.re-w720 {
   /* 移动端恢复压暗 + 模糊：底部抽屉本身盖住大半屏，透明底会让正文与面板「糊成一片」。
      桌面端无蒙版的理由（要边调边看）在手机上不成立。 */
   .rwd-backdrop {

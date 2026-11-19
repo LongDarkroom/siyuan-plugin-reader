@@ -17,12 +17,22 @@
  */
 
 import { readable } from "svelte/store";
-import { watchViewport, viewportWidth, viewportHeight, isSoftKeyboardOpen, keyboardInset, BREAKPOINTS } from "./responsive.ts";
+import {
+  watchViewport,
+  layoutWidth,
+  viewportHeight,
+  isSoftKeyboardOpen,
+  keyboardInset,
+  applyViewportTiers,
+  BREAKPOINTS,
+} from "./responsive.ts";
 
 export type ViewportBreakpoint = "phone" | "largePhone" | "tablet" | "desktop";
 
 export interface ViewportState {
+  /** **布局视口**宽度（与 CSS 断点同源；不要用它做浮层定位，那要用 visualViewport） */
   width: number;
+  /** **可视视口**高度（软键盘弹起后会缩） */
   height: number;
   /** 软键盘是否弹起（仅移动端有意义） */
   keyboardOpen: boolean;
@@ -44,8 +54,12 @@ function classify(w: number): ViewportBreakpoint {
 
 /** 同步算一次初值：watchViewport 的首次 fire 走 rAF，直接用初值可避免首帧闪断 */
 function initialViewportState(): ViewportState {
-  const w = viewportWidth();
+  // ⚠️ 断点判定用布局视口宽度（P2-1）：visualViewport 在 iPad 分屏 / 转屏瞬间会短暂
+  // 等于分屏后的窄宽，与 CSS 的 @media 不同源 ⇒ 半帧手机、半帧桌面。
+  const w = layoutWidth();
   const h = viewportHeight();
+  // body 档位类（re-w*) 同步落一次，portal 出去的二级面板在首帧就能拿到正确档位
+  applyViewportTiers(w);
   return {
     width: w,
     height: h,

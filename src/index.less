@@ -1894,7 +1894,11 @@ html[data-theme-mode="dark"] .re-changelog-dialog {
 }
 
 /* ---- 窄屏：版本列横过来 ---- */
-@media (max-width: 760px) {
+/* 2026-11-19 P2-3：原 `@media (max-width:760px)` → body 档位类（760 未进 BREAKPOINTS
+ * 的语义断点，只是这条变更日志弹窗的历史取值；applyViewportTiers 按 BREAKPOINTS 投射
+ * 6 档，760 落在 re-w768 之内，所以这里用 re-w768 —— 768 与 760 的差别只影响
+ * 760–768 这 8px，而该区间本来就没有专门的版式）。 */
+body.re-w768 {
   .re-changelog-dialog .cl-head {
     padding: 16px 18px 10px;
   }

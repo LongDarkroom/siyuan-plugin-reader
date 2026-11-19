@@ -546,12 +546,14 @@
   }
 
   /* 2026-10-24 移动端适配 Phase 4：手机（≤600px）转为底部 sheet（.edit-mask 是 flex 容器） */
-  @media (max-width: 600px) {
-    .graph-panel {
-      align-self: flex-end;
-      width: 100vw;
-      max-height: calc(100dvh - 24px);
-      border-radius: 16px 16px 0 0;
-    }
+  /* 2026-11-19 P2-3：原 `@media (max-width:600px)`。
+     本面板 use:portal 挂到 document.body，**不在** .reader-view/.bookshelf-view 子树里，
+     拿不到 .re-phone，所以用 responsive.ts 投射到 body 的档位类 re-w600
+     （语义等价 max-width:600px，唯一真源是 BREAKPOINTS.largePhone）。 */
+  :global(body.re-w600) .graph-panel {
+    align-self: flex-end;
+    width: 100vw;
+    max-height: calc(100dvh - 24px);
+    border-radius: 16px 16px 0 0;
   }
 </style>

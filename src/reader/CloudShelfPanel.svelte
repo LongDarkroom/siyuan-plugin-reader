@@ -1057,27 +1057,29 @@
   }
 
   /* ---- 手机（≤600px）转底部 sheet，与 OpdsSearchPanel 同一档 ---- */
-  @media (max-width: 600px) {
-    .cloud-panel {
-      align-self: flex-end;
-      width: 100vw;
-      max-height: calc(100dvh - 24px);
-      border-radius: 16px 16px 0 0;
-    }
-    /* 分段控件在窄屏仍排一行：两个标签都短，竖排白占高度 */
-    /* 标签左栏在 390 宽里会挤掉控件宽度，折成上下排 */
-    .cloud-field {
-      grid-template-columns: minmax(0, 1fr);
-      gap: 6px;
-      min-height: 0;
-    }
-    .cloud-row {
-      grid-template-columns: 16px minmax(0, 1fr) 56px auto;
-      gap: 8px;
-    }
-    /* 操作栏在窄屏会挤成两行，危险操作换行后仍留在最左 */
-    .cloud-actions {
-      flex-wrap: wrap;
-    }
+  /* 2026-11-19 P2-3：原 `@media (max-width:600px)`。
+     本面板 use:portal 挂到 document.body，**不在** .reader-view/.bookshelf-view 子树里，
+     拿不到 .re-phone，所以用 responsive.ts 投射到 body 的档位类 re-w600
+     （语义等价 max-width:600px，唯一真源是 BREAKPOINTS.largePhone）。 */
+  :global(body.re-w600) .cloud-panel {
+    align-self: flex-end;
+    width: 100vw;
+    max-height: calc(100dvh - 24px);
+    border-radius: 16px 16px 0 0;
+  }
+  /* 分段控件在窄屏仍排一行：两个标签都短，竖排白占高度 */
+  /* 标签左栏在 390 宽里会挤掉控件宽度，折成上下排 */
+  :global(body.re-w600) .cloud-field {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 6px;
+    min-height: 0;
+  }
+  :global(body.re-w600) .cloud-row {
+    grid-template-columns: 16px minmax(0, 1fr) 56px auto;
+    gap: 8px;
+  }
+  /* 操作栏在窄屏会挤成两行，危险操作换行后仍留在最左 */
+  :global(body.re-w600) .cloud-actions {
+    flex-wrap: wrap;
   }
 </style>

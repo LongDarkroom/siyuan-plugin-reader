@@ -17,9 +17,12 @@ import { getLogger } from "../core/logger.ts";
   // 2026-10-26：移动端压制浏览器原生选词菜单（长按浮条压在自绘划词工具栏上）
   import { shouldSuppressNativeMenu, nativeMenuGuardHandler, applyTouchCalloutNone } from "../core/native-menu.ts";
   // [REword patch 2026-08-29] 移动端 PDF 适配 Phase 1
-  import { getDeviceClass, isSmallMobile, isLargeMobile, isMobile } from "../core/env.ts";
+  import { getDeviceClass, isSmallMobile, isLargeMobile, isMobile, isIOS } from "../core/env.ts";
   // 2026-10-24 移动端适配 Phase 1：响应式视口状态（断点 / 软键盘），根节点状态类 + 紧凑顶栏开关
   import { viewport, isPhoneBreakpoint, type ViewportBreakpoint } from "../core/viewport-store.ts";
+  // 2026-11-19 P2-3：极窄档（380/420）不再用 @media 魔法数，改成根节点状态类，
+  // 与 BREAKPOINTS 同源（re-narrow / re-tiny）。
+  import { BREAKPOINTS } from "../core/responsive.ts";
   // 2026-11-15 移动端全量走通 P0：AI 面板承载决策（内嵌 / 右栏、全屏 / 半屏）的唯一真源
   import { decideAiEntry } from "./ai-entry.ts";
   // [REword 2026-09-02] 界面分流：按书籍格式自动切换「图书界面 / PDF 界面」。
@@ -2994,6 +2997,17 @@ import { getLogger } from "../core/logger.ts";
     };
     trackDocListener(doc, "touchmove", onTouchMove, { passive: false });
 
+    /* 2026-11-19 P2-6：iOS Safari 的捏合走专有的 gesturestart/gesturechange，
+     * 对 touchmove 的 preventDefault 在 Safari 上可能被浏览器手势识别流程忽略 ——
+     * 结果是「想双指调字号，页面却整体放大了」。
+     * gesture* 上 preventDefault **一定有效**，且只有 iOS 有这些事件（其余平台加不上监听）。
+     * 只拦 gesture 不动 touch：安卓走上面那条 touchmove 的 preventDefault。 */
+    if (isIOS()) {
+      const blockSystemZoom = ((e: Event) => e.preventDefault()) as EventListener;
+      trackDocListener(doc, "gesturestart", blockSystemZoom, { passive: false });
+      trackDocListener(doc, "gesturechange", blockSystemZoom, { passive: false });
+    }
+
     const onTouchEnd = (e: TouchEvent) => {
       // 仍有手指按着（如捏合收尾过渡）不处理
       if (e.touches.length > 0) return;
@@ -5203,6 +5217,12 @@ import { getLogger } from "../core/logger.ts";
   let viewportBp: ViewportBreakpoint = "desktop";
   $: viewportBp = $viewport.breakpoint;
   $: isCompactToolbar = isIphoneMode || isPhoneBreakpoint(viewportBp);
+  /* 2026-11-19 P2-3：极窄两档改由状态类驱动（原来是 @media max-width:420 / 380）。
+   * 好处：① 只有一套真源（BREAKPOINTS），② 桌面窄窗调试时能手动切类复现，
+   * ③ 与 re-phone 同源，不会再出现「JS 判 481、CSS 判 479」那种 1px 缝。 */
+  $: vpWidth = $viewport.width;
+  $: isNarrowVp = vpWidth <= BREAKPOINTS.narrowPhone;
+  $: isTinyVp = vpWidth <= BREAKPOINTS.tinyPhone;
 
   /* 2026-11-19 P1-2：软键盘让位。
    * 移动端键盘**只缩 visualViewport**，布局视口不动 ⇒ `bottom:0` 的元素停在键盘下面。
@@ -8060,6 +8080,19 @@ import { getLogger } from "../core/logger.ts";
       trackDocListener(doc, "contextmenu", nativeMenuGuardHandler as EventListener, true);
       applyTouchCalloutNone(doc);
     }
+    /* 2026-11-19 P2-5：iframe 内的 touch-action 是**独立计算**的 —— 宿主根元素上的
+     * `touch-action: manipulation` 管不到内容文档，内容文档走默认 `auto`，
+     * 于是横滑时浏览器优先判「横向滚动」，把翻页手势吃掉（长段落里经常翻不动）。
+     * 这里只放开纵向滚动 + 双指缩放，横向留给 injectPageTurn 的 touchend 判定。
+     * 只在触屏 + 可重排（非 PDF）上写：PDF 固定版式本来就要横向拖动看整页。 */
+    if (isTouchDevice() && !isPdfBook()) {
+      try {
+        const de = doc.documentElement;
+        if (de && de.style.touchAction !== "pan-y pinch-zoom") {
+          de.style.touchAction = "pan-y pinch-zoom";
+        }
+      } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · content touch-action", "debug"); }
+    }
     // [REword patch 2026-08-29] PDF ⌘/Ctrl+滚轮缩放：
     // wheel 事件不跨 iframe 边界，必须挂到内容文档里才能收到页面上的滚轮。
     // 仅 PDF 挂载——EPUB 滚动模式下挂 passive:false 的 wheel 监听会让
@@ -9432,9 +9465,19 @@ import { getLogger } from "../core/logger.ts";
     }
   }
 
+  /* 2026-11-19 P2-13：批注卡尺寸观察的 rAF 节流手柄。
+   * 卡内是完整 Protyle，每敲一个字都会触发尺寸变化 → 原实现每帧都跑一次完整
+   * layoutNoteCard（读 rect + 写 left/top + 夹紧），在手机上明显掉帧。
+   * 合并到下一帧只跑一次即可（一帧内多次尺寸变化本来也只需要最后一次结果）。 */
+  let noteRoRaf = 0;
+
   function stopNoteCardObserver() {
     try { noteCardRO?.disconnect(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · stopNoteCardObserver", "debug"); }
     noteCardRO = null;
+    if (noteRoRaf) {
+      cancelAnimationFrame(noteRoRaf);
+      noteRoRaf = 0;
+    }
   }
 
   /** 卡片打开后：先给预估落点（防首帧跳 0,0），下一帧按实测尺寸重锚并持续观察。 */
@@ -9461,7 +9504,13 @@ import { getLogger } from "../core/logger.ts";
     }
     layoutNoteCard();
     try {
-      noteCardRO = new ResizeObserver(() => layoutNoteCard());
+      noteCardRO = new ResizeObserver(() => {
+        if (noteRoRaf) return; // 本帧已排队，忽略这一批
+        noteRoRaf = requestAnimationFrame(() => {
+          noteRoRaf = 0;
+          if (noteEditor.visible) layoutNoteCard();
+        });
+      });
       noteCardRO.observe(noteEditorEl);
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · beginNoteCardLayout", "debug"); }
   }
@@ -14395,6 +14444,8 @@ import { getLogger } from "../core/logger.ts";
   class:re-phone={viewportBp === "phone"}
   class:re-large-phone={viewportBp === "largePhone"}
   class:re-tablet={viewportBp === "tablet"}
+  class:re-narrow={isNarrowVp}
+  class:re-tiny={isTinyVp}
   class:kb-open={kbOpen}
   class:sidebar-docked={anyDockPanel()}
   style="--re-sidebar-w:{sidebarWidth}px;--re-kb:{kbInset}px"
@@ -16926,6 +16977,7 @@ import { getLogger } from "../core/logger.ts";
     width: auto;
     max-width: none;
     max-height: min(56vh, 420px);
+    max-height: min(56dvh, 420px);
     overflow-y: auto;
     overscroll-behavior: contain;
   }
@@ -17422,6 +17474,7 @@ import { getLogger } from "../core/logger.ts";
        改成「左留 12、右留 12」，与 JS 的 clampDictPopupBox 保持一致。 */
     max-width: min(360px, calc(100vw - 24px));
     max-height: var(--dict-max-h, 62vh);
+    max-height: var(--dict-max-h, 62dvh);
     overflow: auto;
     /* 2026-11-05：与划词工具栏/批注卡共用浮层令牌（白天浅玻璃、夜间深玻璃） */
     background: var(--rwd-pop-bg);
@@ -17740,12 +17793,8 @@ import { getLogger } from "../core/logger.ts";
     outline: 2px solid var(--b3-theme-primary, #378add);
     outline-offset: 2px;
   }
-  /* 窄屏隐藏箭头（触屏靠滑动翻页） */
-  @media (max-width: 479px) {
-    .reader-side-tap {
-      display: none;
-    }
-  }
+  /* 窄屏隐藏箭头 —— 见下方「按设备类」那条（原 @media (max-width:479px) 已删除：
+     479/480 差 1px 是纯历史遗留，且判据本应是「是否触屏」而不是屏宽）。 */
   /* 设置面板：开关行 + 开关 */
   .reader-setting-toggle-row {
     justify-content: space-between;
@@ -17835,6 +17884,7 @@ import { getLogger } from "../core/logger.ts";
     top: var(--reword-chrome-top, 54px);
     left: 8px;
     max-height: 70vh;
+    max-height: 70dvh;
     display: flex;
     flex-direction: column;
     padding: 8px;
@@ -17960,8 +18010,31 @@ import { getLogger } from "../core/logger.ts";
     scrollbar-width: none;
   }
   .reader-view.re-phone .reader-tts-bar::-webkit-scrollbar,
-  .reader-view.re-large-phone .reader-tts-bar::-webkit-scrollbar {
+  .reader-view.re-large-phone .reader-tts-bar::-webkit-scrollbar,
+  .reader-view.re-tablet .reader-tts-bar::-webkit-scrollbar {
     display: none;
+  }
+  /* ================================================================
+   * 2026-11-19 P2-4：`.re-tablet`（601–768px）从「死类」变成真规则
+   * ----------------------------------------------------------------
+   * 这个类一直挂在根节点上，但一条规则都没有（`grep -c re-tablet` = 1），
+   * 768px 档的平板完全走桌面样式：280px 的目录 popover 在 10 寸屏上又窄又矮，
+   * TTS 读取条一长就顶出边界。这里只做「变宽 + 允许横向滚动」两件事，
+   * **不**把平板并进手机形态（平板有足够空间，底部 sheet 反而是退步）。
+   * ⚠️ 不要在这里加「隐藏翻页箭头」—— 平板是触屏但屏够大，箭头是有效入口。 */
+  .reader-view.re-tablet .reader-toc,
+  .reader-view.re-tablet .reader-bookmarks,
+  .reader-view.re-tablet .reader-annots,
+  .reader-view.re-tablet .reader-marks,
+  .reader-view.re-tablet .reader-search {
+    width: 340px;
+    max-height: 76vh;
+    max-height: 76dvh;
+  }
+  .reader-view.re-tablet .reader-tts-bar {
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
   }
   /* 2026-11-06：手机端圆点是显式主入口（中心点按默认关），
      所以命中区贴顶、保持可点，圆点略小不压字。 */
@@ -17994,36 +18067,40 @@ import { getLogger } from "../core/logger.ts";
    * re-phone 已覆盖 ≤480px；这里补两档更窄的（折叠机半屏 / iPhone SE 竖屏）：
    * 顶栏控件更紧凑、底部 sheet 让出更多正文高度。
    * 注意 .reader-toolbar-iphone .reader-btn 的 44×44 命中区**不缩**
-   * （只调 padding/字号，min-width 仍兜底触摸命中）。 */
-  @media (max-width: 420px) {
-    .reader-view.re-phone .reader-toolbar {
-      padding-left: calc(4px + env(safe-area-inset-left, 0px));
-      padding-right: calc(4px + env(safe-area-inset-right, 0px));
-      gap: 2px;
-    }
-    .reader-view.re-phone .reader-btn {
-      padding: 4px 5px;
-    }
-    .reader-view.re-phone .reader-toc,
-    .reader-view.re-phone .reader-bookmarks,
-    .reader-view.re-phone .reader-annots,
-    .reader-view.re-phone .reader-marks,
-    .reader-view.re-phone .reader-search {
-      bottom: 36px;
-      max-height: min(84vh, calc(100% - 84px));
-    }
+   * （只调 padding/字号，min-width 仍兜底触摸命中）。
+   *
+   * 2026-11-19 P2-3：原为 `@media (max-width:420px/380px)`，现改由根节点状态类
+   * `.re-narrow` / `.re-tiny` 驱动（值来自 BREAKPOINTS.narrowPhone / tinyPhone）。
+   * 好处是宽度只有一套真源，且 420 这两档与 re-phone 同源、不存在 1px 缝。
+   */
+  .reader-view.re-narrow .reader-toolbar {
+    padding-left: calc(4px + env(safe-area-inset-left, 0px));
+    padding-right: calc(4px + env(safe-area-inset-right, 0px));
+    gap: 2px;
   }
-  @media (max-width: 380px) {
-    .reader-view.re-phone .reader-toolbar {
-      padding-top: calc(4px + env(safe-area-inset-top, 0px));
-    }
-    .reader-view.re-phone .reader-btn {
-      padding: 3px 4px;
-      font-size: 12px;
-    }
-    .reader-view.re-phone .reader-title {
-      font-size: 12px;
-    }
+  .reader-view.re-narrow .reader-btn {
+    padding: 4px 5px;
+  }
+  .reader-view.re-narrow .reader-toc,
+  .reader-view.re-narrow .reader-bookmarks,
+  .reader-view.re-narrow .reader-annots,
+  .reader-view.re-narrow .reader-marks,
+  .reader-view.re-narrow .reader-search {
+    bottom: calc(36px + env(safe-area-inset-bottom, 0px));
+    max-height: min(84vh, calc(100% - 84px));
+    max-height: min(84dvh, calc(100% - 84px));
+    /* 键盘占高同样要减（见 P1-2） */
+    max-height: min(84dvh, calc(100% - 84px - var(--re-kb, 0px)));
+  }
+  .reader-view.re-tiny .reader-toolbar {
+    padding-top: calc(4px + env(safe-area-inset-top, 0px));
+  }
+  .reader-view.re-tiny .reader-btn {
+    padding: 3px 4px;
+    font-size: 12px;
+  }
+  .reader-view.re-tiny .reader-title {
+    font-size: 12px;
   }
   /* ================================================================
    * 2026-10-25 P0-1：常驻侧边栏（停靠模式，根节点 .sidebar-docked）
@@ -18326,6 +18403,7 @@ import { getLogger } from "../core/logger.ts";
   .reader-imgv-img {
     max-width: 92vw;
     max-height: 86vh;
+    max-height: 86dvh;
     object-fit: contain;
     cursor: zoom-in;
     user-select: none;
@@ -18656,6 +18734,7 @@ import { getLogger } from "../core/logger.ts";
        之上吞掉 ✕ 点击（"关不掉/卡死"根因之一）。3 仍远低于思源原生 UI，安全。 */
     z-index: 3;
     max-height: 62vh;
+    max-height: 62dvh;
     padding: 8px;
     display: flex;
     flex-direction: column;
@@ -18770,6 +18849,7 @@ import { getLogger } from "../core/logger.ts";
     gap: 4px;
     overflow-y: auto;
     max-height: 40vh;
+    max-height: 40dvh;
     margin: 0 -2px;
     padding: 2px;
   }
@@ -18820,6 +18900,7 @@ import { getLogger } from "../core/logger.ts";
     position: absolute;
     width: min(360px, 80%);
     max-height: 60vh;
+    max-height: 60dvh;
     background: var(--b3-theme-background, #fff);
     border-radius: 10px;
     border-left: 3px solid #e5484d; /* 红色左边框（截图特征） */
@@ -18944,6 +19025,7 @@ import { getLogger } from "../core/logger.ts";
     flex-direction: column;
     gap: 4px;
     max-height: 80vh;
+    max-height: 80dvh;
     overflow-y: auto;
   }
   .reader-setting-row {
@@ -19365,6 +19447,7 @@ import { getLogger } from "../core/logger.ts";
   .reword-pt-modal {
     width: min(440px, calc(100vw - 32px));
     max-height: calc(100vh - 48px);
+    max-height: calc(100dvh - 48px);
     overflow-y: auto;
     padding: var(--reword-space-4);
     border-radius: var(--reword-radius-lg);

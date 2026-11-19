@@ -11,12 +11,28 @@
  * 两者正交，env 决定交互模式，responsive 决定 UI 尺寸。
  */
 
-/** 屏幕断点（与 SiYuan B3 设计 token 对齐） */
+/**
+ * 屏幕断点（与 SiYuan B3 设计 token 对齐）
+ *
+ * ⚠️ 这是**唯一真源**：CSS 里不要再写 `@media (max-width: 612px)` 这种魔法数。
+ * 宽度类媒体查询一律改走下面两种形态之一：
+ *   1. 阅读器 / 书架子树内 → 根节点的 `.re-*` 状态类（re-phone / re-large-phone /
+ *      re-tablet / re-narrow / re-tiny）；
+ *   2. portal 到 body 的二级面板 → 本文件 `applyViewportTiers()` 写在
+ *      `<body>` 上的 `.re-w380 … .re-w768` 档位类（见 WIDTH_TIERS）。
+ * 只有**设备能力**类查询（pointer / hover / prefers-*）继续留在 CSS 里。
+ */
 export const BREAKPOINTS = {
+  /** 超小屏（折叠机半屏 / 旧 SE 竖屏） */
+  tinyPhone: 380,
+  /** 窄屏手机（iPhone SE 一代 / 小屏安卓） */
+  narrowPhone: 420,
   /** 小屏手机（portrait） */
   phone: 480,
   /** 大屏手机 / 小平板（portrait iPad mini） */
   largePhone: 600,
+  /** 二级弹窗改底部抽屉的宽度（设置 / AI 设置） */
+  dialogDrawer: 720,
   /** 平板 / 桌面（横屏 iPad） */
   tablet: 768,
   /** 桌面 */
@@ -25,21 +41,86 @@ export const BREAKPOINTS = {
 
 export type BreakpointKey = keyof typeof BREAKPOINTS;
 
-/** 当前视口宽度（默认 window.innerWidth，但可被 visualViewport 替代） */
-export function viewportWidth(): number {
+/**
+ * 需要投射成 `<body>` 档位类的宽度档（升序）。
+ * 语义是 `max-width`：视口 500px 时 body 同时带 `re-w380 re-w420 re-w480 re-w600`…… 里
+ * 所有 ≥500 的档**不**带 —— 即 `.re-w600` 命中表示「视口 ≤600」，与 `@media (max-width:600px)` 等价。
+ */
+export const WIDTH_TIERS = [
+  BREAKPOINTS.tinyPhone,
+  BREAKPOINTS.narrowPhone,
+  BREAKPOINTS.phone,
+  BREAKPOINTS.largePhone,
+  BREAKPOINTS.dialogDrawer,
+  BREAKPOINTS.tablet,
+] as const;
+
+/**
+ * 当前**布局视口**宽度 —— 断点判定的唯一依据。
+ *
+ * 🔴 为什么不能用 visualViewport：iPad 分屏 / 转屏瞬间 `visualViewport.width` 会短暂
+ * 等于分屏后的窄宽，而 CSS 的 `@media (max-width:480px)` 判的是**布局视口**。
+ * 两边不同源 ⇒ 转屏那一刻 JS 挂的 `re-phone` 和 CSS 的 `@media` 会打架（半帧手机样式、
+ * 半帧桌面样式）。visualViewport 只用于「软键盘占高」和「浮层定位」。
+ */
+export function layoutWidth(): number {
   if (typeof window === "undefined") return BREAKPOINTS.desktop;
-  // visualViewport 在移动端更准（不包含被软键盘推走的部分）
-  const vv = (window as any).visualViewport;
-  if (vv && typeof vv.width === "number" && vv.width > 0) return vv.width;
-  return window.innerWidth;
+  return window.innerWidth || document.documentElement?.clientWidth || BREAKPOINTS.desktop;
 }
 
-/** 当前视口高度 */
-export function viewportHeight(): number {
+/** 当前**布局视口**高度（不受软键盘影响） */
+export function layoutHeight(): number {
+  if (typeof window === "undefined") return BREAKPOINTS.tablet;
+  return window.innerHeight || document.documentElement?.clientHeight || BREAKPOINTS.tablet;
+}
+
+/** 当前**可视视口**宽度（软键盘弹出 / 双指缩放时会缩；浮层定位用） */
+export function visualWidth(): number {
   if (typeof window === "undefined") return BREAKPOINTS.desktop;
   const vv = (window as any).visualViewport;
+  if (vv && typeof vv.width === "number" && vv.width > 0) return vv.width;
+  return layoutWidth();
+}
+
+/** 当前**可视视口**高度（软键盘弹出时会缩；浮层尺寸 / 键盘检测用） */
+export function visualHeight(): number {
+  if (typeof window === "undefined") return BREAKPOINTS.tablet;
+  const vv = (window as any).visualViewport;
   if (vv && typeof vv.height === "number" && vv.height > 0) return vv.height;
-  return window.innerHeight;
+  return layoutHeight();
+}
+
+/**
+ * 视口宽度 —— **断点语义**（= layoutWidth()）。
+ *
+ * 2026-11-19 P2-1：历史上这里优先取 `visualViewport.width`，与 CSS 断点不同源。
+ * 现在固定为布局视口；需要可视视口的场景请显式用 `visualWidth()`。
+ */
+export function viewportWidth(): number {
+  return layoutWidth();
+}
+
+/** 视口高度 —— **可视视口**语义（软键盘弹起后会变小，弹窗尺寸用它才不会被键盘顶出屏） */
+export function viewportHeight(): number {
+  return visualHeight();
+}
+
+/**
+ * 把宽度档位类写到 `<body>` 上（`re-w380` … `re-w768`，语义同 `max-width`）。
+ *
+ * 为什么需要：四个二级面板（阅读统计 / OPDS / 云端书库 / 图谱）与书架右键菜单都用
+ * `use:portal` 挂到 `document.body`，**不在阅读器 / 书架子树里**，拿不到 `.re-phone`；
+ * 它们原先各自写 `@media (max-width:600px)`。现在统一由这里投影，CSS 侧只认类，
+ * 全项目的宽度断点回到 `BREAKPOINTS` 一个真源。
+ */
+export function applyViewportTiers(w: number = layoutWidth()): void {
+  if (typeof document === "undefined" || !document.body) return;
+  const cl = document.body.classList;
+  for (const t of WIDTH_TIERS) {
+    const name = `re-w${t}`;
+    if (w <= t) cl.add(name);
+    else cl.remove(name);
+  }
 }
 
 /**
@@ -144,11 +225,13 @@ export function responsiveWidth(designWidth: number, min = 280, max?: number): n
 }
 
 /**
- * 响应式 height 换算（与 width 独立）
+ * 响应式高度换算（与 width 独立）
  *  - phone（≤480）：视口高度的 75%
  *  - largePhone（≤600）：80%
  *  - tablet（≤1024）：85%
  *  - desktop：原样
+ *
+ * 用**可视**视口高度：软键盘弹起时对话框要跟着缩，否则确认按钮会被顶到键盘下面。
  */
 export function responsiveHeight(designHeight: number, min = 280, max?: number): number {
   const vh = viewportHeight();
@@ -164,33 +247,6 @@ export function responsiveHeight(designHeight: number, min = 280, max?: number):
     return Math.max(min, Math.min(cap, Math.round(vh * 0.85)));
   }
   return Math.min(designHeight, cap);
-}
-
-/**
- * 像素 → CSS 长度（响应式 Dialog 推荐用法）
- *  - 桌面：原样返回
- *  - 移动端：包成 "calc(100vw - Npx)" / "calc(100vh - Npx)"，
- *    让思源 Dialog 直接铺满视口（更适合触屏交互）
- *
- * ⚠️ 2026-10-26 路线 A 后**当前无调用方**：移动端一级承载（书架 / 阅读）已从
- * 思源 Dialog 迁到全屏浮层（core/mobile-overlay-host.ts），本函数随之成为死代码。
- * 若将来二级弹窗（设置 / 词典管理）需要「按视口缩放」，可重新启用。
- */
-export function responsiveDialogSize(designPx: number, axis: "width" | "height"): string {
-  if (typeof window === "undefined") return `${designPx}px`;
-  if (axis === "width") {
-    const vw = viewportWidth();
-    if (vw <= BREAKPOINTS.phone) return `calc(100vw - 16px)`;
-    if (vw <= BREAKPOINTS.largePhone) return `calc(100vw - 32px)`;
-    if (vw <= BREAKPOINTS.tablet) return `calc(100vw - 64px)`;
-    return `${designPx}px`;
-  } else {
-    const vh = viewportHeight();
-    if (vh <= BREAKPOINTS.phone) return `calc(100vh - 32px)`;
-    if (vh <= BREAKPOINTS.largePhone) return `calc(100vh - 64px)`;
-    if (vh <= BREAKPOINTS.tablet) return `calc(100vh - 96px)`;
-    return `${designPx}px`;
-  }
 }
 
 /* ------------------------------------------------------------------
@@ -221,6 +277,9 @@ export function watchViewport(listener: ViewportListener): () => void {
     const w = viewportWidth();
     const h = viewportHeight();
     const keyboardOpen = isSoftKeyboardOpen();
+    // 档位类每次 fire 都同步一次：宽度没变时是幂等的 6 次 classList 判断，成本可忽略；
+    // 好处是「别人刚把 body 类清掉（重挂载 / 主题重载）」时能自愈。
+    applyViewportTiers(w);
     if (w === lastW && h === lastH && keyboardOpen === lastKeyboard) return;
     lastW = w;
     lastH = h;

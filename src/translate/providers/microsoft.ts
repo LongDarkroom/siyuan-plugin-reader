@@ -8,6 +8,7 @@
  * - 批量：请求体为 [{Text}, ...]，响应为 [{translations:[{text}]}, ...]。
  */
 import type { Translator, TranslateRequest } from "../types.ts";
+import { postJson } from "./proxy-post.ts";
 
 export class MicrosoftTranslator implements Translator {
   readonly name = "microsoft" as const;
@@ -36,22 +37,26 @@ export class MicrosoftTranslator implements Translator {
     const url = `https://api.cognitive.microsofttranslator.com/translate?${params.toString()}`;
     const body = req.texts.map((t) => ({ Text: t }));
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
+    // 2026-11-19 P2-11：直连 fetch → postJson（先内核转发、再回落直连）。
+    // 企业内网 / 移动 WebView 下直连 Azure 端点会被 CORS 或混合内容挡掉。
+    const r = await postJson(
+      url,
+      {
         "Ocp-Apim-Subscription-Key": this.key,
         "Ocp-Apim-Subscription-Region": this.region,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(body),
-    });
-
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      throw new Error(`Microsoft Translator 请求失败 (${res.status}): ${txt.slice(0, 200)}`);
+      JSON.stringify(body),
+    );
+    if (r.status === 0) {
+      throw new Error(`Microsoft Translator 网络请求失败：${r.text.slice(0, 200)}`);
     }
 
-    const data = (await res.json()) as Array<{ translations?: Array<{ text?: string }> }>;
+    if (r.status < 200 || r.status >= 300) {
+      throw new Error(`Microsoft Translator 请求失败 (${r.status}): ${r.text.slice(0, 200)}`);
+    }
+
+    const data = JSON.parse(r.text) as Array<{ translations?: Array<{ text?: string }> }>;
     if (!Array.isArray(data)) throw new Error("Microsoft Translator 响应格式异常");
 
     return data.map((d) => d?.translations?.[0]?.text ?? "");

@@ -2016,13 +2016,15 @@
     outline-offset: 1px;
   }
 
-  @media (max-width: 720px) {
-    .ai-set-overlay {
+  /* 2026-11-19 P2-3：原 `@media (max-width:720px)`。面板挂在 body 上（不在阅读器子树里），
+     改用 responsive.ts 投射到 body 的档位类 re-w720（真源 BREAKPOINTS.dialogDrawer）。
+     与 bookshelf 的 re-w600 同一套机制，不要再用宽度媒体查询。 */
+    :global(body.re-w720) .ai-set-overlay {
       padding: 0;
       align-items: stretch;
     }
 
-    .ai-set-dialog {
+    :global(body.re-w720) .ai-set-dialog {
       width: 100vw;
       height: 100dvh;
       max-height: 100dvh;
@@ -2031,12 +2033,12 @@
       border-right: 0;
     }
 
-    .ai-set-body {
+    :global(body.re-w720) .ai-set-body {
       grid-template-columns: 1fr;
       grid-template-rows: auto minmax(0, 1fr);
     }
 
-    .ai-set-nav {
+    :global(body.re-w720) .ai-set-nav {
       flex-direction: row;
       gap: 6px;
       padding: 8px 10px;
@@ -2046,49 +2048,48 @@
       overflow-y: hidden;
     }
 
-    .ai-set-nav-item {
+    :global(body.re-w720) .ai-set-nav-item {
       width: auto;
       flex: 0 0 auto;
       align-items: center;
       padding: 7px 10px;
     }
 
-    .ai-set-nav-item.on {
+    :global(body.re-w720) .ai-set-nav-item.on {
       box-shadow: inset 0 -2px 0 var(--set-accent-strong);
     }
 
     .ai-set-nav-hint,
-    .ai-set-nav-foot {
+    :global(body.re-w720) .ai-set-nav-foot {
       display: none;
     }
 
-    .ai-set-content {
+    :global(body.re-w720) .ai-set-content {
       padding: 16px 16px 20px;
     }
 
-    .ai-set-grid2 {
+    :global(body.re-w720) .ai-set-grid2 {
       grid-template-columns: 1fr;
       gap: 0;
     }
 
-    .ai-set-hd {
+    :global(body.re-w720) .ai-set-hd {
       padding: 12px 12px 10px 14px;
     }
 
-    .ai-set-ft {
+    :global(body.re-w720) .ai-set-ft {
       flex-wrap: wrap;
       padding: 9px 14px;
     }
 
-    .ai-set-status {
+    :global(body.re-w720) .ai-set-status {
       flex-basis: 100%;
     }
 
-    .ai-set-actions {
+    :global(body.re-w720) .ai-set-actions {
       width: 100%;
       justify-content: flex-end;
     }
-  }
 
   @media (prefers-reduced-motion: reduce) {
     .ai-set-dialog,

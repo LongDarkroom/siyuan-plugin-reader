@@ -129,9 +129,8 @@
         }
         const btn = menuEl?.querySelectorAll(".shelf-menu-item")[idx] as HTMLElement | undefined;
         if (btn) {
-          const tr = btn.getBoundingClientRect();
           openSubmenuIdx = idx;
-          submenuPos = { x: clampSubmenuX(tr.right + 2), y: tr.top };
+          void positionSubmenu(btn.getBoundingClientRect());
         }
       }
       return;
@@ -145,16 +144,48 @@
     return Math.max(4, Math.min(x, window.innerWidth - 186));
   }
 
+  /**
+   * 子菜单定位（2026-11-19 P2-12）。
+   *
+   * 桌面：父项右侧、同 top（原行为）。
+   * 底部 action sheet（body.re-w600）：父菜单已经是贴底全宽的 sheet，
+   * 「向右飞出」会跑出屏幕右侧、并且盖住父菜单的文字 ⇒ 改成**叠加在父菜单之上**
+   * （左对齐父菜单 + 12px 内缩），量一次实际高度后整体夹进视口。
+   * 之前的实现只把 `min-width` 改小、位置仍按桌面算，于是子菜单贴在父菜单右上角
+   * 并压住父菜单内容 —— 能用但视觉粗糙。
+   */
+  async function positionSubmenu(anchor: DOMRect) {
+    const sheet = document.body.classList.contains("re-w600");
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    if (!sheet) {
+      submenuPos = { x: clampSubmenuX(anchor.right + 2), y: anchor.top };
+      return;
+    }
+    const mr = menuEl?.getBoundingClientRect();
+    submenuPos = {
+      x: Math.max(8, Math.min((mr?.left ?? 8) + 12, vw - 8 - 186)),
+      y: anchor.top,
+    };
+    // 子菜单高度取决于条目数（颜色子菜单有 10+ 行），只能渲染后量一次再夹
+    await tick();
+    const sub = menuEl?.querySelector(".shelf-menu-submenu") as HTMLElement | null;
+    if (!sub) return;
+    const sr = sub.getBoundingClientRect();
+    const y = Math.min(Math.max(8, anchor.top), Math.max(8, vh - 8 - sr.height));
+    const x = Math.min(Math.max(8, submenuPos.x), Math.max(8, vw - 8 - sr.width));
+    submenuPos = { x, y };
+  }
+
   function onItemEnter(idx: number, item: MenuItem, e: MouseEvent) {
     if (!item.children?.length) {
       openSubmenuIdx = -1;
       return;
     }
     openSubmenuIdx = idx;
-    // 子菜单位置:菜单项右侧,垂直对齐
+    // 子菜单位置:菜单项右侧,垂直对齐（sheet 形态见 positionSubmenu）
     const t = e.currentTarget as HTMLElement;
-    const tr = t.getBoundingClientRect();
-    submenuPos = { x: clampSubmenuX(tr.right + 2), y: tr.top };
+    void positionSubmenu(t.getBoundingClientRect());
   }
 
   function onItemLeave(e: MouseEvent) {
@@ -325,20 +356,20 @@
   }
   /* 2026-10-24 移动端适配 Phase 4：手机上右键菜单（长按/⋯ 唤起）转为底部 action sheet。
      !important 压过 inline left/top（组件按点击点定位，手机上贴边易溢出）。 */
-  @media (max-width: 600px) {
-    .shelf-context-menu {
-      left: 8px !important;
-      right: 8px !important;
-      top: auto !important;
-      bottom: calc(12px + env(safe-area-inset-bottom, 0px)) !important;
-      max-width: none;
-    }
-    .shelf-menu-item {
-      min-height: 44px;
-    }
-    /* 底部 sheet 下子菜单改为叠加在父菜单上方，不再向右飞出屏幕 */
-    .shelf-menu-submenu {
-      min-width: 180px;
-    }
+  /* 2026-11-19 P2-3：原 `@media (max-width:600px)`。本菜单 use:portal 挂 body，
+     不在书架子树里 ⇒ 用 body 上的档位类 re-w600（唯一真源 BREAKPOINTS.largePhone）。 */
+  :global(body.re-w600) .shelf-context-menu {
+    left: 8px !important;
+    right: 8px !important;
+    top: auto !important;
+    bottom: calc(12px + env(safe-area-inset-bottom, 0px)) !important;
+    max-width: none;
+  }
+  :global(body.re-w600) .shelf-menu-item {
+    min-height: 44px;
+  }
+  /* 底部 sheet 下子菜单改为叠加在父菜单上方，不再向右飞出屏幕 */
+  :global(body.re-w600) .shelf-menu-submenu {
+    min-width: 180px;
   }
 </style>
