@@ -982,7 +982,9 @@ import { getLogger } from "../core/logger.ts";
   }
 
   function onContentImageContextMenu(e: Event): void {
-    // 移动端长按归系统的统一压制逻辑（core/native-menu.ts），不做自绘菜单
+    // 移动端不走这条路：触屏长按由 500ms 定时器（见 LONG_PRESS_MS 回调）弹同一份
+    // 自绘菜单，坐标用的是 touchstart 落点。若这里也接 contextmenu，
+    // Android 上长按会**同一次手势弹两次**（定位还不一致）。
     if (isMobile()) return;
     const ev = e as MouseEvent;
     const target = ev.target as Element | null;
@@ -2919,23 +2921,38 @@ import { getLogger } from "../core/logger.ts";
         if (longPressTimer) clearTimeout(longPressTimer);
         longPressTimer = setTimeout(() => {
           longPressTimer = null;
-          // [REword patch 2026-08-29] Phase 2 长按 500ms
-          // 已有选区 → 触发划词流程（mouseup 走 onContentMouseUp → selToolbar 弹出）
-          // 无选区 → 让系统默认长按选词菜单处理（iOS Safari / Android Chrome 自带）
+          /* 2026-11-19 移动端 P0 修复「长按什么都不发生」。
+           *
+           * 这里原来是**整段注释、零函数调用**，只写着「无选区就让系统菜单兜底」——
+           * 而 core/native-menu.ts 恰恰把系统菜单关掉了（contextmenu preventDefault +
+           * -webkit-touch-callout:none），两条手段一起 ⇒ 手机上长按只剩「浏览器自己
+           * 选词 + 我方 500ms 定时器空转」，图片的「复制 / 保存」彻底没有入口
+           * （onContentImageContextMenu 首行是 `if (isMobile()) return`）。
+           *
+           * 现在落地两条分支：
+           *  ① 若系统长按选词已完成（选区非折叠）→ 立刻让划词工具栏出现，
+           *     不必等用户抬手（原先要等 touchend 那条链）；
+           *  ② 若落点是图片 → 弹我方自绘菜单（复制图片 / 保存图片）。
+           *     ⚠️ 依赖 native-menu.ts 的压制生效：原生 callout 不会再来兜底，
+           *     所以这里不弹就等于完全没有。同时也不需要给压制开例外 ——
+           *     自绘菜单是 DOM 元素，与浏览器 UI 层的 callout 不是一层东西。
+           *  ③ 其余情况（正文文字、无选区）保持不动：系统选词手柄照常出现，
+           *     选区非折叠后由 touchend → scheduleReadSelection 接手。
+           */
           try {
             const sel = doc.getSelection?.();
             const text = sel && typeof sel.toString === "function" ? sel.toString().trim() : "";
             if (text && sel && !sel.isCollapsed) {
-              // 模拟 mouseup 事件触发 selToolbar
-              // 实际上 foliate 触屏的 mouseup 会被合成，这里直接用 selectionchange 已有路径
-              // 触发条件：选区非折叠且有内容
-              // selToolbar 通过 selectionchange 自动显示（已有逻辑）
-              // 长按此处的作用是"延长选区停留时间"让 selectionchange 完成
-              // 不需要额外动作
+              scheduleReadSelection();
+              return;
             }
-            // 无选区：让浏览器原生长按选词菜单弹出
-            // iOS Safari: long-press 触发 system selection toolbar
-            // Android Chrome: long-press 触发 text selection magnifier
+            const el = (doc as any).elementFromPoint?.(longPressStartX, longPressStartY) as Element | null;
+            const src = el && typeof (el as any).closest === "function" ? imageSrcFromTarget(el) : "";
+            if (src) {
+              // iframe 局部坐标 → 宿主窗口 client 坐标（菜单是 position:fixed 在宿主里）
+              const fr = (doc as any).defaultView?.frameElement?.getBoundingClientRect?.();
+              openImageContextMenu(src, longPressStartX + (fr?.left ?? 0), longPressStartY + (fr?.top ?? 0));
+            }
           } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · longPress", "debug"); }
         }, LONG_PRESS_MS);
       } else if (e.touches.length === 2) {

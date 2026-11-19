@@ -9,6 +9,8 @@
   import { viewport, isPhoneBreakpoint } from "../core/viewport-store.ts";
   // 2026-11-15：触屏设备判定 —— 决定是否启用 HTML5 拖拽（见下方 touchUI 注释）
   import { isTouchDevice } from "../core/env.ts";
+  // 2026-11-19 动画：首帧判断手机断点用（常驻侧栏不能再靠 onMount 事后收）
+  import { BREAKPOINTS, viewportWidth } from "../core/responsive.ts";
   import type {
     BookshelfStore,
     BookMeta,
@@ -107,6 +109,10 @@
   let lpFired = false;
   function onCardTouchStart(e: TouchEvent, items: MenuItem[]) {
     if (!isPhoneBp) return;
+    // 2026-11-19：输入框里的长按不弹菜单 —— 分组重命名输入框挂在分组行内部，
+    // 按住 550ms 会把菜单弹到正在编辑的输入框上（光标/选区全被盖住）。
+    const tag = (e.target as Element | null)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") return;
     if (lpTimer) clearTimeout(lpTimer);
     lpFired = false;
     const x = e.touches[0]?.clientX ?? 0;
@@ -147,7 +153,37 @@
   let viewMode: "grid" | "list" = "grid";
   let sortKey: BookSortKey = "lastRead";
   let sortDir: SortDir = "desc";
-  let sidebarOpen = true;
+
+  /**
+   * 2026-11-19 动画：首帧就要把「分组栏开/关」定死。
+   *
+   * 分组栏从「{#if} 挂载/卸载」改成了「常驻 DOM + 宽度过渡」，
+   * 于是「首帧状态不对」不再是「闪一下就没」，而是**当着用户的面播一遍收起动画**。
+   * 所以这里同步读一次 localStorage（手机端是 overlay 抽屉，直接定成收起），
+   * 首帧即最终状态，动画只在用户主动点击时出现。
+   */
+  function readSidebarOpenPref(): boolean {
+    try {
+      // 手机端是 overlay 抽屉，默认收起（桌面才记忆上次的开合）
+      if (viewportWidth() <= BREAKPOINTS.largePhone) return false;
+      const raw = localStorage.getItem(UI_KEY);
+      if (!raw) return true;
+      const p = JSON.parse(raw);
+      return typeof p.sidebarOpen === "boolean" ? p.sidebarOpen : true;
+    } catch {
+      return true;
+    }
+  }
+  let sidebarOpen = readSidebarOpenPref();
+
+  /**
+   * 2026-11-19 动画：首帧之前关掉所有过渡（根节点挂 .no-anim）。
+   *
+   * 组件初始化时有一批「读偏好 → 改状态」的动作（视图模式、排序、分组栏开合……），
+   * 它们在首帧之后才落到 DOM 上。没有这道闸，它们会**在用户眼前播一遍动画**，
+   * 看起来像界面自己动了一下。首帧画完再开闸。
+   */
+  let animReady = false;
 
   /**
    * 侧栏宽度（可拖拽）。上限不是常量：拖到主区放不下卡片没有意义，
@@ -1354,6 +1390,9 @@
     loadUiPrefs();
     // 2026-10-24 移动端适配 Phase 3：手机端分组侧栏是 overlay 抽屉，默认收起（桌面保持记忆值）
     if (isPhoneBreakpoint($viewport.breakpoint)) sidebarOpen = false;
+    // 2026-11-19 动画：首帧画完再开动画闸。
+    // 双 rAF —— 单个 rAF 仍在同一帧的绘制之前，那时撤闸等于没撤。
+    requestAnimationFrame(() => requestAnimationFrame(() => (animReady = true)));
     void refresh();
     unsubStore = store.subscribe((list) => {
       if (!Array.isArray(list)) return;
@@ -1477,6 +1516,7 @@
 <div
   class="bookshelf-view"
   class:dragging
+  class:no-anim={!animReady}
   class:re-phone={$viewport.breakpoint === "phone"}
   class:re-large-phone={$viewport.breakpoint === "largePhone"}
   class:re-tablet={$viewport.breakpoint === "tablet"}
@@ -1488,7 +1528,7 @@
 >
   <div class="bookshelf-header">
     <button
-      class="shelf-icon-btn"
+      class="shelf-icon-btn shelf-sb-toggle-btn"
       class:active={sidebarOpen}
       title={sidebarOpen ? t("收起分组栏") : t("展开分组栏")}
       on:click={toggleSidebar}
@@ -1574,7 +1614,7 @@
       title={sortDir === "desc" ? t("当前：降序（点击切升序）") : t("当前：升序（点击切降序）")}
       on:click={toggleSortDir}
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html sortDir === "desc" ? SEL_ICONS.sortDesc : SEL_ICONS.sortAsc}</span></button>
-    <div class="shelf-view-toggle">
+    <div class="shelf-view-toggle" data-view={viewMode}>
       <button
         class="shelf-icon-btn"
         class:active={viewMode === "grid"}
@@ -1690,12 +1730,26 @@
     bind:this={shelfBodyEl}
   >
     <!-- 2026-10-24 移动端适配 Phase 3：手机端分组侧栏是 overlay 抽屉，补一块可点击的遮罩 -->
-    {#if sidebarOpen && isPhoneBp}
-      <div class="shelf-sb-backdrop" on:click={() => (sidebarOpen = false)}></div>
+    <!-- 2026-11-19 动画：遮罩常驻 DOM，靠 opacity 淡入淡出（收起时不是「啪」地消失，
+         而是跟着抽屉一起退场）。
+         ⚠️ 条件用 `breakpoint === "phone"` 而不是 `isPhoneBp`：
+         抽屉样式（position:absolute）只挂在 `.re-phone` 上，而 isPhoneBp 覆盖到
+         600px（largePhone）。两者不一致时，遮罩会在 largePhone 上盖住整屏
+         —— 那时侧栏其实是内联布局（不是抽屉），根本不需要遮罩。
+         这是本次动效改造顺手修掉的一个老 bug。 -->
+    {#if $viewport.breakpoint === "phone"}
+      <div class="shelf-sb-backdrop" class:on={sidebarOpen} on:click={() => (sidebarOpen = false)}></div>
     {/if}
-    {#if sidebarOpen}
-      <!-- [2026-08-29] P1 分组侧栏：用户分组 + 智能分组（状态/标签/格式） -->
-      <aside class="shelf-sidebar" style="width:{sideWidth}px">
+    <!-- [2026-08-29] P1 分组侧栏：用户分组 + 智能分组（状态/标签/格式） -->
+    <!-- 2026-11-19 动画：侧栏常驻 DOM（不再用 {#if} 卸载），收起靠 width 过渡；
+         内层 .shelf-sb-inner 固定宽度，避免收起过程中文字被压扁换行。 -->
+    <aside
+      class="shelf-sidebar"
+      class:collapsed={!sidebarOpen}
+      style="--side-w:{sideWidth}px"
+      inert={!sidebarOpen}
+    >
+      <div class="shelf-sb-inner">
         <div class="shelf-sb-block">
           <button
             class="shelf-sb-item"
@@ -1752,6 +1806,10 @@
           </div>
           {#if !collapsed.groups}
             {#each facets.groups as g (g.id)}
+              <!-- 2026-11-19 移动端 P0：分组行补触屏长按 + 常显 ⋯（.shelf-sb-more）。
+                   触屏**不产生 contextmenu**（iOS 完全没有，Android 只有部分场景），
+                   双击又被系统双击缩放抢走 ⇒ 手机上「给分组改名 / 改色 / 删分组」
+                   之前完全没有入口。长按逻辑与书卡完全同源（onCardTouchStart 550ms）。 -->
               <div
                 class="shelf-sb-item shelf-sb-group"
                 class:active={filterGroup === g.id}
@@ -1765,6 +1823,10 @@
                 on:dblclick={() => startRenameGroup(g)}
                 on:keydown={(e) => (e.key === "Enter" || e.key === " ") && renamingGroupId !== g.id && pickGroup(g.id)}
                 on:contextmenu={(e) => openCtxMenu(e, buildGroupMenu(g))}
+                on:touchstart={(e) => onCardTouchStart(e, buildGroupMenu(g))}
+                on:touchmove|passive={onCardTouchMove}
+                on:touchend={onCardTouchEnd}
+                on:touchcancel={onCardTouchEnd}
                 on:dragover={(e) => onGroupDragOver(e, g.id)}
                 on:dragleave={() => onGroupDragLeave(g.id)}
                 on:drop={(e) => onGroupDrop(e, g.id)}
@@ -1811,6 +1873,14 @@
                   ></span>
                   <span class="shelf-sb-label"><span class="reword-shelf-ico reword-shelf-ico--sm reword-shelf-ico--t">{@html SEL_ICONS.group}</span>{g.name}</span>
                   <span class="shelf-sb-num">{g.count}</span>
+                  <!-- 2026-11-19 移动端 P0：触屏唯一可见入口（仅 re-phone / re-large-phone 显示）。
+                       菜单内容与右键同一份 buildGroupMenu：重命名 / 颜色 / 打开 / 复制组名 / 删除。 -->
+                  <button
+                    type="button"
+                    class="shelf-sb-more"
+                    title={t("更多操作")}
+                    on:click|stopPropagation={(e) => openCtxMenu(e, buildGroupMenu(g))}
+                  >⋯</button>
                   <!-- [2026-08-29] P2:悬停显示重命名 + 颜色 popover 入口 -->
                   <button
                     type="button"
@@ -1920,38 +1990,38 @@
             {/if}
           </div>
         {/if}
-      </aside>
-      <!-- 侧栏右边那条线就是把手：横拖改宽度，双击恢复默认 -->
-      <!-- svelte-ignore a11y-no-noninteractive-element-interactions a11y-no-noninteractive-tabindex
-           ARIA 1.2 里「可聚焦的分隔条」就是 role=separator + aria-valuenow + 方向键，
-           svelte-check 的角色表还不认这一条，所以两条 a11y 警告是误报。 -->
-      <div
-        class="shelf-side-resizer"
-        class:resizing={sideResizing}
-        role="separator"
-        aria-orientation="vertical"
-        aria-label={t("侧栏宽度")}
-        aria-valuenow={sideWidth}
-        aria-valuemin={SIDE_W_MIN}
-        aria-valuemax={SIDE_W_MAX}
-        tabindex="0"
-        title={t("拖动调整侧栏宽度，双击恢复默认")}
-        on:pointerdown={sideResizeStart}
-        on:pointermove={sideResizeMove}
-        on:pointerup={sideResizeEnd}
-        on:pointercancel={sideResizeEnd}
-        on:keydown={sideResizeKey}
-        on:dblclick={sideResizeReset}
-      ></div>
-    {/if}
+      </div>
+    </aside>
+    <!-- 侧栏右边那条线就是把手：横拖改宽度，双击恢复默认 -->
+    <!-- svelte-ignore a11y-no-noninteractive-element-interactions a11y-no-noninteractive-tabindex
+         ARIA 1.2 里「可聚焦的分隔条」就是 role=separator + aria-valuenow + 方向键，
+         svelte-check 的角色表还不认这一条，所以两条 a11y 警告是误报。 -->
+    <div
+      class="shelf-side-resizer"
+      class:resizing={sideResizing}
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={t("侧栏宽度")}
+      aria-valuenow={sideWidth}
+      aria-valuemin={SIDE_W_MIN}
+      aria-valuemax={SIDE_W_MAX}
+      tabindex="0"
+      title={t("拖动调整侧栏宽度，双击恢复默认")}
+      on:pointerdown={sideResizeStart}
+      on:pointermove={sideResizeMove}
+      on:pointerup={sideResizeEnd}
+      on:pointercancel={sideResizeEnd}
+      on:keydown={sideResizeKey}
+      on:dblclick={sideResizeReset}
+    ></div>
 
     <div class="shelf-main">
       <!-- [2026-10-11 B2] 生效筛选摘要：每颗胶囊一个 ✕ 只清自己，右侧「清除全部」。
            数据来自 activeFilters 派生数组，这里不做任何状态判断 —— 加筛选条件时只改那一处。 -->
       {#if hasFilter && books.length > 0}
         <div class="shelf-chips">
-          {#each activeFilters as f (f.key)}
-            <span class="shelf-chip">
+          {#each activeFilters as f, fi (f.key)}
+            <span class="shelf-chip" style="--i:{fi}">
               <span class="reword-shelf-ico reword-shelf-ico--xs reword-shelf-ico--t">{@html f.icon}</span>
               <span class="shelf-chip-label" title={f.label}>{f.label}</span>
               <button class="shelf-chip-x" title={t("清除")} on:click={f.clear}
@@ -1960,257 +2030,259 @@
           {/each}
           <button class="shelf-chips-clear" title={t("清除全部筛选")} on:click={clearFilters}>{t("清除全部")}</button>
         </div>
-      {/if}
+        {/if}
 
-      {#if books.length === 0}
-        <div class="bookshelf-empty">
-          <!-- 2026-10-11 B3：空态不再是纯文字 —— 32px 图形（与拖拽遮罩同一枚）先把视线接住 -->
-          <div class="bookshelf-empty-icon reword-shelf-ico reword-shelf-ico--xl">{@html SEL_ICONS.dropImport}</div>
-          <div class="bookshelf-empty-title">{t("书架是空的")}</div>
-          <div class="bookshelf-empty-hint">{t("支持 EPUB / MOBI / AZW3 / FB2 / CBZ / PDF / TXT / Markdown")}</div>
-          <div class="bookshelf-empty-hint">{t("直接拖拽文件到这里，或点击下方按钮")}</div>
-          <button class="bookshelf-import-btn" on:click={() => fileInput?.click()}>{t("导入第一本书")}</button>
-        </div>
-      {:else if visible.length === 0}
-        <div class="bookshelf-empty">
-          <div class="bookshelf-empty-title">{t("没有匹配的书籍")}</div>
-          <div class="bookshelf-empty-hint">{t("试着换个关键词，或清除筛选条件")}</div>
-          <button class="bookshelf-import-btn" on:click={clearFilters}>{t("清除筛选")}</button>
-        </div>
-      {:else if viewMode === "grid"}
-        <div class="bookshelf-grid">
-          {#each visible as book (book.id)}
-            <div
-              class="book-card"
-              class:selected={selectedIds.includes(book.id)}
-              draggable={!touchUI}
-              on:dragstart={(e) => onBookDragStart(e, book.id)}
-              on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
-              on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
-              on:touchmove|passive={onCardTouchMove}
-              on:touchend={onCardTouchEnd}
-              on:touchcancel={onCardTouchEnd}
-            >
-              <div class="book-cover-wrap">
-                <button
-                  class="book-cover"
-                  on:click={() => (selectMode ? toggleSelect(book.id) : onOpen(book.id))}
-                >
-                  {#if coverUrls[book.id]}
-                    <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
-                  {:else}
-                    <span class="book-cover-text">{book.title.slice(0, 2)}</span>
-                  {/if}
-                </button>
-                {#if selectMode}
+        {#if books.length === 0}
+          <div class="bookshelf-empty">
+            <!-- 2026-10-11 B3：空态不再是纯文字 —— 32px 图形（与拖拽遮罩同一枚）先把视线接住 -->
+            <div class="bookshelf-empty-icon reword-shelf-ico reword-shelf-ico--xl">{@html SEL_ICONS.dropImport}</div>
+            <div class="bookshelf-empty-title">{t("书架是空的")}</div>
+            <div class="bookshelf-empty-hint">{t("支持 EPUB / MOBI / AZW3 / FB2 / CBZ / PDF / TXT / Markdown")}</div>
+            <div class="bookshelf-empty-hint">{t("直接拖拽文件到这里，或点击下方按钮")}</div>
+            <button class="bookshelf-import-btn" on:click={() => fileInput?.click()}>{t("导入第一本书")}</button>
+          </div>
+        {:else if visible.length === 0}
+          <div class="bookshelf-empty">
+            <div class="bookshelf-empty-title">{t("没有匹配的书籍")}</div>
+            <div class="bookshelf-empty-hint">{t("试着换个关键词，或清除筛选条件")}</div>
+            <button class="bookshelf-import-btn" on:click={clearFilters}>{t("清除筛选")}</button>
+          </div>
+        {:else if viewMode === "grid"}
+          <div class="bookshelf-grid">
+            {#each visible as book, bi (book.id)}
+              <div
+                class="book-card"
+                class:selected={selectedIds.includes(book.id)}
+                style="--i:{bi < 18 ? bi : 18}"
+                draggable={!touchUI}
+                on:dragstart={(e) => onBookDragStart(e, book.id)}
+                on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
+                on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
+                on:touchmove|passive={onCardTouchMove}
+                on:touchend={onCardTouchEnd}
+                on:touchcancel={onCardTouchEnd}
+              >
+                <div class="book-cover-wrap">
                   <button
-                    class="book-sel"
-                    class:on={selectedIds.includes(book.id)}
-                    title={t("选择")}
-                    on:click|stopPropagation={() => toggleSelect(book.id)}
-                  >{#if selectedIds.includes(book.id)}<span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.confirm}</span>{/if}</button>
-                {/if}
-                <!-- [2026-08-29] P2:封面右上色点(hover 显示色名 tooltip)
-                     2026-10-11 B1：右上角整块让给收藏星，色点移左下 -->
-                {#if book.color}
-                  <span
-                    class="book-color-dot"
-                    style="--swatch-color: {BOOK_COLORS.find((c) => c.token === book.color)?.hex}"
-                    title={t("颜色: {c}", { c: colorLabel(book.color) })}
-                  ></span>
-                {/if}
-                <button
-                  class="book-fav"
-                  class:on={book.favorite}
-                  title={book.favorite ? t("取消收藏") : t("收藏")}
-                  on:click|stopPropagation={() => toggleFav(book)}
-                ><span class="reword-shelf-ico reword-shelf-ico--sm{book.favorite ? ' reword-shelf-ico--fill' : ''}">{@html SEL_ICONS.fav}</span></button>
-                <!-- 2026-10-24 移动端适配 Phase 3：触屏操作入口（hover 浮层/右键在手机不可达）。
-                     仅 re-phone 显示（默认 display:none），弹出与右键同一份菜单。 -->
-                <button
-                  class="book-more-btn"
-                  title={t("更多操作")}
-                  on:click|stopPropagation={(e) => openCtxMenu(e, buildBookMenu(book))}
-                >⋯</button>
-                <!-- 2026-08-29 优化：操作按钮收纳到封面悬停层，卡片信息更简洁 -->
-                <div
-                  class="book-cover-overlay"
-                  aria-hidden="true"
-                  on:click={() => onOpen(book.id)}
-                >
-                  <button
-                    class="book-overlay-primary"
-                    title={book.progress?.fraction ? t("继续阅读") : t("开始阅读")}
-                    on:click|stopPropagation={() => onOpen(book.id)}
+                    class="book-cover"
+                    on:click={() => (selectMode ? toggleSelect(book.id) : onOpen(book.id))}
                   >
+                    {#if coverUrls[book.id]}
+                      <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
+                    {:else}
+                      <span class="book-cover-text">{book.title.slice(0, 2)}</span>
+                    {/if}
+                  </button>
+                  {#if selectMode}
+                    <button
+                      class="book-sel"
+                      class:on={selectedIds.includes(book.id)}
+                      title={t("选择")}
+                      on:click|stopPropagation={() => toggleSelect(book.id)}
+                    >{#if selectedIds.includes(book.id)}<span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.confirm}</span>{/if}</button>
+                  {/if}
+                  <!-- [2026-08-29] P2:封面右上色点(hover 显示色名 tooltip)
+                       2026-10-11 B1：右上角整块让给收藏星，色点移左下 -->
+                  {#if book.color}
+                    <span
+                      class="book-color-dot"
+                      style="--swatch-color: {BOOK_COLORS.find((c) => c.token === book.color)?.hex}"
+                      title={t("颜色: {c}", { c: colorLabel(book.color) })}
+                    ></span>
+                  {/if}
+                  <button
+                    class="book-fav"
+                    class:on={book.favorite}
+                    title={book.favorite ? t("取消收藏") : t("收藏")}
+                    on:click|stopPropagation={() => toggleFav(book)}
+                  ><span class="reword-shelf-ico reword-shelf-ico--sm{book.favorite ? ' reword-shelf-ico--fill' : ''}">{@html SEL_ICONS.fav}</span></button>
+                  <!-- 2026-10-24 移动端适配 Phase 3：触屏操作入口（hover 浮层/右键在手机不可达）。
+                       仅 re-phone 显示（默认 display:none），弹出与右键同一份菜单。 -->
+                  <button
+                    class="book-more-btn"
+                    title={t("更多操作")}
+                    on:click|stopPropagation={(e) => openCtxMenu(e, buildBookMenu(book))}
+                  >⋯</button>
+                  <!-- 2026-08-29 优化：操作按钮收纳到封面悬停层，卡片信息更简洁 -->
+                  <div
+                    class="book-cover-overlay"
+                    aria-hidden="true"
+                    on:click={() => onOpen(book.id)}
+                  >
+                    <button
+                      class="book-overlay-primary"
+                      title={book.progress?.fraction ? t("继续阅读") : t("开始阅读")}
+                      on:click|stopPropagation={() => onOpen(book.id)}
+                    >
+                      {book.progress?.fraction ? t("续读") : t("开始")}
+                    </button>
+                    <div class="book-overlay-tools">
+                      <button
+                        class="book-icon-btn"
+                        title={t("编辑书籍信息")}
+                        on:click|stopPropagation={() => openEdit(book)}
+                      ><span class="reword-shelf-ico">{@html SEL_ICONS.edit}</span></button>
+                      <button
+                        class="book-icon-btn danger"
+                        title={t("从书架删除")}
+                        on:click|stopPropagation={() => openRemove(book)}
+                      ><span class="reword-shelf-ico">{@html SEL_ICONS.trash}</span></button>
+                    </div>
+                  </div>
+                </div>
+                <div class="book-info">
+                  <div class="book-name" title={book.title}>{book.title}</div>
+                  <!-- 2026-10-13 改版：文字区收成两行（对齐参考网格）—— 书名一行 + 状态行：
+                       读完 = 绿钉，其余只显示进度（未读 / xx%）。作者、格式、状态胶囊不再是
+                       卡片常驻文字；状态改档走列表视图的胶囊与编辑弹窗，笔记目标重绑仍在右键菜单。 -->
+                  <div class="book-sub">
+                    {#if book.status === "finished"}
+                      <span class="book-done">{t("读完")}</span>
+                    {:else}
+                      <span class="book-progress">{fmtPct(book.progress?.fraction)}</span>
+                    {/if}
+                    <!-- 2026-10-09：已绑定笔记发送目标的角标。
+                         **只显示已绑定** —— 未绑定不做灰色警告，
+                         否则整架书都是灰标，等于在报"你还没配置"，压迫感很强。
+                         刻意不可点：它只是状态标识，点它去设置反而要再写一套弹窗。
+                         2026-10-13 改版：从 meta 行收进 sub 行、右对齐（meta 行已下线）。 -->
+                    {#if book.notebookTarget?.docId}
+                      <span
+                        class="book-note-target"
+                        title={t("笔记发送到：{doc}", { doc: book.notebookTarget.docTitle || book.notebookTarget.docId })}
+                      ><span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.noteBound}</span></span>
+                    {/if}
+                  </div>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {:else}
+          <!-- [2026-08-29] P0 列表视图：一行看全信息 -->
+          <!-- 2026-10-11 B3：改固定列栅格（demo 的八列模板）。
+               表头把列义讲清楚 —— 之前每行都是「·」串起来的散句，列与列对不齐，
+               同一屏里找「阅读时长」得逐行扫。 -->
+          <div class="shelf-list">
+            <div class="shelf-lhead" aria-hidden="true">
+              <span></span>
+              <span class="lh-title">{t("书名")}</span>
+              <span class="lh-author">{t("作者")}</span>
+              <span class="lh-format">{t("格式")}</span>
+              <span class="lh-progress">{t("进度")}</span>
+              <span class="lh-time">{t("阅读时长")}</span>
+              <span class="lh-lastread">{t("最近阅读")}</span>
+              <span></span>
+            </div>
+            {#each visible as book, idx (book.id)}
+              <div
+                class="shelf-row"
+                class:focused={rowFocusIdx === idx}
+                data-idx={idx}
+                class:selected={selectedIds.includes(book.id)}
+                style="--i:{idx < 18 ? idx : 18}"
+                draggable={!touchUI}
+                on:dragstart={(e) => onBookDragStart(e, book.id)}
+                on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
+                on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
+                on:touchmove|passive={onCardTouchMove}
+                on:touchend={onCardTouchEnd}
+                on:touchcancel={onCardTouchEnd}
+              >
+                <!-- 第 1 列：多选时是勾选框，否则是色点（同一格，列数不随模式变） -->
+                <div class="row-lead">
+                  {#if selectMode}
+                    <button
+                      class="row-sel"
+                      class:on={selectedIds.includes(book.id)}
+                      title={t("选择")}
+                      on:click={() => toggleSelect(book.id)}
+                    >{#if selectedIds.includes(book.id)}<span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.confirm}</span>{/if}</button>
+                  {:else if book.color}
+                    <span
+                      class="row-color-dot"
+                      style="--swatch-color: {BOOK_COLORS.find((c) => c.token === book.color)?.hex}"
+                      title={t("颜色: {c}", { c: colorLabel(book.color) })}
+                    ></span>
+                  {/if}
+                </div>
+                <!-- 第 2 列「书名」：小封面 + 标题行 + 副行（分组/大小/标签） -->
+                <div class="row-title-line">
+                  <button class="row-cover" title={book.title} on:click={() => onOpen(book.id)}>
+                    {#if coverUrls[book.id]}
+                      <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
+                    {:else}
+                      <span class="row-cover-text">{book.title.slice(0, 1)}</span>
+                    {/if}
+                  </button>
+                  <div class="row-titlecol">
+                    <div class="row-title-row">
+                      <span class="row-title" title={book.title}>{book.title}</span>
+                      <button
+                        class="row-status-chip"
+                        class:reading={(book.status ?? "unread") === "reading"}
+                        class:done={book.status === "finished"}
+                        title={t("点击切换阅读状态")}
+                        on:click={() => cycleStatus(book)}
+                      >{statusLabel(book.status)}</button>
+                      {#if book.favorite}<span class="row-fav" title={t("收藏")}><span class="reword-shelf-ico reword-shelf-ico--xs reword-shelf-ico--fill">{@html SEL_ICONS.fav}</span></span>{/if}
+                    </div>
+                    <div class="row-sub">
+                      <!-- [2026-08-29] P2:组 chip(放最前) -->
+                      {#if book.groupId}
+                        {@const g = facets.groups.find((x) => x.id === book.groupId)}
+                        {#if g}
+                          <span class="row-group-chip" title={t("分组")}>
+                            {#if g.color}<span
+                              class="row-group-dot"
+                              style="--swatch-color: {BOOK_COLORS.find((c) => c.token === g.color)?.hex}"
+                            ></span>{/if}<span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.group}</span>{g.name}
+                          </span>
+                          <span class="row-dot">·</span>
+                        {/if}
+                      {/if}
+                      <span>{fmtSize(book.size)}</span>
+                      {#if book.tags?.length}
+                        <span class="row-tag-chips">
+                          {#each book.tags.slice(0, 2) as t}
+                            <span class="row-tag">{t}</span>
+                          {/each}
+                          {#if book.tags.length > 2}
+                            <span class="row-tag more">+{book.tags.length - 2}</span>
+                          {/if}
+                        </span>
+                      {/if}
+                    </div>
+                  </div>
+                </div>
+                <span class="row-author" title={book.author || ""}>{book.author || t("未知作者")}</span>
+                <span class="row-formatcell">{book.format.toUpperCase()}</span>
+                <!-- 进度列只放条：62px 里再塞百分比会两边都读不清，精确值挂 title -->
+                <span class="row-pbar" title={fmtPct(book.progress?.fraction)}
+                  ><i style="width: {Math.round((book.progress?.fraction ?? 0) * 100)}%"></i></span
+                >
+                <span class="row-time">{fmtTime(book.readingTimeMs) || "—"}</span>
+                <!-- 缺「最近阅读」显示 —，不退化成「添加时间」也不显示 0 -->
+                <span class="row-lastread">{fmtDate(book.lastReadAt) || "—"}</span>
+                <div class="row-actions">
+                  <button class="row-btn primary" on:click={() => onOpen(book.id)}>
                     {book.progress?.fraction ? t("续读") : t("开始")}
                   </button>
-                  <div class="book-overlay-tools">
-                    <button
-                      class="book-icon-btn"
-                      title={t("编辑书籍信息")}
-                      on:click|stopPropagation={() => openEdit(book)}
-                    ><span class="reword-shelf-ico">{@html SEL_ICONS.edit}</span></button>
-                    <button
-                      class="book-icon-btn danger"
-                      title={t("从书架删除")}
-                      on:click|stopPropagation={() => openRemove(book)}
-                    ><span class="reword-shelf-ico">{@html SEL_ICONS.trash}</span></button>
+                  <div class="row-actions-extra" aria-hidden="true">
+                    <button class="row-icon-btn" title={t("编辑")} on:click={() => openEdit(book)}><span class="reword-shelf-ico">{@html SEL_ICONS.edit}</span></button>
+                    <button class="row-icon-btn danger" title={t("删除")} on:click={() => openRemove(book)}><span class="reword-shelf-ico">{@html SEL_ICONS.trash}</span></button>
                   </div>
-                </div>
-              </div>
-              <div class="book-info">
-                <div class="book-name" title={book.title}>{book.title}</div>
-                <!-- 2026-10-13 改版：文字区收成两行（对齐参考网格）—— 书名一行 + 状态行：
-                     读完 = 绿钉，其余只显示进度（未读 / xx%）。作者、格式、状态胶囊不再是
-                     卡片常驻文字；状态改档走列表视图的胶囊与编辑弹窗，笔记目标重绑仍在右键菜单。 -->
-                <div class="book-sub">
-                  {#if book.status === "finished"}
-                    <span class="book-done">{t("读完")}</span>
-                  {:else}
-                    <span class="book-progress">{fmtPct(book.progress?.fraction)}</span>
-                  {/if}
-                  <!-- 2026-10-09：已绑定笔记发送目标的角标。
-                       **只显示已绑定** —— 未绑定不做灰色警告，
-                       否则整架书都是灰标，等于在报"你还没配置"，压迫感很强。
-                       刻意不可点：它只是状态标识，点它去设置反而要再写一套弹窗。
-                       2026-10-13 改版：从 meta 行收进 sub 行、右对齐（meta 行已下线）。 -->
-                  {#if book.notebookTarget?.docId}
-                    <span
-                      class="book-note-target"
-                      title={t("笔记发送到：{doc}", { doc: book.notebookTarget.docTitle || book.notebookTarget.docId })}
-                    ><span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.noteBound}</span></span>
-                  {/if}
-                </div>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {:else}
-        <!-- [2026-08-29] P0 列表视图：一行看全信息 -->
-        <!-- 2026-10-11 B3：改固定列栅格（demo 的八列模板）。
-             表头把列义讲清楚 —— 之前每行都是「·」串起来的散句，列与列对不齐，
-             同一屏里找「阅读时长」得逐行扫。 -->
-        <div class="shelf-list">
-          <div class="shelf-lhead" aria-hidden="true">
-            <span></span>
-            <span class="lh-title">{t("书名")}</span>
-            <span class="lh-author">{t("作者")}</span>
-            <span class="lh-format">{t("格式")}</span>
-            <span class="lh-progress">{t("进度")}</span>
-            <span class="lh-time">{t("阅读时长")}</span>
-            <span class="lh-lastread">{t("最近阅读")}</span>
-            <span></span>
-          </div>
-          {#each visible as book, idx (book.id)}
-            <div
-              class="shelf-row"
-              class:focused={rowFocusIdx === idx}
-              data-idx={idx}
-              class:selected={selectedIds.includes(book.id)}
-              draggable={!touchUI}
-              on:dragstart={(e) => onBookDragStart(e, book.id)}
-              on:contextmenu={(e) => openCtxMenu(e, buildBookMenu(book))}
-              on:touchstart={(e) => onCardTouchStart(e, buildBookMenu(book))}
-              on:touchmove|passive={onCardTouchMove}
-              on:touchend={onCardTouchEnd}
-              on:touchcancel={onCardTouchEnd}
-            >
-              <!-- 第 1 列：多选时是勾选框，否则是色点（同一格，列数不随模式变） -->
-              <div class="row-lead">
-                {#if selectMode}
+                  <!-- 2026-10-24 移动端适配 Phase 3：触屏菜单入口（row-actions-extra 是 hover 显示） -->
                   <button
-                    class="row-sel"
-                    class:on={selectedIds.includes(book.id)}
-                    title={t("选择")}
-                    on:click={() => toggleSelect(book.id)}
-                  >{#if selectedIds.includes(book.id)}<span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.confirm}</span>{/if}</button>
-                {:else if book.color}
-                  <span
-                    class="row-color-dot"
-                    style="--swatch-color: {BOOK_COLORS.find((c) => c.token === book.color)?.hex}"
-                    title={t("颜色: {c}", { c: colorLabel(book.color) })}
-                  ></span>
-                {/if}
-              </div>
-              <!-- 第 2 列「书名」：小封面 + 标题行 + 副行（分组/大小/标签） -->
-              <div class="row-title-line">
-                <button class="row-cover" title={book.title} on:click={() => onOpen(book.id)}>
-                  {#if coverUrls[book.id]}
-                    <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
-                  {:else}
-                    <span class="row-cover-text">{book.title.slice(0, 1)}</span>
-                  {/if}
-                </button>
-                <div class="row-titlecol">
-                  <div class="row-title-row">
-                    <span class="row-title" title={book.title}>{book.title}</span>
-                    <button
-                      class="row-status-chip"
-                      class:reading={(book.status ?? "unread") === "reading"}
-                      class:done={book.status === "finished"}
-                      title={t("点击切换阅读状态")}
-                      on:click={() => cycleStatus(book)}
-                    >{statusLabel(book.status)}</button>
-                    {#if book.favorite}<span class="row-fav" title={t("收藏")}><span class="reword-shelf-ico reword-shelf-ico--xs reword-shelf-ico--fill">{@html SEL_ICONS.fav}</span></span>{/if}
-                  </div>
-                  <div class="row-sub">
-                    <!-- [2026-08-29] P2:组 chip(放最前) -->
-                    {#if book.groupId}
-                      {@const g = facets.groups.find((x) => x.id === book.groupId)}
-                      {#if g}
-                        <span class="row-group-chip" title={t("分组")}>
-                          {#if g.color}<span
-                            class="row-group-dot"
-                            style="--swatch-color: {BOOK_COLORS.find((c) => c.token === g.color)?.hex}"
-                          ></span>{/if}<span class="reword-shelf-ico reword-shelf-ico--xs">{@html SEL_ICONS.group}</span>{g.name}
-                        </span>
-                        <span class="row-dot">·</span>
-                      {/if}
-                    {/if}
-                    <span>{fmtSize(book.size)}</span>
-                    {#if book.tags?.length}
-                      <span class="row-tag-chips">
-                        {#each book.tags.slice(0, 2) as t}
-                          <span class="row-tag">{t}</span>
-                        {/each}
-                        {#if book.tags.length > 2}
-                          <span class="row-tag more">+{book.tags.length - 2}</span>
-                        {/if}
-                      </span>
-                    {/if}
-                  </div>
+                    class="book-more-btn row-more-btn"
+                    title={t("更多操作")}
+                    on:click|stopPropagation={(e) => openCtxMenu(e, buildBookMenu(book))}
+                  >⋯</button>
                 </div>
               </div>
-              <span class="row-author" title={book.author || ""}>{book.author || t("未知作者")}</span>
-              <span class="row-formatcell">{book.format.toUpperCase()}</span>
-              <!-- 进度列只放条：62px 里再塞百分比会两边都读不清，精确值挂 title -->
-              <span class="row-pbar" title={fmtPct(book.progress?.fraction)}
-                ><i style="width: {Math.round((book.progress?.fraction ?? 0) * 100)}%"></i></span
-              >
-              <span class="row-time">{fmtTime(book.readingTimeMs) || "—"}</span>
-              <!-- 缺「最近阅读」显示 —，不退化成「添加时间」也不显示 0 -->
-              <span class="row-lastread">{fmtDate(book.lastReadAt) || "—"}</span>
-              <div class="row-actions">
-                <button class="row-btn primary" on:click={() => onOpen(book.id)}>
-                  {book.progress?.fraction ? t("续读") : t("开始")}
-                </button>
-                <div class="row-actions-extra" aria-hidden="true">
-                  <button class="row-icon-btn" title={t("编辑")} on:click={() => openEdit(book)}><span class="reword-shelf-ico">{@html SEL_ICONS.edit}</span></button>
-                  <button class="row-icon-btn danger" title={t("删除")} on:click={() => openRemove(book)}><span class="reword-shelf-ico">{@html SEL_ICONS.trash}</span></button>
-                </div>
-                <!-- 2026-10-24 移动端适配 Phase 3：触屏菜单入口（row-actions-extra 是 hover 显示） -->
-                <button
-                  class="book-more-btn row-more-btn"
-                  title={t("更多操作")}
-                  on:click|stopPropagation={(e) => openCtxMenu(e, buildBookMenu(book))}
-                >⋯</button>
-              </div>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
   </div>
 
   {#if fails.length}
@@ -2558,6 +2630,36 @@
     height: 100%;
     overflow: hidden;
   }
+  /* ================================================================
+   * 2026-11-19 动效基建
+   * ================================================================
+   * ① .no-anim —— 首帧闸门。
+   *    组件初始化有一批「读偏好 → 改状态」的动作落在首帧之后，
+   *    没有闸门它们会当着用户的面播一遍动画（界面像自己动了一下）。
+   *    挂 .no-anim 把所有过渡/动画按到 0，再在首帧画完后撤掉。
+   * ② prefers-reduced-motion —— 系统开了「减弱动态效果」就一步到位，
+   *    但**保留状态变化**（侧栏该开还是开），只把过程去掉。 */
+  .bookshelf-view.no-anim,
+  .bookshelf-view.no-anim *,
+  .bookshelf-view.no-anim *::before,
+  .bookshelf-view.no-anim *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .bookshelf-view *,
+    .bookshelf-view *::before,
+    .bookshelf-view *::after {
+      /* delay 也要归零 —— 否则「visibility 延迟 220ms 才隐藏」这种
+         靠 delay 编排的过渡会留下一个空白窗口（遮罩先淡完、220ms 后才出现）。 */
+      transition-duration: 1ms !important;
+      transition-delay: 0ms !important;
+      animation-duration: 1ms !important;
+      animation-delay: 0ms !important;
+      animation-iteration-count: 1 !important;
+      scroll-behavior: auto !important;
+    }
+  }
   .bookshelf-header {
     display: flex;
     align-items: center;
@@ -2592,6 +2694,12 @@
     font-size: 13px;
     cursor: pointer;
     flex-shrink: 0;
+    transition:
+      filter var(--reword-dur-fast) var(--reword-ease),
+      opacity var(--reword-dur-fast) var(--reword-ease);
+  }
+  .bookshelf-import-btn:hover:not(:disabled) {
+    filter: brightness(0.94);
   }
   .bookshelf-import-btn:disabled {
     opacity: 0.6;
@@ -2638,6 +2746,11 @@
   }
   /* 批量进度条 */
   .import-progress {
+    /* 2026-11-19 动画：进度条区域淡入 —— 导入是个长过程，
+       让它「进来」一下，用户知道进度开始了。
+       ⚠️ 这里用纯淡入而不是 .shelf-fade-in：那块里带 scale(0.9)，
+       进度条连同文字一起缩放会像镜头在变焦，不像进度条在长。 */
+    animation: shelf-fade-only var(--reword-dur-base) var(--reword-ease);
     padding: 8px 12px;
     border-bottom: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
     flex-shrink: 0;
@@ -2685,6 +2798,14 @@
     z-index: 40;
     white-space: nowrap;
     box-shadow: var(--reword-elev-2, 0 2px 10px rgba(0, 0, 0, 0.18));
+    /* 2026-11-19 动画：toast 从下方滑入。
+       ⚠️ 关键帧里的 translate 必须带 -50% —— 基础规则用 translateX(-50%) 做居中，
+       只写 translateY 会把胶囊的居中偏移弄丢（弹到左边去）。 */
+    animation: shelf-toast-in var(--reword-dur-slow) var(--reword-ease);
+  }
+  @keyframes shelf-toast-in {
+    from { opacity: 0; transform: translate(-50%, 12px) scale(0.96); }
+    to { opacity: 1; transform: translate(-50%, 0) scale(1); }
   }
   /* ---- [2026-10-11 B2] 生效筛选 chip 行 ---- */
   /* 替代工具栏原来那颗「清除筛选」：这里能看见**清了什么**，✕ 逐项清、右侧一键全清。
@@ -2698,6 +2819,12 @@
     gap: 6px;
     flex-wrap: wrap;
     padding: 10px 18px 0;
+    /* 2026-11-19 动画：筛选摘要行淡入下沉 */
+    animation: shelf-fade-down var(--reword-dur-slow) var(--reword-ease);
+  }
+  @keyframes shelf-fade-down {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: none; }
   }
   .shelf-chip {
     display: inline-flex;
@@ -2709,6 +2836,18 @@
     color: var(--b3-theme-on-surface, #333);
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
     border-radius: 999px;
+    /* 2026-11-19 动画：逐颗胶囊淡入（配合 --i 的序号延迟） */
+    animation: shelf-fade-in var(--reword-dur-base) var(--reword-ease) backwards;
+    animation-delay: calc(var(--i, 0) * 36ms);
+  }
+  @keyframes shelf-fade-in {
+    from { opacity: 0; transform: scale(0.9); }
+    to { opacity: 1; transform: none; }
+  }
+  /* 纯淡入：给「整块缩放会失真」的场景用（进度条、宽面板） */
+  @keyframes shelf-fade-only {
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
   .shelf-chip-label {
     max-width: 140px;
@@ -2744,6 +2883,11 @@
   }
 
   .bookshelf-grid {
+    /* 2026-11-19 动画：网格 ↔ 列表切换时整块内容淡入。
+       换视图是一次「换皮」，不做过渡就像闪屏；
+       纯 CSS animation 在元素**重新创建**时自动重播，
+       所以 Svelte 换分支就能拿到入场动画，不必写 JS。 */
+    animation: shelf-view-in var(--reword-dur-slow) var(--reword-ease);
     display: grid;
     /* 2026-10-13 改版：对齐参考书架的密集网格（宽窗 ~8 列观感）。
        158 → 200：文字区收成两行后信息变少，158 档卡片显碎；间距同步拉大。
@@ -2783,6 +2927,18 @@
     gap: 10px;
     min-width: 0;
     transition: transform 0.15s ease;
+    /* 2026-11-19 动画：书卡入场级联。
+       书架打开是一屏封面同时「啪」地出现 —— 级联入场把这一下摊开，
+       视线有落点、界面像有呼吸。延迟按序号递增并**封顶在 18**：
+       不封顶的话 200 本书会排出十几秒的长队。
+       fill-mode: backwards —— 延迟期间保持 from 状态（不可见），
+       否则 stagger 期间会先闪出一屏再退回起点。 */
+    animation: shelf-card-in var(--reword-dur-slow) var(--reword-ease) backwards;
+    animation-delay: calc(var(--i, 0) * 18ms);
+  }
+  @keyframes shelf-card-in {
+    from { opacity: 0; transform: translateY(12px) scale(0.98); }
+    to { opacity: 1; transform: none; }
   }
   /* 2026-11-15 触屏流畅度：卡片上浮必须只在「真有指针悬停」的设备生效。
      触屏 WebView 会在 touchstart 那一刻命中 :hover，并一直保持到下次点击别处 ——
@@ -2957,6 +3113,11 @@
   }
   /* 2026-10-11 B3：空态图形（32px 由 --xl 档负责），与拖拽遮罩同一枚 icon
      同一套「主色 + 0.55 透明」语言 —— 两处出现同一个空书架，样式要说得通。 */
+  /* 2026-11-19 动画：空态淡入 —— 空书架是用户第一次看到的东西，
+     它「立」在那儿比它「闪」一下更像一个状态。 */
+  .bookshelf-empty {
+    animation: shelf-fade-in var(--reword-dur-slow) var(--reword-ease);
+  }
   .bookshelf-empty-icon {
     opacity: 0.55;
     color: var(--b3-theme-primary, #378add);
@@ -2977,11 +3138,24 @@
   :global(.edit-mask) {
     position: fixed;
     inset: 0;
-    z-index: 50;
+    /* 2026-11-19 移动端 P0：50 → 150。
+       `:global(.edit-mask)` 是六个面板共用的外壳，其中**四个**（阅读统计 / OPDS /
+       云端书库 / 图谱）走 `use:portal` 挂到 document.body；而移动端书架跑在
+       `#re-mobile-overlay` 里（z-index:100、背景不透明）⇒ 50 < 100 时面板整块被盖住，
+       点按钮「什么都不出现」。
+       ⚠️ 必须**无条件**提升（不能包 @media）：平板 768px 上手机断点不匹配，包了就白改；
+       也不能加 `.bookshelf-view` 前缀 —— portal 出来的元素不在书架子树里。
+       150 仍低于思源原生 #sidebar(200)，桌面端相对关系不变。 */
+    z-index: 150;
     background: rgba(0, 0, 0, 0.35);
     display: flex;
     align-items: center;
     justify-content: center;
+    /* 2026-11-19 动画：遮罩淡入。
+       ⚠️ 这条 :global(.edit-mask) 是**六个面板共用的外壳**
+       （阅读统计 / OPDS / 云端书库 / 图谱 / 删书确认 / 批量删书），
+       改一处六处一起生效 —— 也意味着别在这里写只对某一个面板成立的东西。 */
+    animation: shelf-mask-in var(--reword-dur-base) var(--reword-ease);
   }
   .import-fail-panel,
   :global(.edit-panel) {
@@ -2994,6 +3168,17 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    /* 2026-11-19 动画：面板从 96% 缩放 + 淡入。
+       遮罩先淡入、面板后到，视线自然被引到内容上。 */
+    animation: shelf-panel-in var(--reword-dur-slow) var(--reword-ease);
+  }
+  @keyframes shelf-mask-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes shelf-panel-in {
+    from { opacity: 0; transform: scale(0.96) translateY(8px); }
+    to { opacity: 1; transform: none; }
   }
   .import-fail-title,
   :global(.edit-title) {
@@ -3225,6 +3410,43 @@
     background: var(--b3-theme-primary-lightest, rgba(55, 138, 221, 0.18));
     color: var(--b3-theme-on-background, #333);
   }
+  /* ---- 2026-11-19 移动端 P0：分组行「更多」按钮 + 触屏可见性 ----
+     · 桌面：不显示（保持原有 hover 浮出两个小图标 + 右键的形态，一行不变）；
+     · 手机/大屏手机：常显一个 ⋯（28px，与 .row-more-btn 同档），
+       同时把两个 hover-only 小图标**隐藏**——它们 opacity:0 时
+       pointer-events 仍是 auto，会变成看不见却能点中的暗雷（误触改名/改色）。
+     · 平板（re-tablet）不在此列：宽一点，且仍可能有鼠标/触控笔，
+       由 `@media (hover:none)` 那层兜底（见 .book-fav）。 */
+  .shelf-sb-more {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    margin-left: auto;
+    border: none;
+    border-radius: 8px;
+    background: none;
+    color: var(--b3-theme-on-surface-light, #888);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+    padding: 0;
+  }
+  .shelf-sb-more:active {
+    background: var(--b3-theme-primary-lightest, rgba(55, 138, 221, 0.18));
+  }
+  .bookshelf-view.re-phone .shelf-sb-more,
+  .bookshelf-view.re-large-phone .shelf-sb-more {
+    display: inline-flex;
+  }
+  .bookshelf-view.re-phone .shelf-sb-item.shelf-sb-group .shelf-sb-edit,
+  .bookshelf-view.re-phone .shelf-sb-item.shelf-sb-group .shelf-sb-colorbtn,
+  .bookshelf-view.re-large-phone .shelf-sb-item.shelf-sb-group .shelf-sb-edit,
+  .bookshelf-view.re-large-phone .shelf-sb-item.shelf-sb-group .shelf-sb-colorbtn {
+    display: none;
+  }
   .shelf-sb-item.shelf-sb-group:hover .shelf-sb-label {
     text-decoration: underline dashed;
     text-underline-offset: 2px;
@@ -3247,6 +3469,8 @@
 
   /* ---- 侧边栏 swatch 区块(颜色筛选) ---- */
   .shelf-sb-swatches {
+    /* 2026-11-19 动画：色板逐颗淡入（配合 --i 序号延迟） */
+    animation: shelf-fade-in var(--reword-dur-base) var(--reword-ease);
     display: flex;
     align-items: center;
     gap: 4px;
@@ -3262,7 +3486,10 @@
     background: var(--swatch-color, #888);
     cursor: pointer;
     padding: 0;
-    transition: transform 0.1s ease;
+    transition:
+      transform var(--reword-dur-fast) var(--reword-ease),
+      border-color var(--reword-dur-fast) var(--reword-ease),
+      box-shadow var(--reword-dur-fast) var(--reword-ease);
   }
   .shelf-sb-swatch:hover {
     transform: scale(1.1);
@@ -3311,8 +3538,8 @@
 
   /* ---- 列表行 J/K 焦点高亮 ---- */
   .shelf-row.focused {
-    outline: 2px solid var(--b3-theme-primary, #378add);
-    outline-offset: -2px;
+    /* 只改颜色，宽度/偏移在基础规则里已常驻（见 .shelf-row 的说明） */
+    outline-color: var(--b3-theme-primary, #378add);
   }
 
   /* ================================================================
@@ -3325,6 +3552,14 @@
     border: 1px solid transparent;
     background: none;
     border-radius: 6px;
+    /* 2026-11-19 动画：状态过渡。
+       项目里按钮的 hover / active 此前全是瞬切 —— 鼠标扫过一排图标时
+       「啪、啪、啪」地闪，扫一遍像有人在你眼皮底下乱按。
+       一条 transition 让扫过变成一次流动。 */
+    transition:
+      background var(--reword-dur-fast) var(--reword-ease),
+      border-color var(--reword-dur-fast) var(--reword-ease),
+      color var(--reword-dur-fast) var(--reword-ease);
     /* 26 → 28：里面那枚图标从 16px 提到 18px（--btn 档），
        26px 的盒子只剩 4px 内边距，图标会顶着边框反而显得小 */
     width: 28px;
@@ -3349,6 +3584,22 @@
     background: var(--b3-theme-primary-lightest, rgba(55, 138, 221, 0.14));
     border-color: var(--b3-theme-primary, #378add);
     color: var(--b3-theme-on-background, #333);
+  }
+  /* 2026-11-19 动画：顶栏「分组栏」开关 —— ☰ 在展开态转 90°，变成三条竖线。
+     收起是「抽屉被抽走」，按钮跟着转一下，方向感就成立了。
+     缓动带一点回弹（overshoot），动作有生气但不晃眼。 */
+  .shelf-sb-toggle-btn .reword-shelf-ico {
+    transition: transform 300ms cubic-bezier(0.34, 1.32, 0.64, 1);
+  }
+  .shelf-sb-toggle-btn.active .reword-shelf-ico {
+    transform: rotate(90deg);
+  }
+  /* 按钮本体：按下时轻微内缩，给一点触感反馈 */
+  .shelf-sb-toggle-btn:active .reword-shelf-ico {
+    transform: scale(0.88);
+  }
+  .shelf-sb-toggle-btn.active:active .reword-shelf-ico {
+    transform: rotate(90deg) scale(0.88);
   }
 
   /* ---- 顶栏「续读」：与「导入」同一套实心主色 ----
@@ -3428,6 +3679,9 @@
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
     color: var(--b3-theme-on-background, #333);
     outline: none;
+    transition:
+      background var(--reword-dur-fast) var(--reword-ease),
+      border-color var(--reword-dur-fast) var(--reword-ease);
   }
   .shelf-search-input:focus {
     background: var(--b3-theme-background, #fff);
@@ -3446,6 +3700,10 @@
     font-size: 11px;
     color: var(--b3-theme-on-surface-light, #888);
     padding: 2px 4px;
+    transition: color var(--reword-dur-fast) var(--reword-ease);
+  }
+  .shelf-search-clear:hover {
+    color: var(--b3-theme-on-background, #333);
   }
   /* 2026-10-11 B1：与搜索框同一套「无边框 + 中性灰底」语言 ——
      工具栏上不该并存三种控件样式（搜索 / 排序 / 批量）。focus 恢复底色与描边。 */
@@ -3459,6 +3717,10 @@
     cursor: pointer;
     max-width: 110px;
     outline: none;
+    transition:
+      background var(--reword-dur-fast) var(--reword-ease),
+      border-color var(--reword-dur-fast) var(--reword-ease),
+      opacity var(--reword-dur-fast) var(--reword-ease);
   }
   .shelf-select:focus {
     background: var(--b3-theme-background, #fff);
@@ -3474,21 +3736,46 @@
     border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12));
     border-radius: 7px;
     padding: 1px;
+    position: relative;
+    /* 2026-11-19 动画：分段控件的「滑块」。
+       原来选中态是直接换背景色 —— 点了哪颗，那颗就啪地变成实心主色。
+       改成一块实心滑块在两格之间**滑过去**，这是 iOS 分段控件的经典做法，
+       也是「值钱感」提升最明显的一处：用户能看见自己按了什么、往哪边切。
+       ⚠️ --vt-cell 必须与 .shelf-icon-btn 的 width 同值（28px），
+       滑块宽度和位移都按它算；改按钮尺寸时这里要跟着改。 */
+    --vt-cell: 28px;
+    --vt-gap: 2px;
+  }
+  .shelf-view-toggle::before {
+    content: "";
+    position: absolute;
+    top: 1px;
+    left: 1px;
+    width: var(--vt-cell);
+    height: calc(100% - 2px);
+    border-radius: 6px;
+    background: var(--b3-theme-primary, #378add);
+    transform: translateX(0);
+    transition: transform var(--reword-dur-base) var(--reword-ease);
+    pointer-events: none;
+  }
+  .shelf-view-toggle[data-view="list"]::before {
+    transform: translateX(calc(var(--vt-cell) + var(--vt-gap)));
   }
   /* 2026-10-11 B1：视图切换的选中格 = 实心主色单元格。
      原来复用的 .shelf-icon-btn.active（淡主色底 + 主色描边）在 Asri/Neo 下
      和 hover 灰底区分度不够（B0 §8.4 遗留项）；这两颗是**分段的单选**，
      比「一排图标里高亮一颗」更需要一眼看出选中哪格。
-     权重 (0,3,0) 高于 .shelf-icon-btn:hover (0,2,0)，hover 也要自己写。 */
+     权重 (0,3,0) 高于 .shelf-icon-btn:hover (0,2,0)，hover 也要自己写。
+     2026-11-19：底色改由 ::before 滑块承担，这里只留图标颜色。 */
   .shelf-view-toggle .shelf-icon-btn.active {
-    background: var(--b3-theme-primary, #378add);
-    border-color: var(--b3-theme-primary, #378add);
+    background: transparent;
+    border-color: transparent;
     color: var(--b3-theme-on-primary, #fff);
   }
   .shelf-view-toggle .shelf-icon-btn.active:hover {
-    background: var(--b3-theme-primary, #378add);
+    background: transparent;
     color: var(--b3-theme-on-primary, #fff);
-    filter: brightness(0.94);
   }
 
   /* ---- 批量操作条 ---- */
@@ -3503,6 +3790,13 @@
     border-bottom: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
     flex-shrink: 0;
     flex-wrap: wrap;
+    /* 2026-11-19 动画：批量条从上方落下 —— 它是「挤」进工具栏和书之间的，
+       落一下比啪地出现更说明「多选模式开了」。 */
+    animation: shelf-batch-in var(--reword-dur-slow) var(--reword-ease);
+  }
+  @keyframes shelf-batch-in {
+    from { opacity: 0; transform: translateY(-100%); }
+    to { opacity: 1; transform: none; }
   }
   .shelf-batch-count {
     font-size: 12px;
@@ -3517,6 +3811,13 @@
     font-size: 12px;
     cursor: pointer;
     color: var(--b3-theme-on-background, #333);
+    transition:
+      background var(--reword-dur-fast) var(--reword-ease),
+      border-color var(--reword-dur-fast) var(--reword-ease),
+      opacity var(--reword-dur-fast) var(--reword-ease);
+  }
+  .shelf-batch-btn:hover:not(:disabled) {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
   }
   .shelf-batch-btn:disabled {
     opacity: 0.5;
@@ -3555,20 +3856,42 @@
     z-index: 30;
     background: var(--b3-theme-background, #fff);
     box-shadow: 0 0 24px rgba(0, 0, 0, 0.2);
-    animation: shelf-drawer-in 180ms ease-out;
+    /* 2026-11-19 动画：手机端是 overlay 抽屉，收起用 transform 滑出去。
+       （原来是挂载时的一次性 keyframes，只能进不能出。） */
+    transform: translateX(0);
+    transition: transform var(--reword-dur-slow) var(--reword-ease);
+  }
+  .bookshelf-view.re-phone .shelf-sidebar.collapsed {
+    transform: translateX(-100%);
+  }
+  /* 抽屉宽度是 min(78vw,320px)，不是 --side-w，内层跟着抽屉走 */
+  .bookshelf-view.re-phone .shelf-sb-inner {
+    width: 100%;
   }
   .bookshelf-view.re-phone .shelf-side-resizer {
     display: none;
   }
+  /* 2026-11-19 动画：遮罩常驻 DOM，靠 opacity 淡入淡出。
+     pointer-events 跟着切 —— opacity:0 但仍能点是最常见的「幽灵遮罩」坑。 */
   .shelf-sb-backdrop {
     position: absolute;
     inset: 0;
     z-index: 29;
     background: rgba(0, 0, 0, 0.35);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    transition:
+      opacity var(--reword-dur-slow) var(--reword-ease),
+      visibility 0s linear var(--reword-dur-slow);
   }
-  @keyframes shelf-drawer-in {
-    from { transform: translateX(-30%); opacity: 0; }
-    to   { transform: translateX(0);    opacity: 1; }
+  .shelf-sb-backdrop.on {
+    opacity: 1;
+    visibility: visible;
+    pointer-events: auto;
+    transition:
+      opacity var(--reword-dur-slow) var(--reword-ease),
+      visibility 0s;
   }
   .bookshelf-view.re-phone .bookshelf-header {
     overflow-x: auto;
@@ -3632,17 +3955,47 @@
     transition: none;
   }
   .shelf-sidebar {
-    /* 宽度是响应式 inline style（可拖，见 sideWidth / SIDE_W_*），这里只管行为 */
+    /* 宽度来自 inline 的 --side-w（可拖，见 sideWidth / SIDE_W_*），这里只管行为 */
     flex-shrink: 0;
+    width: var(--side-w, 200px);
     /* 再宽也得给主区留位置；与脚本里的 SHELF_MAIN_MIN 同值 */
     max-width: calc(100% - 240px);
+    /* 2026-11-19 动画：收起时这里负责「裁切」，不再负责滚动 ——
+       滚动挪给内层 .shelf-sb-inner，宽度归零时内容被裁掉而不是被压扁换行。 */
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    border-right: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
+    /* 收起/展开：宽度是唯一参与布局的属性，border-color 跟着淡出免得留一条竖线 */
+    transition:
+      width var(--reword-dur-slow) var(--reword-ease),
+      border-color var(--reword-dur-base) var(--reword-ease);
+  }
+  /* 收起态：宽度归零（flex 里不占位），右边框透明化 */
+  .shelf-sidebar.collapsed {
+    width: 0;
+    border-right-color: transparent;
+  }
+  /* 内层：固定宽度 + 自己滚动。
+     固定宽度是关键 —— 收起时外层宽度从 sideWidth 动画到 0，
+     内层保持原宽被 overflow:hidden 裁掉，文字不会挤成竖条。 */
+  .shelf-sb-inner {
+    flex: 1 1 auto;
+    min-height: 0;
+    width: var(--side-w, 200px);
     overflow-y: auto;
     padding: 12px 10px;
-    border-right: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.08));
     display: flex;
     flex-direction: column;
     gap: 14px;
-    transition: width 120ms ease;
+    transition:
+      opacity var(--reword-dur-base) var(--reword-ease),
+      transform var(--reword-dur-slow) var(--reword-ease);
+  }
+  /* 收起时内容轻微左移 + 淡出，和外层宽度收缩叠在一起 = 抽屉被抽走 */
+  .shelf-sidebar.collapsed .shelf-sb-inner {
+    opacity: 0;
+    transform: translateX(-14px);
   }
   /* 压在 border-right 上的细长把手：默认完全透明，看起来仍只是那条线 */
   .shelf-side-resizer {
@@ -3674,6 +4027,22 @@
   }
   .shelf-side-resizer:focus-visible {
     outline: none;
+  }
+  /* 2026-11-19 动画：把手跟着侧栏一起收走（宽度归零 + 淡出），
+     否则侧栏收起后把手上那条 hover 高亮会孤零零留在屏幕最左边。 */
+  .shelf-side-resizer {
+    transition:
+      width var(--reword-dur-slow) var(--reword-ease),
+      flex-basis var(--reword-dur-slow) var(--reword-ease),
+      margin-left var(--reword-dur-slow) var(--reword-ease),
+      opacity var(--reword-dur-base) var(--reword-ease);
+  }
+  .bookshelf-body:not(.sidebar-open) .shelf-side-resizer {
+    width: 0;
+    flex-basis: 0;
+    margin-left: 0;
+    opacity: 0;
+    pointer-events: none;
   }
   .shelf-main {
     flex: 1;
@@ -3794,6 +4163,11 @@
     cursor: pointer;
     color: var(--b3-theme-on-background, #333);
     text-align: left;
+    /* 2026-11-19 动画：条目 hover / 选中态过渡 */
+    transition:
+      background var(--reword-dur-fast) var(--reword-ease),
+      border-color var(--reword-dur-fast) var(--reword-ease),
+      color var(--reword-dur-fast) var(--reword-ease);
   }
   .shelf-sb-item:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
@@ -3951,6 +4325,29 @@
   .book-fav.on {
     color: #ffc94d;
   }
+  /* 2026-11-19 移动端 P0：收藏星「常显」。
+     触屏没有 hover ⇒ 未收藏的书 `opacity:0 + pointer-events:none`，
+     星标**永远不出现**、也点不到 ⇒ 手机上根本没法收藏一本书。
+     （已收藏的带 .on 所以看得见，但「加收藏」这个动作不存在。）
+     口径与 `.book-more-btn` 一致：宽度档（re-phone / re-large-phone）里常显，
+     顺手把 24px 撑到 30px 提高命中率 —— 视觉仍是小圆角chip，不会挂一排灰星。
+     ⚠️ 只改 re-phone / re-large-phone 两档：768px 平板（re-tablet）若也是触屏，
+     由下面的 `@media (hover: none)` 兜底，不在这里硬写。 */
+  .bookshelf-view.re-phone .book-fav,
+  .bookshelf-view.re-large-phone .book-fav {
+    opacity: 1;
+    pointer-events: auto;
+    width: 30px;
+    height: 30px;
+  }
+  /* 触屏兜底（不分断点）：极少数「平板触屏 / 桌面触屏笔电跑在手机壳里」的情况
+     宽度档没匹配上，靠能力查询再兜一层。桌面鼠标环境不受影响。 */
+  @media (hover: none) and (pointer: coarse) {
+    .book-fav {
+      opacity: 1;
+      pointer-events: auto;
+    }
+  }
   /* 笔记发送目标角标（2026-10-09；2026-10-13 从 .book-meta 收进 .book-sub、右对齐）
      —— 纯展示，不响应点击。只显示已绑定，未绑定不做灰色警告。 */
   .book-note-target {
@@ -3965,9 +4362,15 @@
 
   /* ---- 列表视图 ---- */
   .shelf-list {
+    /* 与 .bookshelf-grid 同一套入场（见那里的说明） */
+    animation: shelf-view-in var(--reword-dur-slow) var(--reword-ease);
     display: flex;
     flex-direction: column;
     padding: 6px 12px;
+  }
+  @keyframes shelf-view-in {
+    from { opacity: 0; transform: translateY(6px); }
+    to { opacity: 1; transform: none; }
   }
   /* 2026-10-11 B3：固定列栅格（照 demo 的八列模板）。
      列＝选择/色点 · 书名（内含小封面）· 作者 · 格式 · 进度条 · 时长 · 最近阅读 · 操作。
@@ -3994,7 +4397,18 @@
     border-bottom: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.06));
     border-radius: 8px;
     min-width: 0;
-    transition: background 0.15s ease;
+    /* 2026-11-19 动画（B-21）：焦点环常驻但透明，只过渡颜色。
+       原来 .focused 直接把 outline 从 none 切成 2px 实线 —— 按住 j/k
+       连续跳行时，那圈框在「出现 / 消失」之间硬切，看起来是一阵闪烁。
+       outline 不占布局（不是 border），所以常驻没有副作用。 */
+    outline: 2px solid transparent;
+    outline-offset: -2px;
+    transition:
+      background 0.15s ease,
+      outline-color var(--reword-dur-fast) var(--reword-ease);
+    /* 2026-11-19 动画：列表视图同样级联入场（与网格同一套节奏） */
+    animation: shelf-card-in var(--reword-dur-base) var(--reword-ease) backwards;
+    animation-delay: calc(var(--i, 0) * 14ms);
   }
   .shelf-row:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.04));

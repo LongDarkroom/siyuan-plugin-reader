@@ -12,6 +12,8 @@ import { getLogger } from "../core/logger.ts";
  */
 import type { AiSettings, AiTransportMode } from "./types.ts";
 import { t as T } from "../i18n/index.ts";
+// 2026-11-19 移动端 P0：auto 传输模式在手机上一律直接走内核代理（见 requestAIStream）
+import { isMobile } from "../core/env.ts";
 
 export type AiRole = "system" | "user" | "assistant" | "tool";
 
@@ -618,7 +620,18 @@ export async function requestAIStream(opts: AiStreamOptions): Promise<AiStreamRe
   // ⏱ 诊断临时计时起点（2026-09-08 排查用）
   const diagT0 = Date.now();
   const settings = opts.settings;
-  const mode: AiTransportMode = settings.transportMode ?? "auto";
+  /* 2026-11-19 移动端 P0：`auto` 在手机上**直接走代理**，不要先试直连。
+   *
+   * 病因：`auto` 的语义是「先直连 fetch 读 SSE，CORS 失败再回退 forwardProxy」。
+   * 手机端页面 origin 就是思源服务器（`http://192.168.x.x:6806`），直连
+   * api.openai.com / 各网关**必然 CORS 失败**，而带 Authorization 头还会先打一次
+   * 预检（OPTIONS）⇒ 手机上每一次 AI 请求都白付一次「预检 + 失败 + 回退」的往返，
+   * 弱网下体感非常明显（首字延迟 ×2 起）。
+   * 桌面端 origin 是 127.0.0.1 —— 同样跨域，但本地往返成本几乎为 0，且
+   * 「开启 CORS 的本地 LLM 网关」这个直连场景确实存在，所以桌面保持 auto 原义。
+   * 用户显式选 "direct"（明确要求直连）时不覆盖。 */
+  const rawMode: AiTransportMode = settings.transportMode ?? "auto";
+  const mode: AiTransportMode = rawMode === "auto" && isMobile() ? "proxy" : rawMode;
   const url = buildChatUrl(settings.baseUrl);
   if (!url) return { ok: false, content: "", error: T("AI baseUrl 为空或无法解析为 chat 端点") };
 

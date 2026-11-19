@@ -36,6 +36,15 @@ import { AiTabController } from "./ai/ai-tab-controller.ts";
 import { AiDockController } from "./ai/ai-dock-controller.ts";
 import { AiSessionIO } from "./ai/panel/ai-session-io.ts";
 import { installConsoleFilter } from "./core/console-filter.ts";
+// 2026-11-19 移动端 P0：ES2024 分组 API 补丁（Object/Map.groupBy）。
+// foliate 的 epub.js 用它解析 OPF；老 Android WebView（Chrome < 117）没有这两个 API
+// ⇒ 打开 EPUB 静默白屏。必须**在开第一本书之前**装上，onload 同步阶段最早。
+import { installEsPolyfills } from "./core/es-polyfill.ts";
+// 2026-11-19 移动端 P1：剪贴板降级垫片。`navigator.clipboard` 只在安全上下文存在，
+// 手机连 `http://192.168.x.x:6806` 时是 undefined ⇒ 全项目 29 处
+// `navigator.clipboard?.writeText()` 静默短路、界面却弹「已复制」（复制假成功）。
+// 装一次垫片，旧调用点一行都不用改就有 execCommand 兜底。
+import { installClipboardFallback } from "./core/clipboard.ts";
 import { logSwallow } from "./core/safe.ts";
 import { getLogger } from "./core/logger.ts";
 import { DictManager } from "./dict/dict-manager.ts";
@@ -106,7 +115,26 @@ export class ReaderPlugin extends Plugin {
   async onload(): Promise<void> {
     const plugin = this;
 
-    /* ============ 0. 注册自定义图标（必须在 addTopBar / addTab 之前）===========
+    /* ============ 0. ES 运行时补丁（必须最先，且同步）===========
+     * 老 Android WebView 缺 Object.groupBy / Map.groupBy（ES2024）⇒ 打开 EPUB
+     * 时 epub.js 第 244 行直接抛 TypeError，正文与目录全空、且不弹任何提示。
+     * 装在 onload 最前面是为了比任何 reader 模块的首次使用都早 —— 幂等，
+     * 现代浏览器上整段跳过（不覆盖原生实现）。 */
+    try {
+      installEsPolyfills();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] ES 补丁安装失败", { error: e });
+    }
+
+    /* 剪贴板垫片：非安全上下文（手机连局域网 http）没有 navigator.clipboard。
+     * 装得越早越好 —— 用户第一次点「复制」之前必须就位（同一函数内同步执行）。 */
+    try {
+      installClipboardFallback();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 剪贴板降级安装失败", { error: e });
+    }
+
+    /* ============ 0.1 注册自定义图标（必须在 addTopBar / addTab 之前）===========
      * 漏了这步会导致：顶栏图标与页签图标都找不到 → 思源抛
      * "Icon must be svg id or svg tag"，进而「进入」按钮出现但点不开/显示空白。
      * 主插件踩过同样的坑（2026-08-17：多 symbol 拼成一条传给 addIcons，
