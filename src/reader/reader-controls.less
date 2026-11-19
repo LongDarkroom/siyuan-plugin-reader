@@ -348,6 +348,19 @@
 @media (pointer: coarse) {
   .reader-btn { min-height: 36px; padding: 8px 10px; }
   .reader-mini-btn { min-height: 32px; min-width: 32px; }
+  /* 2026-11-19 P2-17：四个二级面板（阅读统计 / OPDS / 云端书库 / 图谱）的关闭 ✕
+     原来各写各的 28×28，手机上落在底部 sheet 的最角落，是全屏最难点的位置。
+     四个组件各自的 scoped 规则都是同一个类名 ⇒ 这里一条全局规则统管，
+     不必去四个文件里各抄一遍（抄四遍迟早漏一处）。 */
+  .panel-close {
+    width: 44px;
+    height: 44px;
+    min-width: 44px;
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
 }
 
 /* 2026-11-06 方案 A：宽屏档与 ReaderView 的 44px 轻质单栏同步。

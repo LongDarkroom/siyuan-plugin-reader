@@ -105,7 +105,11 @@
     const dlg = new Dialog({
       title: `${t("思维导图")} · ${t("放大查看")}`,
       width: "min(1160px, calc(100vw - 48px))",
-      height: "min(76vh, 760px)",
+      /* 2026-11-19 P1-17：vh → dvh。思源弹窗在移动端的历史上塌过（地址栏一收起
+         vh 就比可视区高），dvh 跟着可视区走；老 WebView 不认识 dvh 时兜回 vh。 */
+      height: (typeof CSS !== "undefined" && CSS.supports?.("height", "1dvh"))
+        ? "min(76dvh, 760px)"
+        : "min(76vh, 760px)",
       content: `<div class="rw-mm-zoom"></div>`,
       destroyCallback: () => closeZoom(),
     });

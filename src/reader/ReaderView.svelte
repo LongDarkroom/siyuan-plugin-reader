@@ -3111,7 +3111,9 @@ import { getLogger } from "../core/logger.ts";
     clearHoverHide();
     hoverWord = word;
     dictPopupSource = "hover";
-    dictPopup = { visible: true, x, y, html: renderLoading(), word, source: "hover" };
+    // 2026-11-19 P1-6：悬浮入口同样走夹紧（鼠标在窗口下半部悬停时会出屏）
+    const box = clampDictPopupBox(x, y);
+    dictPopup = { visible: true, x: box.x, y: box.y, maxH: box.maxH, html: renderLoading(), word, source: "hover" };
     setTimeout(async () => {
       if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再写浮层状态
       // 期间来源/单词已切换则丢弃旧结果
@@ -3732,34 +3734,62 @@ import { getLogger } from "../core/logger.ts";
     if (!pdfRectMode) pdfRectDrag = null;
   }
 
-  function stagePoint(e: MouseEvent): { x: number; y: number } {
+  function stagePoint(e: { clientX: number; clientY: number }): { x: number; y: number } {
     const r = readerStageEl.getBoundingClientRect();
     return { x: e.clientX - r.left, y: e.clientY - r.top };
   }
 
-  function onRectCaptureMouseDown(e: MouseEvent): void {
-    if (e.button !== 0 || !pdfRectDrag || pdfRectBusy) return;
+  /**
+   * 矩形框选：Pointer Events（2026-11-19 P1-10）。
+   *
+   * 原来只有 `mousedown/mousemove/mouseup` —— 触屏上**只有点按**会合成鼠标事件，
+   * 拖拽会被浏览器判成滚动 ⇒ 手指永远画不出矩形，「框选图表 / 排版区域」在
+   * 手机平板上完全不可用。pointer 事件统一覆盖鼠标 / 手指 / 手写笔，一处改完全平台生效。
+   *
+   * 两个配套动作缺一不可：
+   *  ① 捕获层必须有 `touch-action: none`（见 CSS），否则滚动会先抢走手势；
+   *  ② `setPointerCapture` —— 手指拖到捕获层之外（iframe / 页边）时仍能收到
+   *     pointermove / pointerup，否则矩形会「卡住不松手」。
+   */
+  function onRectCapturePointerDown(e: PointerEvent): void {
+    // 鼠标只接受左键；触摸 / 笔没有 button 语义，一律放行
+    if (e.pointerType === "mouse" && e.button !== 0) return;
+    if (pdfRectBusy) return;
     e.preventDefault();
-    const move = (ev: MouseEvent) => {
-      const q = stagePoint(ev);
-      pdfRectDrag = { ...pdfRectDrag!, x1: q.x, y1: q.y };
-    };
-    const up = (ev: MouseEvent) => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", up);
-      const q = stagePoint(ev);
-      void finishPdfRect({ x0: pdfRectDrag!.x0, y0: pdfRectDrag!.y0, x1: q.x, y1: q.y });
-    };
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", up);
-  }
-
-  function onRectCaptureMouseDownStart(e: MouseEvent): void {
-    if (e.button !== 0) return;
-    e.preventDefault();
+    try {
+      (e.currentTarget as HTMLElement | null)?.setPointerCapture?.(e.pointerId);
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · setPointerCapture", "debug");
+    }
     const p = stagePoint(e);
     pdfRectDrag = { x0: p.x, y0: p.y, x1: p.x, y1: p.y };
-    onRectCaptureMouseDown(e);
+    const move = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId || !pdfRectDrag) return;
+      const q = stagePoint(ev);
+      pdfRectDrag = { ...pdfRectDrag, x1: q.x, y1: q.y };
+    };
+    const cleanup = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      window.removeEventListener("pointercancel", cancel);
+    };
+    const up = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      cleanup();
+      const drag = pdfRectDrag;
+      if (!drag) return;
+      const q = stagePoint(ev);
+      void finishPdfRect({ x0: drag.x0, y0: drag.y0, x1: q.x, y1: q.y });
+    };
+    // 手势被系统打断（来电 / 通知栏下拉）：当作取消，不能留着半个矩形
+    const cancel = (ev: PointerEvent) => {
+      if (ev.pointerId !== e.pointerId) return;
+      cleanup();
+      pdfRectDrag = null;
+    };
+    window.addEventListener("pointermove", move, { passive: false });
+    window.addEventListener("pointerup", up);
+    window.addEventListener("pointercancel", cancel);
   }
 
   $: pdfRectPreviewCss = pdfRectDrag
@@ -5173,6 +5203,17 @@ import { getLogger } from "../core/logger.ts";
   let viewportBp: ViewportBreakpoint = "desktop";
   $: viewportBp = $viewport.breakpoint;
   $: isCompactToolbar = isIphoneMode || isPhoneBreakpoint(viewportBp);
+
+  /* 2026-11-19 P1-2：软键盘让位。
+   * 移动端键盘**只缩 visualViewport**，布局视口不动 ⇒ `bottom:0` 的元素停在键盘下面。
+   * 这里把占高算成 CSS 变量 `--re-kb` 挂到根节点，贴底浮层自己 `bottom: var(--re-kb)`；
+   * 同时挂 `kb-open` 类，供「结构化重排」（批注卡改贴底 sheet）用。
+   * 注意：`keyboardInset` 可能为 0 而 `keyboardOpen` 为 true（布局视口同步缩小的 WebView），
+   * 那种情况下元素本来就会跟着缩，不需要再让位。 */
+  $: kbInset = $viewport.keyboardOpen ? Math.max(0, $viewport.keyboardInset) : 0;
+  $: kbOpen = $viewport.keyboardOpen && isMobile();
+  /** 批注卡：键盘弹起时改贴底 sheet（卡内是思源 Protyle，一进来就弹键盘） */
+  $: noteCardSheet = kbOpen;
   // ⋯ 溢出菜单（紧凑顶栏专属）
   let showMoreMenu = false;
 
@@ -7497,7 +7538,7 @@ import { getLogger } from "../core/logger.ts";
   // 鼠标/触控正在按住拖选中（pointerdown→up 之间）。滚动收起手柄时据此避让：
   // 拖选到视口边缘会触发自动滚动，此时不能因 scroll 就把正在扩展的手柄/选区收起。
   let contentPointerHeld = false;
-  let dictPopup: { visible: boolean; x: number; y: number; html: string; word?: string; source?: "sel" | "hover" | null } = { visible: false, x: 0, y: 0, html: "", word: "", source: null };
+  let dictPopup: { visible: boolean; x: number; y: number; maxH?: number; html: string; word?: string; source?: "sel" | "hover" | null } = { visible: false, x: 0, y: 0, html: "", word: "", source: null };
   // 2026-08-27：Option+悬浮取词（英文）相关状态
   let dictPopupEl: HTMLElement | null = null;       // 弹窗 DOM 引用（用于命中检测）
   let dictPopupSource: "sel" | "hover" | null = null; // 当前弹窗来源（sel=划词工具栏, hover=悬浮）
@@ -10820,19 +10861,51 @@ import { getLogger } from "../core/logger.ts";
    *   否则会被上面那句「对齐设置默认源」立刻覆盖回去，
    *   表现为「点 🌐 没反应」（这是加持久化时最容易踩的一个坑）。
    */
+  /**
+   * 词典词卡的定位夹紧（2026-11-19 P1-6）。
+   * 输入是「容器坐标里的锚点中心」，输出夹到内容区内的 left/top 与剩余可视高度。
+   * `--dict-max-h` 由 markup 写成 inline 变量，CSS 用它压 max-height ——
+   * 这样不必先量卡片高度（量了会闪一帧），也不需要猜 62vh 在键盘下还剩多少。
+   */
+  function clampDictPopupBox(rawX: number, rawY: number): { x: number; y: number; maxH: number } {
+    const pad = 8;
+    const off = getReaderViewOffset();
+    const b = getContentBounds();
+    const cardW = Math.min(360, Math.max(240, (readerViewEl?.clientWidth ?? 360) - 24));
+    const halfW = cardW / 2;
+    const minX = b.left - off.left + pad + halfW;
+    const maxX = b.right - off.left - pad - halfW;
+    // 可用宽度比卡片还窄时（极窄分屏）居中兜底，不要把 min/max 反着传
+    const x = maxX >= minX ? Math.min(Math.max(rawX, minX), maxX) : (minX + maxX) / 2;
+    const topEdge = b.top - off.top + pad;
+    const bottomEdge = b.bottom - off.top - pad;
+    // 至少留 96px 在屏内 —— 再往下就算「整块看不见」，不如让它往上挤
+    const y = Math.min(Math.max(rawY, topEdge), Math.max(topEdge, bottomEdge - 96));
+    const cap = Math.round((readerViewEl?.clientHeight ?? 640) * 0.62);
+    const maxH = Math.max(160, Math.min(cap, bottomEdge - y));
+    return { x, y, maxH };
+  }
+
   function runDictLookup(
     word: string,
     opts?: { x?: number; y?: number; source?: "sel" | "hover"; keepMode?: boolean },
   ) {
-    const x = opts?.x ?? selToolbar.x;
-    const y = opts?.y ?? (selToolbar.y + toolbarH);
+    /* 2026-11-19 P1-6：水平 + 垂直双夹紧（划词与悬浮两条入口共用）。
+       · 水平：锚点原本是按划词工具栏（300px）夹出来的，词卡更宽（360px）
+         ⇒ 左右各多出 30px，贴边时整块被裁。
+       · 垂直：原来**完全没夹** —— 工具栏落在屏幕下半部时词卡下半截直接出屏。
+         词卡最高 62vh，先量高度再夹会闪一帧，改成「按剩余空间给 max-height」
+         （CSS 读 --dict-max-h），y 只需要保证顶部有个下界即可。 */
+    const rawX = opts?.x ?? selToolbar.x;
+    const rawY = opts?.y ?? (selToolbar.y + toolbarH);
+    const { x, y, maxH } = clampDictPopupBox(rawX, rawY);
     const source = opts?.source ?? "sel";
     // 每次开弹窗都对齐设置的「默认数据源」——
     // 这样刷新页面后不会莫名回到离线（原先 dictPopupMode 是硬编码的内存变量）。
     // setDictMode 自带在线总闸检查：在线被关时会回落离线。
     if (!opts?.keepMode) setDictMode(settings.dictDefaultSource === "online" ? "online" : "offline");
     dictPopupSource = source;
-    dictPopup = { visible: true, x, y, html: renderLoading(), word, source };
+    dictPopup = { visible: true, x, y, maxH, html: renderLoading(), word, source };
     setTimeout(async () => {
       if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再写浮层状态
       let html: string;
@@ -14322,8 +14395,9 @@ import { getLogger } from "../core/logger.ts";
   class:re-phone={viewportBp === "phone"}
   class:re-large-phone={viewportBp === "largePhone"}
   class:re-tablet={viewportBp === "tablet"}
+  class:kb-open={kbOpen}
   class:sidebar-docked={anyDockPanel()}
-  style="--re-sidebar-w:{sidebarWidth}px"
+  style="--re-sidebar-w:{sidebarWidth}px;--re-kb:{kbInset}px"
 >
   <!-- 2026-11-06 微信读书式上下栏：顶栏永远是浮层（脱离文档流、浮在正文上方）。
        · reader-toolbar-floating —— 固定类名，不再有「常驻/悬浮」两档
@@ -15123,7 +15197,7 @@ import { getLogger } from "../core/logger.ts";
           class="pdf-rect-capture"
           role="application"
           aria-label={t("矩形框选模式")}
-          on:mousedown={onRectCaptureMouseDownStart}
+          on:pointerdown={onRectCapturePointerDown}
         >
           {#if pdfRectDrag}
             <div class="pdf-rect-preview" style={pdfRectPreviewCss}></div>
@@ -15507,8 +15581,9 @@ import { getLogger } from "../core/logger.ts";
       class:place-left={noteEditor.place==='left'}
       class:place-right={noteEditor.place==='right'}
       class:measuring={!noteCardBox.ready}
+      class:kb-sheet={noteCardSheet}
       bind:this={noteEditorEl}
-      style="left:{noteCardBox.left}px;top:{noteCardBox.top}px"
+      style={noteCardSheet ? "" : `left:${noteCardBox.left}px;top:${noteCardBox.top}px`}
       on:click={onNoteCardClick}
       on:focusout={onNoteFocusOut}
     >
@@ -15675,7 +15750,8 @@ import { getLogger } from "../core/logger.ts";
     {#if dictPopupSource === "sel"}
       <div class="reader-dict-backdrop" on:click={closeDictPopup} aria-hidden="true"></div>
     {/if}
-    <div class="reader-dict-popup" bind:this={dictPopupEl} style="left:{dictPopup.x}px; top:{dictPopup.y}px"
+    <div class="reader-dict-popup" bind:this={dictPopupEl}
+         style="left:{dictPopup.x}px; top:{dictPopup.y}px{dictPopup.maxH ? `; --dict-max-h:${dictPopup.maxH}px` : ''}"
          on:mouseenter={onDictPopupEnter} on:mouseleave={onDictPopupLeave}>
       <div class="reader-dict-head">
         <span>{t("词典")}</span>
@@ -16837,6 +16913,23 @@ import { getLogger } from "../core/logger.ts";
   }
   /* 首帧量尺寸前隐身，避免卡片先在预估位置闪一下再跳 */
   .reader-note-editor.measuring { visibility: hidden; }
+  /* 2026-11-19 P1-2：键盘弹起 → 改贴底 sheet。
+     卡内是思源 Protyle，一聚焦就弹键盘；继续按选区锚定会整张卡被埋进键盘里，
+     用户在写着字却看不见自己写的东西。这里钉在键盘上沿，并把小三角藏掉
+     （贴底形态没有锚点语义）。
+     ⚠️ 只改 left/right/top/bottom，**不能引入 transform**（见上方 Protyle 说明）。 */
+  .reader-note-editor.kb-sheet {
+    left: 8px;
+    right: 8px;
+    top: auto;
+    bottom: calc(var(--re-kb, 0px) + 8px);
+    width: auto;
+    max-width: none;
+    max-height: min(56vh, 420px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+  .reader-note-editor.kb-sheet::after { display: none; }
   /* 小三角指向选中文本，颜色与卡片底同源（--rwd-pop-bg），
      否则白天/夜间两套底色下都会出现「三角与卡片不同色」的错位。 */
   .reader-note-editor::after {
@@ -17325,8 +17418,10 @@ import { getLogger } from "../core/logger.ts";
     /* 2026-08-24 修复：z-index 降到 3 */
     z-index: 3;
     width: 360px;
-    max-width: 88vw;
-    max-height: 62vh;
+    /* 2026-11-19 P1-6：360px 在 360px 屏上必然贴边，88vw 又只给 317px（比工具栏还窄）。
+       改成「左留 12、右留 12」，与 JS 的 clampDictPopupBox 保持一致。 */
+    max-width: min(360px, calc(100vw - 24px));
+    max-height: var(--dict-max-h, 62vh);
     overflow: auto;
     /* 2026-11-05：与划词工具栏/批注卡共用浮层令牌（白天浅玻璃、夜间深玻璃） */
     background: var(--rwd-pop-bg);
@@ -17826,8 +17921,10 @@ import { getLogger } from "../core/logger.ts";
     top: auto;
     /* 2026-11-19 P2-8：贴底 sheet 让出 Home Indicator 的高度。
        进度条区本身已经吃掉了 safe-area（见 .reader-progress 的 padding-bottom），
-       所以这里在 44 的基础上再叠一层，避免 sheet 底边被系统手势条压住。 */
-    bottom: calc(44px + env(safe-area-inset-bottom, 0px));
+       所以这里在 44 的基础上再叠一层，避免 sheet 底边被系统手势条压住。
+       2026-11-19 P1-2：再叠键盘占高 —— 搜索面板里有输入框，一弹键盘整块 sheet
+       会沉到键盘下面（搜索面板的输入框在顶部，看得见但结果列表全被盖）。 */
+    bottom: calc(44px + env(safe-area-inset-bottom, 0px) + var(--re-kb, 0px));
     left: 0;
     right: 0;
     width: auto;
@@ -17836,7 +17933,7 @@ import { getLogger } from "../core/logger.ts";
        键盘或地址栏一出现就比可视区高 ⇒ sheet 底边被推出屏外。
        先写 vh 兜不支持 dvh 的老 WebView，再写 dvh 覆盖（后者不认识时整行被忽略）。 */
     max-height: min(78vh, calc(100% - 104px));
-    max-height: min(78dvh, calc(100% - 104px));
+    max-height: min(78dvh, calc(100% - 104px - var(--re-kb, 0px)));
     border-radius: 16px 16px 0 0;
     border-bottom: none;
     transform-origin: bottom center;
@@ -17979,7 +18076,9 @@ import { getLogger } from "../core/logger.ts";
     position: absolute;
     top: 0;
     right: 0;
-    bottom: 0;
+    /* 2026-11-19 P1-2：键盘弹起时让出占高，否则 `.ai-composer` 整块被埋进键盘
+       （面板是 flex 列，composer 是 flex:none 的末项 ⇒ 缩 bottom 就等于把它顶上来）。 */
+    bottom: var(--re-kb, 0px);
     /* 只在 stage 之上、划词工具条(3)/手柄(4)之下：选区贴近正文右缘时，
        工具栏宁可压在面板上，也不能被面板整块盖住点不到。 */
     z-index: var(--rz-floating);
@@ -17994,6 +18093,8 @@ import { getLogger } from "../core/logger.ts";
     z-index: 40;
     box-shadow: none;
   }
+  /* 手机全屏面板的 composer 安全区由 AiPanel 自己补（.ai-panel.is-overlay .ai-composer），
+     这里不再重复加，否则两层 env() 叠起来会把输入框顶高一个手势条。 */
   /* 2026-11-15 P0：平板 / 宽视口移动端的右侧半屏面板。
      手机档仍走 --overlay 全屏；平板给一个「可对照正文」的宽度：
      768 竖屏 ≈ 353px，1024 横屏封顶 420px。不铺满是为了不打断阅读。
@@ -18003,7 +18104,7 @@ import { getLogger } from "../core/logger.ts";
   .reader-ai-dock--tablet {
     top: env(safe-area-inset-top, 0px);
     right: env(safe-area-inset-right, 0px);
-    bottom: env(safe-area-inset-bottom, 0px);
+    bottom: calc(env(safe-area-inset-bottom, 0px) + var(--re-kb, 0px));
     width: min(420px, 46%);
     min-width: 300px;
     z-index: 40;
@@ -19997,6 +20098,12 @@ import { getLogger } from "../core/logger.ts";
     cursor: crosshair;
     background: transparent;
     user-select: none;
+    /* 2026-11-19 P1-10：触屏拖拽不能被滚动/缩放手势抢走，
+       否则 pointermove 根本收不到（手机上是「一拖就滚正文」）。 */
+    touch-action: none;
+    /* 拖拽时别选中底下的文字（iOS 长按会弹选择） */
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
   }
   .pdf-rect-preview {
     position: absolute;

@@ -6347,8 +6347,20 @@
   .ai-panel.is-overlay .ai-tool-add {
     padding: 0 10px 0 8px;
   }
+  /* 2026-11-19 P1-15：`92%` 是相对 `.ai-composer`（≈332px）算的，不是视口；
+     而菜单用 `right: 0` 锚定 ⇒ 360px 屏上左侧会越界被面板裁掉。
+     改用 vw，并给消息菜单补 max-width / 44px 行高（原来是 ~25px，手指点不准）。 */
   .ai-panel.is-overlay .ai-tool-pop {
-    width: min(320px, 92%);
+    width: min(320px, calc(100vw - 24px));
+  }
+  .ai-panel.is-overlay .ai-msg-menu {
+    max-width: calc(100vw - 24px);
+    min-width: 150px;
+  }
+  .ai-panel.is-overlay .ai-msg-menu button {
+    min-height: 44px;
+    padding: 10px 12px;
+    font-size: 14px;
   }
   .ai-panel.is-overlay .ai-tool-opt {
     min-height: 40px;
@@ -6365,8 +6377,10 @@
     font-size: 12px;
   }
   .ai-panel.is-overlay .ai-model-pop {
-    width: min(300px, 92%);
+    /* % 是相对 composer 不是视口，同 P1-15 的理由改用 vw */
+    width: min(300px, calc(100vw - 24px));
     max-height: 44vh;
+    max-height: 44dvh;
   }
   .ai-panel.is-overlay .ai-model-opt {
     min-height: 38px;

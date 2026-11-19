@@ -17,7 +17,7 @@
  */
 
 import { readable } from "svelte/store";
-import { watchViewport, viewportWidth, viewportHeight, isSoftKeyboardOpen, BREAKPOINTS } from "./responsive.ts";
+import { watchViewport, viewportWidth, viewportHeight, isSoftKeyboardOpen, keyboardInset, BREAKPOINTS } from "./responsive.ts";
 
 export type ViewportBreakpoint = "phone" | "largePhone" | "tablet" | "desktop";
 
@@ -26,6 +26,12 @@ export interface ViewportState {
   height: number;
   /** 软键盘是否弹起（仅移动端有意义） */
   keyboardOpen: boolean;
+  /**
+   * 软键盘占掉的高度（px；未弹起时 0）。
+   * 贴底浮层直接用它让位：`bottom: var(--re-kb, 0px)`。
+   * 与 `keyboardOpen` 不等价 —— 布局视口同步缩小的 WebView 里可能是 0。
+   */
+  keyboardInset: number;
   breakpoint: ViewportBreakpoint;
 }
 
@@ -40,7 +46,13 @@ function classify(w: number): ViewportBreakpoint {
 function initialViewportState(): ViewportState {
   const w = viewportWidth();
   const h = viewportHeight();
-  return { width: w, height: h, keyboardOpen: isSoftKeyboardOpen(), breakpoint: classify(w) };
+  return {
+    width: w,
+    height: h,
+    keyboardOpen: isSoftKeyboardOpen(),
+    keyboardInset: keyboardInset(),
+    breakpoint: classify(w),
+  };
 }
 
 /**
@@ -50,7 +62,13 @@ function initialViewportState(): ViewportState {
 export const viewport = readable<ViewportState>(initialViewportState(), (set) => {
   return watchViewport({
     onResize: (info) => {
-      set({ width: info.width, height: info.height, keyboardOpen: info.keyboardOpen, breakpoint: classify(info.width) });
+      set({
+        width: info.width,
+        height: info.height,
+        keyboardOpen: info.keyboardOpen,
+        keyboardInset: keyboardInset(),
+        breakpoint: classify(info.width),
+      });
     },
   });
 });

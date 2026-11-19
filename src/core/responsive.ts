@@ -42,14 +42,61 @@ export function viewportHeight(): number {
   return window.innerHeight;
 }
 
-/** 软键盘是否弹起（仅在移动端 + 视口高度被压时为 true） */
+/**
+ * 「算作键盘弹起」的最小压缩量（px）。
+ * 原值 150 是为了避开 iOS 地址栏收起（~60px）与横屏工具栏，但会漏掉
+ * **浮动 / 半屏键盘**（压缩 100–140px）⇒ 2026-11-19 降到 120。
+ */
+const KEYBOARD_MIN_SHRINK = 120;
+
+/** 当前是否为粗指针（触屏）。只用于「没有任何尺寸信号时」的键盘兜底判定。 */
+function isCoarsePointer(): boolean {
+  try {
+    return window.matchMedia?.("(pointer: coarse)")?.matches === true;
+  } catch {
+    return false;
+  }
+}
+
+/** 焦点是否在可编辑元素上（input / textarea / contenteditable，含思源 Protyle） */
+function isEditableFocused(): boolean {
+  const el = document.activeElement as HTMLElement | null;
+  if (!el) return false;
+  const tag = el.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return true;
+  if (el.isContentEditable) return true;
+  return !!el.closest?.("[contenteditable='true'], .protyle-wysiwyg");
+}
+
+/**
+ * 软键盘占掉的高度（px；未弹起 / 桌面 = 0）。
+ *
+ * 🔴 为什么需要这个数：**移动端软键盘只压缩 visualViewport，布局视口不变**。
+ * 所以 `position:absolute; bottom:0` 的元素（AI 输入框、批注编辑器、TTS 条…）
+ * 会停在键盘**下面**，用户既看不见也点不到。拿到了这个值，把它们改成
+ * `bottom: var(--re-kb, 0px)` 就自然让开了 —— 见 ReaderView 的 `--re-kb`。
+ *
+ * 布局视口也一起缩的 WebView 里相减接近 0，此时返回 0 是**正确**的
+ * （那些环境里 absolute 元素本来就跟着缩，无需再让）。
+ */
+export function keyboardInset(): number {
+  if (typeof window === "undefined") return 0;
+  const vv = (window as any).visualViewport;
+  if (!vv || typeof vv.height !== "number" || vv.height <= 0) return 0;
+  const shrunk = window.innerHeight - vv.height;
+  return shrunk > KEYBOARD_MIN_SHRINK ? Math.round(shrunk) : 0;
+}
+
+/**
+ * 软键盘是否弹起（仅在移动端 + 视口高度被压 / 焦点在可编辑元素上时为 true）。
+ * 注意：与 `keyboardInset() > 0` **不总是等价** —— 后者可能因布局视口同步缩小而返回 0。
+ */
 export function isSoftKeyboardOpen(): boolean {
   if (typeof window === "undefined") return false;
-  const vv = (window as any).visualViewport;
-  if (!vv) return false;
-  // 经验值：键盘弹起会压缩 visualViewport 至少 ~150px
-  const shrunk = window.innerHeight - vv.height;
-  return shrunk > 150;
+  if (keyboardInset() > 0) return true;
+  // 兜底：部分 WebView（iOS 15 起 / 安卓 WebView）会把布局视口一起缩，
+  // 上面的相减拿不到信号。此时用「触屏 + 焦点在可编辑元素」判定。
+  return isCoarsePointer() && isEditableFocused();
 }
 
 /** 断点判定（粗粒度；与 deviceClass 不完全等价） */

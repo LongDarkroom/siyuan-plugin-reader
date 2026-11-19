@@ -215,9 +215,43 @@
   });
   onDestroy(() => stopFoldAnim());
 
+  /* ============================================================
+   * 2026-11-19 P1-16：双指捏合缩放
+   * ------------------------------------------------------------
+   * 之前只有「单指平移」+「ctrl/⌘ + 滚轮缩放」—— 后者在手机上根本不存在，
+   * 于是打开脑图只能靠工具条上的 ± 按钮一档一档点。
+   * 这里用 pointer 事件自己算：记住两指距离 d0 与当时的 scale s0，
+   * move 时按 d/d0 等比缩放，锚点取两指中点（捏哪儿放哪儿）。
+   * 单指仍是平移：只要有第二根手指落下就立刻废掉当前 drag，两者不打架。
+   *
+   * ⚠️ `.mmv` 的 touch-action 是 `pan-y`（卡片里的纵向留给对话滚动），
+   * 双指手势是否完整到达取决于浏览器；放大弹层 `.wide` 是 `touch-action: none`，
+   * 那里 100% 可用。卡片里属于「能捏就捏，捏不动还有 ± 按钮」。
+   * ============================================================ */
+  let pinch: { d0: number; s0: number } | null = null;
+  const activePointers = new Map<number, { x: number; y: number }>();
+
+  function twoPointerSpan(): { d: number; cx: number; cy: number } | null {
+    const pts = [...activePointers.values()];
+    if (pts.length < 2) return null;
+    return {
+      d: Math.hypot(pts[0].x - pts[1].x, pts[0].y - pts[1].y),
+      cx: (pts[0].x + pts[1].x) / 2,
+      cy: (pts[0].y + pts[1].y) / 2,
+    };
+  }
+
   function onPointerDown(e: PointerEvent): void {
     if (locked || e.button !== 0) return;
     settleFoldAnim();
+    activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (activePointers.size >= 2) {
+      // 第二根手指落下 ⇒ 从平移切到缩放（drag 直接作废，避免松手时误判成拖拽）
+      drag = null;
+      const span = twoPointerSpan();
+      if (span && span.d > 0) pinch = { d0: span.d, s0: vp.s };
+      return;
+    }
     // 按下时不能立即 setPointerCapture：捕获之后浏览器补发的 click 会被重定向到
     // 画布容器，节点 <g> 上的「−/+」折叠和双击打开引用就再也收不到点击了。
     // 等越过拖动阈值、确认这次是拖拽再捕获。
@@ -225,6 +259,17 @@
   }
 
   function onPointerMove(e: PointerEvent): void {
+    if (activePointers.has(e.pointerId)) {
+      activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+    if (pinch) {
+      const span = twoPointerSpan();
+      if (!span || !(span.d > 0)) return;
+      const rect = host.getBoundingClientRect();
+      const next = clampMindmapScale((pinch.s0 * span.d) / pinch.d0);
+      apply(zoomMindmapAt(vp, next, span.cx - rect.left, span.cy - rect.top));
+      return;
+    }
     if (!drag || drag.id !== e.pointerId) return;
     const dx = e.clientX - drag.x;
     const dy = e.clientY - drag.y;
@@ -237,6 +282,8 @@
   }
 
   function endDrag(e: PointerEvent): void {
+    activePointers.delete(e.pointerId);
+    if (activePointers.size < 2) pinch = null;
     if (!drag || drag.id !== e.pointerId) return;
     const moved = drag.moved;
     drag = null;
@@ -580,5 +627,26 @@
     background: var(--b3-theme-background, #fff);
     color: var(--b3-theme-on-surface, #6b7280);
     font-size: 10.5px;
+  }
+  /* 2026-11-19 P1-16：工具条按钮原来 padding:2px 6px / font-size:10.5px ⇒
+     命中区约 18px，手机上基本点不中。触屏档给到 32px 高（整条工具条会变高，
+     但比「点十次中一次」强），字号同步提到 12px 免得还是蚂蚁字。
+     不强制 44 —— 工具条上 8 个控件横排，44 会直接撑出屏外。 */
+  @media (pointer: coarse) {
+    .mm-btn {
+      min-height: 32px;
+      padding: 6px 9px;
+      font-size: 12px;
+    }
+    .mm-btn.tight {
+      min-width: 32px;
+    }
+    .mm-select {
+      height: 32px;
+      font-size: 12px;
+    }
+    .mm-slider {
+      min-height: 32px;
+    }
   }
 </style>

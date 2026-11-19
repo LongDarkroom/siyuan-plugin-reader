@@ -35,6 +35,9 @@
   // 2026-10-11 美化 P1：书架图标改用与划词工具栏同一张生成表（构建期内联的 Tabler SVG）。
   // emoji 的三个问题：跨平台形状不同、彩色 emoji 不跟主题、笔画粗细不可控。
   import { SEL_ICONS } from "./sel-icons.generated.ts";
+  // 2026-11-19：顶栏 ⋯ 溢出菜单用的三圆点不在 Tabler 图标库里（`dots` 不存在，
+  // gen-sel-icons.mjs 里已注明），只能取 ReaderView 那张手绘表里的 `more`。
+  import { ICONS } from "./icons.ts";
 
   export let store: BookshelfStore;
   export let onOpen: (bookId: string) => void;
@@ -78,6 +81,32 @@
   }
   function closeCtxMenu() {
     ctxMenu = null;
+  }
+
+  /**
+   * 顶栏 ⋯ 溢出菜单（2026-11-19 P1-8）。
+   * 手机档把 4 个入口（阅读统计 / OPDS / 云端书库 / 图谱）从 header 收进这里 ——
+   * 此前靠 `overflow-x: auto` 兜底，既没有滚动提示也没有渐隐，右侧按钮在用户眼里
+   * 等于不存在（审计里「10 个图标按钮 + 工具栏」正是这条）。
+   * 复用书架右键菜单组件：它在 ≤600px 会自动变成底部 action sheet（44px 行高），
+   * 正好是手机该有的形态，不必另造一套浮层。
+   */
+  function openHeaderOverflow(e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = e.currentTarget as HTMLElement | null;
+    const r = el?.getBoundingClientRect();
+    // 桌面：从按钮右下角展开；手机端 CSS 会用 !important 把它压成底部 sheet，这里只是占位
+    ctxMenu = {
+      x: r ? r.right - 8 : e.clientX,
+      y: r ? r.bottom + 6 : e.clientY,
+      items: [
+        { label: t("阅读统计"), icon: SEL_ICONS.stats, onClick: () => (showStats = true) },
+        { label: t("在线书源（OPDS）"), icon: SEL_ICONS.globe, onClick: () => (showOpds = true) },
+        { label: t("云端书库（WebDAV / S3）"), icon: SEL_ICONS.cloudShelf, onClick: () => (showCloud = true) },
+        { label: t("阅读知识图谱"), icon: SEL_ICONS.graph, onClick: () => (showGraph = true) },
+      ],
+    };
   }
 
   /* ================================================================
@@ -1552,26 +1581,34 @@
       title={selectMode ? t("退出多选") : t("多选")}
       on:click={toggleSelectMode}
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.checklist}</span></button>
+    <!-- 2026-11-19 P1-8：手机档这 4 个入口收进 ⋯ 溢出菜单。
+         此前靠 header 横向滚动兜底 —— 没有滚动提示，右侧按钮在用户眼里「不存在」。 -->
     <button
-      class="shelf-icon-btn"
+      class="shelf-icon-btn shelf-hdr-wide"
       title={t("阅读统计")}
       on:click={() => (showStats = true)}
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.stats}</span></button>
     <button
-      class="shelf-icon-btn"
+      class="shelf-icon-btn shelf-hdr-wide"
       title={t("在线书源（OPDS）")}
       on:click={() => (showOpds = true)}
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.globe}</span></button>
     <button
-      class="shelf-icon-btn"
+      class="shelf-icon-btn shelf-hdr-wide"
       title={t("云端书库（WebDAV / S3）")}
       on:click={() => (showCloud = true)}
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.cloudShelf}</span></button>
     <button
-      class="shelf-icon-btn"
+      class="shelf-icon-btn shelf-hdr-wide"
       title={t("阅读知识图谱")}
       on:click={() => (showGraph = true)}
     ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.graph}</span></button>
+    <button
+      class="shelf-icon-btn shelf-hdr-more"
+      title={t("更多")}
+      aria-haspopup="menu"
+      on:click={openHeaderOverflow}
+    ><span class="reword-shelf-ico reword-shelf-ico--btn"><svg viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.more}</svg></span></button>
     <button
       class="bookshelf-import-btn"
       disabled={importing}
@@ -1732,12 +1769,11 @@
     <!-- 2026-10-24 移动端适配 Phase 3：手机端分组侧栏是 overlay 抽屉，补一块可点击的遮罩 -->
     <!-- 2026-11-19 动画：遮罩常驻 DOM，靠 opacity 淡入淡出（收起时不是「啪」地消失，
          而是跟着抽屉一起退场）。
-         ⚠️ 条件用 `breakpoint === "phone"` 而不是 `isPhoneBp`：
-         抽屉样式（position:absolute）只挂在 `.re-phone` 上，而 isPhoneBp 覆盖到
-         600px（largePhone）。两者不一致时，遮罩会在 largePhone 上盖住整屏
-         —— 那时侧栏其实是内联布局（不是抽屉），根本不需要遮罩。
-         这是本次动效改造顺手修掉的一个老 bug。 -->
-    {#if $viewport.breakpoint === "phone"}
+         ⚠️ 条件用 `isPhoneBp`，**必须与抽屉样式的选择器严格同步**：
+         2026-11-19 P1-1 起 largePhone（481–600）也是抽屉（`.re-large-phone` 已并入
+         同一组逗号选择器），所以遮罩跟着扩到 600px。两者一旦错位，就会出现
+         「遮罩盖住整屏但侧栏是内联布局」或反过来的老 bug。 -->
+    {#if isPhoneBp}
       <div class="shelf-sb-backdrop" class:on={sidebarOpen} on:click={() => (sidebarOpen = false)}></div>
     {/if}
     <!-- [2026-08-29] P1 分组侧栏：用户分组 + 智能分组（状态/标签/格式） -->
@@ -2796,11 +2832,18 @@
     transition: width 0.2s;
   }
   /* toast */
+  /* 2026-11-19 P1-18：toast 补 safe-area 与换行。
+     原来 `bottom:14px` 在 iPhone 上被 Home Indicator 压住一截；
+     `white-space:nowrap` + 无 max-width ⇒「已导入 3 本，2 本失败」这类文案
+     在 360px 屏上直接横向溢出（还被 `overflow:hidden` 的根裁掉右半边）。 */
   .import-toast {
     position: absolute;
     left: 50%;
-    bottom: 14px;
+    bottom: calc(14px + env(safe-area-inset-bottom, 0px));
     transform: translateX(-50%);
+    max-width: calc(100vw - 32px);
+    box-sizing: border-box;
+    text-align: center;
     /* 原 `rgba(30,30,30,.92)` + `#fff` 是**写死的深色**：浅色主题下它是一块突兀的
        黑胶囊，深色主题下又和界面底色糊在一起。改成主题面漆 + 描边，随主题走。 */
     background: var(--b3-theme-surface, #333);
@@ -2810,7 +2853,9 @@
     padding: 6px 14px;
     border-radius: 8px;
     z-index: 40;
-    white-space: nowrap;
+    /* 2026-11-19 P1-18：长文案要能换行（配合上面的 max-width），
+       否则「已导入 3 本，2 本失败」在 360px 屏上横向溢出被根节点裁掉。 */
+    white-space: normal;
     box-shadow: var(--reword-elev-2, 0 2px 10px rgba(0, 0, 0, 0.18));
     /* 2026-11-19 动画：toast 从下方滑入。
        ⚠️ 关键帧里的 translate 必须带 -50% —— 基础规则用 translateX(-50%) 做居中，
@@ -2912,7 +2957,11 @@
     align-content: start;
   }
   /* 容器查询：右侧主区域变窄时自动缩小封面，避免 1–2 列被拉得很大 */
-  @container shelf-main (max-width: 360px) {
+  /* 2026-11-19 P2-16：88px 档的断点从 360 收到 320。
+     360px 手机（iPhone 12/13/14 竖屏主区就是 360）原本落进 88px 档，
+     每卡约 104px，书名只放得下 3–4 个字；它其实够用 (361–520) 档的 112px。
+     320 以下才是真的放不下（折叠机半屏 / SE 分屏）。 */
+  @container shelf-main (max-width: 320px) {
     .bookshelf-grid {
       grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
       gap: 12px;
@@ -3851,16 +3900,23 @@
   }
 
   /* ================================================================
-   * 2026-10-24 移动端适配 Phase 3：书架手机端（re-phone）
+   * 2026-10-24 移动端适配 Phase 3：书架手机端（re-phone / re-large-phone）
    * ================================================================
    * ① 分组侧栏 → overlay 左抽屉（inline 宽度需 !important 压过）+ 遮罩；
    * ② resizer / 拖拽是桌面交互，隐藏；
    * ③ header 一行 9 组控件必然溢出 → 横向滚动（隐藏滚动条，视觉仍是单行）；
-   * ④ 卡片 ⋯ 菜单按钮：桌面隐藏、手机常显（触屏操作入口）。 */
-  .bookshelf-view.re-phone .bookshelf-body {
+   * ④ 卡片 ⋯ 菜单按钮：桌面隐藏、手机常显（触屏操作入口）。
+   *
+   * 2026-11-19 P1-1：**largePhone（481–600px）并入同一组**。
+   * 此前这一档只有桌面内联侧栏 + 可拖 resizer ⇒ 大屏手机上侧栏吃掉
+   * `max-width: calc(100% - 240px)` 的宽度，主区只剩一条缝，而且没有收起入口
+   * （☰ 只在抽屉形态下才有意义）。遮罩条件同步改成 isPhoneBp，两边绑死。 */
+  .bookshelf-view.re-phone .bookshelf-body,
+  .bookshelf-view.re-large-phone .bookshelf-body {
     position: relative;
   }
-  .bookshelf-view.re-phone .shelf-sidebar {
+  .bookshelf-view.re-phone .shelf-sidebar,
+  .bookshelf-view.re-large-phone .shelf-sidebar {
     position: absolute;
     left: 0;
     top: 0;
@@ -3875,16 +3931,18 @@
     transform: translateX(0);
     transition: transform var(--reword-dur-slow) var(--reword-ease);
   }
-  .bookshelf-view.re-phone .shelf-sidebar.collapsed {
+  .bookshelf-view.re-phone .shelf-sidebar.collapsed,
+  .bookshelf-view.re-large-phone .shelf-sidebar.collapsed {
     transform: translateX(-100%);
   }
   /* 抽屉宽度是 min(78vw,320px)，不是 --side-w，内层跟着抽屉走 */
-  .bookshelf-view.re-phone .shelf-sb-inner {
+  .bookshelf-view.re-phone .shelf-sb-inner,
+  .bookshelf-view.re-large-phone .shelf-sb-inner {
     width: 100%;
   }
-  .bookshelf-view.re-phone .shelf-side-resizer {
-    display: none;
-  }
+  /* 2026-11-19 P1-7：拖拽改宽是**桌面**交互 —— 它跟屏宽无关，跟「有没有精确指针」有关。
+     原来只按 re-phone（≤480）隐藏，平板 / 大屏手机上留着一根拖不动的 8px 竖条，
+     而且拖了会把主区挤没。改为按设备能力隐藏（见文件末尾的 (pointer: coarse) 块）。 */
   /* 2026-11-19 动画：遮罩常驻 DOM，靠 opacity 淡入淡出。
      pointer-events 跟着切 —— opacity:0 但仍能点是最常见的「幽灵遮罩」坑。 */
   .shelf-sb-backdrop {
@@ -3907,14 +3965,46 @@
       opacity var(--reword-dur-slow) var(--reword-ease),
       visibility 0s;
   }
-  .bookshelf-view.re-phone .bookshelf-header {
+  .bookshelf-view.re-phone .bookshelf-header,
+  .bookshelf-view.re-large-phone .bookshelf-header {
     overflow-x: auto;
     scrollbar-width: none;
   }
-  .bookshelf-view.re-phone .bookshelf-header::-webkit-scrollbar {
+  /* 2026-11-19 P1-8：⋯ 溢出按钮桌面不出现（`.shelf-icon-btn` 自带 inline-flex，
+     这条必须写在它之后才能压住）*/
+  .shelf-hdr-more {
     display: none;
   }
-  .bookshelf-view.re-phone .bookshelf-header > * {
+  /* 2026-11-19 P1-8：手机上 header 从「横滑找按钮」改成「4 个入口收进 ⋯」。
+     仍在横滑的只剩 续读 / 多选 / 导入 三个，360px 屏基本不用滑。
+     ⋯ 本身只在手机档出现 —— 桌面上 4 个图标直接摆得下，不需要多一层。 */
+  .bookshelf-view.re-phone .shelf-hdr-wide,
+  .bookshelf-view.re-large-phone .shelf-hdr-wide {
+    display: none;
+  }
+  .bookshelf-view.re-phone .shelf-hdr-more,
+  .bookshelf-view.re-large-phone .shelf-hdr-more {
+    display: inline-flex;
+  }
+  /* 2026-11-19 P2-15：360px 屏的工具栏折行。
+     桌面值「搜索 min 140 + 排序 110 + 升降序 + 视图切换 2 颗」已经 300+，
+     触屏档按钮又长大到 40px ⇒ 必然折成两行、第二行只剩一颗孤零零的图标。
+     这一档把搜索下限压到 100、排序上限压到 88，实测 360px 刚好一行放下。 */
+  .bookshelf-view.re-phone .shelf-search {
+    flex: 1 1 120px;
+    min-width: 100px;
+    max-width: none;
+  }
+  .bookshelf-view.re-phone .shelf-select {
+    max-width: 88px;
+    min-width: 0;
+  }
+  .bookshelf-view.re-phone .bookshelf-header::-webkit-scrollbar,
+  .bookshelf-view.re-large-phone .bookshelf-header::-webkit-scrollbar {
+    display: none;
+  }
+  .bookshelf-view.re-phone .bookshelf-header > *,
+  .bookshelf-view.re-large-phone .bookshelf-header > * {
     flex-shrink: 0;
   }
   .book-more-btn {
@@ -3931,7 +4021,8 @@
     line-height: 1;
     cursor: pointer;
   }
-  .bookshelf-view.re-phone .book-more-btn {
+  .bookshelf-view.re-phone .book-more-btn,
+  .bookshelf-view.re-large-phone .book-more-btn {
     display: inline-flex;
   }
   /* 2026-10-25 移动端适配 C4：视觉降权——封面右下半透明毛玻璃小圆钮。
@@ -3953,7 +4044,8 @@
       background: var(--b3-theme-surface, #fff);
     }
   }
-  .bookshelf-view.re-phone .row-more-btn {
+  .bookshelf-view.re-phone .row-more-btn,
+  .bookshelf-view.re-large-phone .row-more-btn {
     min-width: 36px;
     min-height: 36px;
     background: none;
@@ -4354,6 +4446,59 @@
     width: 30px;
     height: 30px;
   }
+  /* ================================================================
+   * 2026-11-19 P1-13 / P1-7：触屏能力档（集中一处，别散着写）
+   * ================================================================
+   * 书架此前**完全没有** (pointer: coarse) 专项（阅读器那边至少还有三组）。
+   * 后果是顶栏 28px、勾选框 17/19px —— 手指点不中，点了没反应还以为是功能坏了。
+   * 口径：
+   *  · 「孤立控件」直接长个儿（顶栏按钮 28→40 + 伪元素补到 44）；
+   *  · 「浮在封面上的小钮」只扩命中区、视觉不变（伪元素），否则会盖住封面主体。
+   * 只挂能力查询、不挂断点 —— 拖拽改宽、hover 都不是屏宽问题，是「有没有精确指针」。 */
+  @media (pointer: coarse) {
+    /* P1-7：拖拽改宽是桌面交互。原来只在 re-phone（≤480）隐藏，
+       平板 / 大屏手机上留着一根拖不动的 8px 竖条，拖了还会把主区挤没。 */
+    .shelf-side-resizer {
+      display: none;
+    }
+    /* 顶栏 / 工具栏图标：28 → 40，再用伪元素补到 44。
+       header 的 gap 是 10px，盒子长大不会互相重叠。 */
+    .shelf-icon-btn {
+      position: relative;
+      width: 40px;
+      height: 40px;
+    }
+    .shelf-icon-btn::after {
+      content: "";
+      position: absolute;
+      inset: -2px;
+    }
+    /* 勾选框是最难点的目标（网格 19px / 列表 17px）。
+       视觉不能长大（会压住封面/行首），只把命中区撑到 44。 */
+    .book-sel::after,
+    .row-sel::after {
+      content: "";
+      position: absolute;
+      inset: -13px;
+    }
+    .row-sel {
+      position: relative;
+    }
+    /* 封面右下 ⋯ / 列表行 ⋯ / 行内小按钮：同上，只扩命中区 */
+    .book-more-btn,
+    .row-more-btn,
+    .row-icon-btn {
+      position: relative;
+    }
+    .book-more-btn::after,
+    .row-more-btn::after,
+    .row-icon-btn::after {
+      content: "";
+      position: absolute;
+      inset: -6px;
+    }
+  }
+
   /* 触屏兜底（不分断点）：极少数「平板触屏 / 桌面触屏笔电跑在手机壳里」的情况
      宽度档没匹配上，靠能力查询再兜一层。桌面鼠标环境不受影响。 */
   @media (hover: none) and (pointer: coarse) {
@@ -4721,16 +4866,19 @@
     }
   }
   /* 2026-10-26 路线 A · 极小屏档（对标「思阅」SiReader 的 380 断点）：
-     折叠机半屏 / iPhone SE 竖屏下再收一档内边距与封面宽度。 */
+     折叠机半屏 / iPhone SE 竖屏下再收一档内边距与封面宽度。
+     2026-11-19 P1-14：内边距不能再往下压 —— 6px 上下 + 22px 封面（3:4 → 29.3px）
+     算出整行约 41px，**低于 44px 的触摸下限**；手指压在两行交界处上下都点不准。
+     改为上 8 / 下 8 + 封面 24px（32px 高）⇒ 行高约 48px。 */
   @container shelf-main (max-width: 400px) {
     .shelf-list {
       padding: 4px 6px;
     }
     .shelf-row {
-      padding: 6px 6px;
+      padding: 8px 6px;
     }
     .row-cover {
-      width: 22px;
+      width: 24px;
     }
   }
 
@@ -4800,7 +4948,11 @@
     flex-direction: column;
     gap: 10px;
     overflow-y: auto;
+    /* 2026-11-19 P1-17：vh → dvh。移动端 `vh` 是「最大视口」，
+       键盘弹起时输入区（这里是编辑书籍信息）会被压到看不见；
+       先写 vh 兜老 WebView，再写 dvh 覆盖 —— 桌面上 dvh 与 vh 等价，不受影响。 */
     max-height: 62vh;
+    max-height: 62dvh;
     padding-right: 2px;
   }
   .edit-cover-row {

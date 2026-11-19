@@ -1301,6 +1301,12 @@ body.theme--dark :is(.rwd-panel, .cloud-panel) {
     flex-direction: column;
     width: 100%; max-width: none;
     height: min(680px, 88vh);
+    /* 2026-11-19 P1-17：vh → dvh（地址栏 / 键盘下的「最大视口」比可视区高，
+       抽屉底边会被推出屏外）。vh 那行留着给不认识 dvh 的老 WebView。 */
+    height: min(680px, 88dvh);
+    /* 抽屉贴底：给 Home Indicator 让位，否则最后一行设置项被手势条压住 */
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    box-sizing: border-box;
     border-radius: 16px 16px 0 0;
     align-self: flex-end;
   }
