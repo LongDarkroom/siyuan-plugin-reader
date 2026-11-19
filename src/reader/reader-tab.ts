@@ -161,8 +161,10 @@ export class ReaderTabController {
         );
       },
       // 2026-08-30：整书预翻译弹窗「已缓存统计」——按书查询每段缓存命中，返回同序 boolean[]
-      onCheckCache: (texts: string[]) =>
-        self.plugin?.checkTranslationCacheHits?.(bookId, texts) ?? Promise.resolve(new Array(texts.length).fill(false)),
+      // 2026-11-19：透传目标语言 —— 缓存按 to 隔离，统计必须查同一条命名空间
+      onCheckCache: (texts: string[], to?: string) =>
+        self.plugin?.checkTranslationCacheHits?.(bookId, texts, to) ??
+        Promise.resolve(new Array(texts.length).fill(false)),
       // 2026-11-17：读缓存里的译文（PDF 整本翻译用）——命中段的译文必须取出来填进结果
       onGetCachedTranslations: (texts: string[]) =>
         self.plugin?.getTranslationCache?.(bookId, texts) ?? Promise.resolve(new Map<string, string>()),

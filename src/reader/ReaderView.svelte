@@ -470,7 +470,9 @@ import { getLogger } from "../core/logger.ts";
       ) => Promise<string[]>)
     | undefined = undefined;
   /** 批量查询缓存命中（委托 plugin.checkTranslationCacheHits），供预翻译弹窗精确计算待译数 */
-  export let onCheckCache: ((texts: string[]) => Promise<boolean[]>) | undefined = undefined;
+  export let onCheckCache:
+    | ((texts: string[], to?: string) => Promise<boolean[]>)
+    | undefined = undefined;
   /**
    * 2026-11-17：读缓存里的译文（委托 plugin.getTranslationCache）。
    * PDF 整本翻译用：命中段的译文必须取出来填进结果，否则该页只有未命中段有译文。
@@ -1087,13 +1089,27 @@ import { getLogger } from "../core/logger.ts";
    * 2026-10-07 第 3 批：词典管理改为设置弹窗内二级页后，这里不再需要
    *    额外的 showDictManager 状态（旧方案要另开一个弹窗）。
    */
-  $: dictManagerRef = (window as any)?.__rewordDictManager ?? null;
+  let dictManagerRef: any = (window as any)?.__rewordDictManager ?? null;
   /**
    * 翻译宿主实例（由插件入口挂在 window 上，此处读取并注入设置弹窗）。
    * 2026-10-07：接通翻译链路时新增——「翻译引擎配置」二级页要经它
    * 读设置 / 存设置 / 测连通性。与词典同一套路。
+   *
+   * 2026-11-19：改为「初值 + 挂载后补取」。此前是无依赖的 `$:`，只在组件
+   * 初始化那一瞬读 window：若阅读页签在插件 onload 挂宿主之前就被恢复，
+   * 这里会永久是 null → 设置页读到空配置（看着像「密钥没填」，实际翻译照常跑）。
    */
-  $: translateHostRef = (window as any)?.__rewordTranslateHost ?? null;
+  let translateHostRef: any = (window as any)?.__rewordTranslateHost ?? null;
+  onMount(() => {
+    if (dictManagerRef && translateHostRef) return;
+    let tries = 0;
+    const timer = setInterval(() => {
+      dictManagerRef = dictManagerRef ?? (window as any)?.__rewordDictManager ?? null;
+      translateHostRef = translateHostRef ?? (window as any)?.__rewordTranslateHost ?? null;
+      if ((dictManagerRef && translateHostRef) || ++tries >= 20) clearInterval(timer);
+    }, 250);
+    return () => clearInterval(timer);
+  });
   /**
    * 思源 API（2026-10-08 新增，供「选择导出文档」二级页用）。
    *
@@ -6638,6 +6654,33 @@ import { getLogger } from "../core/logger.ts";
        不会冒泡 change；这里保留兜底，防止将来 schema 改回entry 形态时
        误把一个字符串写进 settings（settings 里并没有 __dict 字段）。 */
     if (path === "__dict") {
+      return;
+    }
+
+    /* ---- 双语总开关：必须驱动运行时 ----
+       设置页开关原先只落 settings、不启停双语运行时（打开后要重开书才出译文）；
+       而工具栏菜单只驱动运行时、不落盘（重开书即丢）。两条路径统一走
+       toggleBilingual：开启带语言识别与引擎检查，关闭同步移除注入节点。 */
+    if (path === "bilingual") {
+      const want = value !== false;
+      if (want !== bilingualOn) void toggleBilingual();
+      return;
+    }
+
+    /* ---- 双语目标语言（2026-11-19）：影响 handle 的 to 与整窗译文 ----
+       旧实现两处失效：handle 创建时把 to 固化，改完不重建永远用旧语言；
+       缓存键也不含目标语言，重开书仍命中旧语言译文。缓存隔离已在 run.ts 完成，
+       这里负责重建 handle（重建会清空注入，再按新目标重译）。 */
+    if (path === "bilingualTarget") {
+      settings = settingsStore.update({ bilingualTarget: String(value || "zh") } as any);
+      const wasOn = bilingualOn;
+      if (bilingualHandle) {
+        try { bilingualHandle.destroy(); } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · 切换翻译目标语言重建双语", "debug"); }
+        bilingualHandle = null;
+      }
+      bilingualOn = false;
+      bilingualProgress = { done: 0, total: 0, active: false };
+      if (wasOn) enableBilingual();
       return;
     }
 
@@ -12530,6 +12573,8 @@ import { getLogger } from "../core/logger.ts";
   // ========== 2026-08-27 重设计：双语对照开关 ==========
   /** 双语整批失败 toast 冷却时间戳：避免滚动补译时反复弹 */
   let bilingualFailToastAt = 0;
+  /** 双语「部分段落没译出」轻提示冷却（2026-11-19）：成功数不足一半时提示一次，30s 内不重复 */
+  let bilingualPartialToastAt = 0;
 
   /**
    * 2026-08-31 Phase 3：段落级「重译」。
@@ -12707,7 +12752,9 @@ import { getLogger } from "../core/logger.ts";
       debug: () => settingsStore.get().bilingualDebug ?? false,
       // 2026-08-30：整书预翻译弹窗精确计算待译数（查缓存命中）
       checkCached: (texts) =>
-        onCheckCache ? onCheckCache(texts) : Promise.resolve(new Array(texts.length).fill(false)),
+        onCheckCache
+          ? onCheckCache(texts, settingsStore.get().bilingualTarget || "zh")
+          : Promise.resolve(new Array(texts.length).fill(false)),
       to: target,
       // 2026-08-31 重新启用简洁版：译文风格（直译/简洁）实时读设置，下一轮注入即生效
       getMode: () => (settingsStore.get().bilingualStyle || "default") as "default" | "concise",
@@ -12768,15 +12815,30 @@ import { getLogger } from "../core/logger.ts";
         }
         refreshCacheBookList();
       },
-      onProgress: (done, total) => {
+      onProgress: (done, total, final) => {
         bilingualProgress = { done, total, active: done < total };
+        // 失败提示只在「本轮结束」时判断：增量注入每片都会回调（final=false），
+        // 中间态 done 天然偏小，若照旧判断会误弹「部分段落未译出」。
+        const roundDone = final !== false;
         // 2026-08-28 修复：整批翻译失败（total>0 且 done===0）明确告知用户，
         // 否则 AI 配置错误/网络/限流被静默吞掉、用户无感知。8 秒冷却防刷屏。
-        if (total > 0 && done === 0 && Date.now() - bilingualFailToastAt > 8000) {
+        if (roundDone && total > 0 && done === 0 && Date.now() - bilingualFailToastAt > 8000) {
           bilingualFailToastAt = Date.now();
           toast(t("双语翻译失败：请检查「双语翻译 → 翻译服务」的引擎配置与网络"), 3200, "error");
+        } else if (
+          roundDone &&
+          total >= 5 &&
+          done > 0 &&
+          done / total < 0.5 &&
+          Date.now() - bilingualPartialToastAt > 30000
+        ) {
+          // 部分失败此前完全静默（只在 0 成功时提示），用户只看到零星空白段
+          bilingualPartialToastAt = Date.now();
+          toast(t("部分段落未译出，将在下次翻页时自动重试"), 2600, "info");
         }
-        if (done >= total) {
+        // 本轮结束（含部分空译）：都要收起「翻译中」状态，否则有空白段时
+        // active 永远停在 true、顶栏转圈不消失。
+        if (roundDone) {
           setTimeout(() => {
             bilingualProgress = { ...bilingualProgress, active: false };
             // 翻译完成后读取累计 token 用量（由 index.ts 的 aiTranslateBatch 填充）
@@ -12803,6 +12865,9 @@ import { getLogger } from "../core/logger.ts";
     if (!isTranslationConfigured || isTranslationConfigured()) {
       ensureBilingualHandle().setEnabled(true);
       bilingualOn = true;
+      // 2026-11-17：开启状态必须落盘，否则重开书 / 重启后双语悄悄丢失
+      //（关闭路径一直有写 false，开启路径此前漏了 true）
+      settingsStore.update({ bilingual: true });
       refreshCacheStats(bookId);
       refreshCacheBookList();
     } else {

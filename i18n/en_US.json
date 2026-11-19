@@ -567,6 +567,8 @@
   "双语翻译失败：请检查「AI 设置 → AI 服务」配置与网络": "Bilingual translation failed. Check your \"AI Settings → AI Service\" configuration and network",
   "双语翻译模式记忆（按书）": "Bilingual mode memory (per book)",
   "双语翻译设置": "Bilingual translation settings",
+  "在每段原文下注入译文": "Inject a translation under each paragraph",
+  "引擎、密钥与术语表": "Engine, API key and glossary",
   "双语调试信息": "Bilingual debug info",
   "双页": "Double",
   "反义：": "Ant.:",
@@ -1566,6 +1568,7 @@
   "测试中…": "Testing…",
   "测试在线词典（查 \"mastery\"）": "Test online dictionary (looks up \"mastery\")",
   "测试连接": "Test Connection",
+  "先启用该引擎": "Enable this engine first",
   "浏览器环境通常无法连通，会回退系统语音；讯飞语记改用 URL 鉴权可直连，中文质量更自然（需配置密钥）。": "usually unreachable in browser environments and falls back to system voice; iFlytek uses URL auth and connects directly with more natural Chinese (API key required).",
   "海天蓝": "Ocean",
   "海词": "Haici",
@@ -3269,6 +3272,7 @@
   "翻译引擎不可用：请在「双语翻译」设置中检查引擎开关、密钥或用量上限": "Translation engine unavailable: check the engine switch, credentials, and usage limit in Bilingual translation settings",
   "请先在「双语翻译 → 翻译服务」中启用引擎并填写密钥": "Enable an engine and enter its credentials under Bilingual translation → Translation service first",
   "双语翻译失败：请检查「双语翻译 → 翻译服务」的引擎配置与网络": "Bilingual translation failed: check the engine configuration under Bilingual translation → Translation service and your network",
+  "部分段落未译出，将在下次翻页时自动重试": "Some paragraphs were not translated; they will be retried on the next page turn",
   "翻译引擎与凭据": "Translation engine & credentials",
   "连接方式": "Connection type",
   "连接": "Connection",
@@ -3335,5 +3339,10 @@
   "已生成：{name}": "Generated: {name}",
   "双语 PDF 已生成：{name}": "Bilingual PDF generated: {name}",
   "这份 PDF 是扫描版（没有文字层），无法翻译": "This is a scanned PDF (no text layer) and cannot be translated",
-  "翻译失败：{msg}": "Translation failed: {msg}"
+  "翻译失败：{msg}": "Translation failed: {msg}",
+  "常用平台": "Common platforms",
+  "已填入 {name} 的接口地址与模型": "Filled in the endpoint and model for {name}",
+  "已填入 {name} 的接口地址与模型，并沿用了 AI 平台中保存的密钥": "Filled in the endpoint and model for {name}, reusing the key saved in AI platforms",
+  "翻译服务尚未加载完成，下面的配置暂时为空（不代表没保存过）。请关闭设置后重新打开。": "The translation service has not finished loading, so the fields below are empty (this does not mean nothing was saved). Please close and reopen settings.",
+  "已获取 {n} 个模型，翻译模型已置顶": "Fetched {n} models; translation models are listed first"
 }

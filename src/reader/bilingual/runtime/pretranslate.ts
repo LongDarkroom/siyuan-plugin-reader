@@ -115,7 +115,9 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
     aheadSections: number,
     signal?: AbortSignal,
   ): Promise<void> {
-    const pending = segs.filter((s) => !deps.injector.hasInjected(s.locatorKey));
+    const pending = segs.filter(
+      (s) => !deps.injector.hasInjected(s.locatorKey) && !deps.injector.isBlocked(s.locatorKey),
+    );
     if (!pending.length) return;
     state.total = Math.max(state.total, state.done + pending.length);
 
@@ -293,14 +295,16 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
     },
 
     /**
-     * 预扫描：枚举全书分节 → 按 locatorKey 去重 → 统计段数/字数/已缓存。
+     * 预扫描：枚举全书分节 → 按原文文本去重 → 统计段数/字数/已缓存。
+     * 去重键用文本而不是 locatorKey：定位键含出现位置序号，重复文本各占一条，
+     * 但缓存与送译都按文本合并，统计按文本才与「实际请求量」一致。
      * 不送译、不注入，仅 CPU + 一次缓存读，可安全在确认弹窗打开时调用。
      */
     async scan(signal?: AbortSignal): Promise<PretranslateScan> {
       const seen = new Map<string, string>();
       const sections = deps.getSections?.() ?? [];
       const collect = (segs: Segment[]) => {
-        for (const s of segs) if (!seen.has(s.locatorKey)) seen.set(s.locatorKey, s.text);
+        for (const s of segs) if (!seen.has(s.text)) seen.set(s.text, s.text);
       };
       if (sections.length) {
         for (const sec of sections) {

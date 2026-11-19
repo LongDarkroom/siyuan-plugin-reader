@@ -395,12 +395,16 @@ body.theme--dark :is(.rwd-panel, .cloud-panel) {
 .rwd-close {
   width: 30px; height: 30px;
   flex: none;
+  margin-left: auto; /* 兜底：无论父级是否 flex:1，关闭键都钉在右上角 */
   display: flex; align-items: center; justify-content: center;
   border: none; background: none;
   color: var(--b3-theme-on-surface-light, #9a9aa0);
   border-radius: 8px; cursor: pointer;
+  transition: background 0.14s ease, color 0.14s ease;
 }
 .rwd-close:hover { background: var(--b3-list-hover, rgba(255,255,255,0.06)); color: var(--b3-theme-on-background, #e8e8ea); }
+.rwd-close:active { background: var(--b3-list-hover, rgba(255,255,255,0.1)); }
+.rwd-close:focus-visible { outline: 2px solid var(--b3-theme-primary, #5b7cfa); outline-offset: -2px; }
 
 /* ===================== 内容区 ===================== */
 
@@ -1152,9 +1156,11 @@ body.theme--dark :is(.rwd-panel, .cloud-panel) {
 .rwd-back {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
+  flex: none;
   height: 30px;
-  padding: 0 10px 0 7px;
+  padding: 0 9px 0 6px;
+  margin-left: -6px; /* 让图标左缘贴近正文左线，而非被按钮内边距顶开 */
   border: none;
   border-radius: 8px;
   background: none;
@@ -1166,14 +1172,19 @@ body.theme--dark :is(.rwd-panel, .cloud-panel) {
 }
 .rwd-back svg { width: 16px; height: 16px; }
 .rwd-back:hover { background: var(--b3-list-hover, rgba(127, 127, 127, 0.1)); color: var(--b3-theme-on-background, #e8e8ea); }
-.rwd-back:hover { background: var(--b3-list-hover, rgba(255, 255, 255, 0.12)); }
 
+/* 标题必须吃掉剩余宽度：否则 × 会紧贴标题留在左侧，而不是停在右上角 */
 .rwd-subhead-title {
+  flex: 1;
+  min-width: 0;
   margin: 0;
-  font-size: 14px;
+  font-size: 15px;
   font-weight: 600;
   font-family: inherit;
   color: var(--b3-theme-on-background, #e8e8ea);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ===================== 搜索结果 ===================== */
@@ -1699,6 +1710,19 @@ body.theme--dark :is(.rwd-panel, .cloud-panel) {
   line-height: 1.5;
   color: var(--b3-theme-on-surface-light, #9a9aa0);
 }
+
+/* ---- 常用平台快捷填充（通用大模型卡） ---- */
+.rwd-tr-presets {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rwd-tr-preset-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.rwd-tr-preset-row .rwd-tr-btn { flex: none; }
 
 /* ===================== 「更多」折叠区（对标 Readest） ===================== */
 

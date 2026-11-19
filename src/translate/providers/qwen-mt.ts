@@ -131,6 +131,8 @@ export class QwenMtTranslator implements Translator {
   async translate(req: TranslateRequest): Promise<string[]> {
     if (!this.available) throw new Error("千问翻译未配置 API Key");
     const out: string[] = new Array(req.texts.length).fill("");
+    let anyOk = false;
+    let lastErr: unknown;
 
     for (const chunk of chunkForQwen(req.texts)) {
       if (req.signal?.aborted) break;
@@ -140,8 +142,14 @@ export class QwenMtTranslator implements Translator {
         chunk.forEach((idx, j) => {
           out[idx] = parts[j] || "";
         });
+        anyOk = true;
       } catch (e) {
-        if (!(e instanceof QwenBatchParseError)) throw e;
+        if (!(e instanceof QwenBatchParseError)) {
+          // 单片失败不连坐：保留其余分片的结果，失败段留空由窗口下一轮补译。
+          // 旧实现直接抛出 → 整批作废，兜底引擎把全部段落重译一遍（双倍费用）。
+          lastErr = e;
+          continue;
+        }
         // 段数对不上：逐段重译。整片只给一段时没有可拆的，留空即可。
         if (slice.length === 1) continue;
         for (let j = 0; j < slice.length; j++) {
@@ -149,12 +157,15 @@ export class QwenMtTranslator implements Translator {
           try {
             const one = await this.callChunk([slice[j]], req);
             out[chunk[j]] = one[0] || "";
+            anyOk = true;
           } catch {
             // 单段失败留空：下次读到该段会自动重试，绝不把别的段落内容填进来
           }
         }
       }
     }
+    // 一片都没成功才抛：让引擎链切到下家兜底（全空返回会被 translateWithFallback 忽略）
+    if (!anyOk && lastErr) throw lastErr;
     return out;
   }
 

@@ -7,14 +7,22 @@
  *  1. **memo**：旧代码在 injectAll / segmentStats / segmentTexts / pretranslateAll
  *     四个调用点各自全量扫描 DOM（同一批段落在一轮里被扫 4 次）。本模块按
  *     Document 做 WeakMap 缓存，四处共用一份结果，翻页或重排时 invalidate。
- *  2. **产出 Segment 而非匿名结构**：带 locatorKey（= segHash(text)，只由原文
- *     决定，不含译文风格），成为注入去重 / 失败重试 / 隐藏集合的统一锚点。
+ *  2. **产出 Segment 而非匿名结构**：带 locatorKey（= 文本指纹 + 节内稳定序号），
+ *     成为注入去重 / 失败重试 / 隐藏集合的统一锚点。
+ *     2026-11-19：键里必须带序号 —— 旧键只由文本决定，书里重复出现的同句
+ *     （对白、分隔符）会被去重逻辑当成「同一段」，第二处起永远不出译文。
+ *     序号只统计「结构合格的候选块」，与是否已注入/隐藏无关，因此临时解析的
+ *     分节文档与已挂载文档能算出同一个键（full 预翻译靠它映射回真实节点）。
  */
 import type { Segment, SegmenterLike } from "../core/types.ts";
 import { segHash, isTranslatedPeer } from "../../bilingual-v2/render.ts";
 
-/** 真实正文块（首选段落级） */
-const BLOCK = "p, li, blockquote";
+/**
+ * 真实正文块（首选段落级）。
+ * 2026-11-19 补 h1–h6 / figcaption / dt / dd：标题与图注此前完全不翻。
+ * caption 刻意不收：<table> 内插 div 兄弟是非法结构，浏览器会把译文提出表格。
+ */
+const BLOCK = "p, li, blockquote, h1, h2, h3, h4, h5, h6, figcaption, dt, dd";
 /** div 仅作叶子文本块兜底：部分 EPUB 用 div 而非 p 做段落 */
 const LEAF_DIV = "div";
 /**
@@ -26,8 +34,13 @@ const CELL = "td, th";
 const HAS_LETTER = /\p{L}/u;
 /** 不应翻译的节点 */
 const EXCLUDED = "pre, code, math, style, script";
-/** 作为整体翻译的容器：其内 p/li 跳过，改译容器整体 */
-const CONTAINER = "blockquote, li";
+/**
+ * 作为整体翻译的容器：其内 p 跳过，改译容器整体。
+ * 2026-11-19 移出 blockquote：引文常含多个段落，整体切会把多段合成一段
+ * （丢段落结构、单条过长易被引擎截断）；改为 blockquote 有块级子节点时
+ * 自身让位、由内部 p 各自承载译文。
+ */
+const CONTAINER = "li";
 
 export function cleanText(s: string): string {
   return (s || "").replace(/\s+/g, " ").trim();
@@ -48,27 +61,34 @@ export function segmentDocument(
   const all = Array.from(doc.querySelectorAll(`${BLOCK}, ${LEAF_DIV}, ${CELL}`)) as Element[];
   const out: Segment[] = [];
   let recent: string[] = [];
+  /**
+   * 稳定序号：对每个「结构合格」的候选块递增，**在跳过已注入/隐藏之前占号**。
+   * 这样同一节点在临时文档（未注入）与已挂载文档（部分已注入）里拿到同一个序号，
+   * 定位键才能跨文档对齐；同时重复文本靠序号区分，互不吞掉。
+   */
+  let ordinal = 0;
   for (const el of all) {
     if (el.closest(EXCLUDED)) continue;
     if ((el as HTMLElement).classList?.contains("reword-bilingual")) continue;
     if (el.hasAttribute("data-translation-mark")) continue;
-    // 叶子判定：div 与单元格只在「没有块级后代」时整体翻译；
-    // 含 table 的单元格同样跳过（嵌套表格由内层单元格各自承担）。
+    // 叶子判定：div / 单元格 / blockquote 只在「没有块级后代」时整体翻译；
+    // 含 table 的同样跳过（嵌套表格由内层单元格各自承担）。
     if (
-      (el.tagName === "DIV" || el.tagName === "TD" || el.tagName === "TH") &&
+      (el.tagName === "DIV" || el.tagName === "TD" || el.tagName === "TH" || el.tagName === "BLOCKQUOTE") &&
       el.querySelector("p, li, blockquote, div, table")
     ) continue;
     if (el.parentElement?.closest(CONTAINER)) continue;
-    if (el.hasAttribute("data-reword-translated") || isTranslatedPeer(el)) continue;
     const text = cleanText(el.textContent || "");
     if (!text) continue;
     if ((el.tagName === "TD" || el.tagName === "TH") && !HAS_LETTER.test(text)) continue;
+    const index = ordinal++;
+    if (el.hasAttribute("data-reword-translated") || isTranslatedPeer(el)) continue;
     if (isSegmentHidden && isSegmentHidden(segHash(text))) continue;
     out.push({
-      locatorKey: segHash(text),
+      locatorKey: `${segHash(text)}#${sectionIndex}.${index}`,
       text,
       sectionIndex,
-      indexInSection: out.length,
+      indexInSection: index,
       node: el,
       prev: recent.slice(-2).join("\n"),
     });

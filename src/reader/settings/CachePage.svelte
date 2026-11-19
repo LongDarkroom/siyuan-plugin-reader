@@ -173,16 +173,18 @@
   </div>
 
   <div class="cc-toolbar">
-    <button type="button" class="rwd-tr-btn" on:click={refresh} disabled={loading || busy}>
+    <button type="button" class="rwd-tr-btn ghost" on:click={refresh} disabled={loading || busy}>
       {loading ? t("刷新中…") : t("刷新列表")}
     </button>
     <span class="cc-spacer" />
+    <!-- 批量清理：低频且不可撤销，统一走描边样式并与刷新键用竖线隔开 -->
     <button type="button" class="rwd-tr-btn ghost" on:click={() => batch("orphan")} disabled={busy || !rows.length}>
       {t("清理孤儿")}
     </button>
     <button type="button" class="rwd-tr-btn ghost" on:click={() => batch("old")} disabled={busy || !rows.length}>
       {t("清理 90 天前")}
     </button>
+    <span class="cc-div" aria-hidden="true" />
     <button type="button" class="rwd-tr-btn danger" on:click={() => batch("all")} disabled={busy || !rows.length}>
       {t("清空全部")}
     </button>
@@ -244,6 +246,8 @@
   .cc-sum-dot { color: var(--b3-theme-on-surface, #bbb); }
   .cc-toolbar { display: flex; align-items: center; gap: 8px; }
   .cc-spacer { flex: 1; }
+  /* 危险区隔线：把「清空全部」与普通清理分开，避免误触 */
+  .cc-div { width: 1px; height: 14px; margin: 0 2px; background: var(--b3-border-color, #e2e2e2); }
   .cc-empty { padding: 18px 0; text-align: center; font-size: 12px; color: var(--b3-theme-on-surface, #999); }
   .cc-head, .cc-row { display: grid; grid-template-columns: 1fr 96px 88px 60px; gap: 8px; align-items: center; }
   .cc-head { font-size: 11px; color: var(--b3-theme-on-surface, #999); padding: 0 2px; }
@@ -269,10 +273,15 @@
   .cc-size-sub { font-size: 10px; color: var(--b3-theme-on-surface, #999); }
   .cc-date { font-size: 12px; color: var(--b3-theme-on-surface, #777); }
   .cc-tip { font-size: 11px; color: var(--b3-theme-primary, #3b82f6); }
-  /* 危险按钮：仅文字变红，内边距/边框与 ghost 一致 —— 切换态不引起位移 */
+  /* 危险按钮：描边式（透明底 + 红字），不再与主按钮的实心色抢视线；
+     内边距/边框与 ghost 一致 —— 切换态不引起位移 */
   .cc-toolbar :global(.rwd-tr-btn.danger) {
+    background: transparent;
     color: var(--b3-theme-error, #d32f2f);
     border-color: color-mix(in srgb, var(--b3-theme-error, #d32f2f) 40%, transparent);
+  }
+  .cc-toolbar :global(.rwd-tr-btn.danger:hover:not(:disabled)) {
+    background: color-mix(in srgb, var(--b3-theme-error, #d32f2f) 10%, transparent);
   }
   .cc-toolbar :global(.rwd-tr-btn.danger:disabled) { opacity: 0.45; }
 </style>

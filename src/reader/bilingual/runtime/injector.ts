@@ -68,6 +68,9 @@ interface FailRecord {
   nextAt: number;
 }
 
+/** 空译文重试用尽后的长冷却（不永久拉黑，网络恢复后还能自愈） */
+const EMPTY_COOLDOWN_MS = 5 * 60_000;
+
 export function createInjector(opts: InjectorOptions = {}): Injector {
   const perFrameDefault = opts.perFrame ?? INJECT_DEFAULTS.perFrame;
   /** 重试上限（动态读，支持设置开关关闭 = 0 即不自动重试） */
@@ -75,6 +78,12 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
     opts.maxRetries && opts.maxRetries() >= 0 ? opts.maxRetries() : PRETRANSLATE_DEFAULTS.maxRetries;
   const injectedSet = new Set<string>();
   const failedSet = new Map<string, FailRecord>();
+  /**
+   * 空译文退避（2026-11-19）：引擎对某段返回空串时旧实现不记任何状态，
+   * 下一轮窗口刷新会再送译一次 —— 翻页越频繁越烧额度。这里与异常共用退避表规则，
+   * 只是分类记录（stats 仍只把异常算作 failed）。
+   */
+  const emptySet = new Map<string, FailRecord>();
   const nodesByKey = new Map<string, Element>();
 
   function nextFrame(): Promise<void> {
@@ -86,12 +95,28 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
     });
   }
 
-  function markFailed(key: string): void {
-    const prev = failedSet.get(key);
+  function backoff(set: Map<string, FailRecord>, key: string): void {
+    const prev = set.get(key);
     const tries = (prev?.tries ?? 0) + 1;
     const delays = PRETRANSLATE_DEFAULTS.retryDelaysMs;
     const delay = delays[Math.min(tries - 1, delays.length - 1)];
-    failedSet.set(key, { tries, nextAt: Date.now() + delay });
+    set.set(key, { tries, nextAt: Date.now() + delay });
+  }
+
+  function markFailed(key: string): void {
+    backoff(failedSet, key);
+  }
+
+  /**
+   * 空译文退避：重试用尽后不永久拉黑，改为 5 分钟长冷却再放行。
+   * 网络抖动/限流造成的空译会自然恢复；真正译不出的段也不会被每轮翻页反复送译。
+   */
+  function markEmpty(key: string): void {
+    const prev = emptySet.get(key);
+    const tries = (prev?.tries ?? 0) + 1;
+    const delays = PRETRANSLATE_DEFAULTS.retryDelaysMs;
+    const delay = tries <= delays.length ? delays[tries - 1] : EMPTY_COOLDOWN_MS;
+    emptySet.set(key, { tries, nextAt: Date.now() + delay });
   }
 
   async function injectBatch(batch: InjectBatch): Promise<InjectResult> {
@@ -119,6 +144,8 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
         }
         const tr = (texts[j] || "").trim();
         if (!tr) {
+          // 引擎返回空译：进入轻量退避，避免每轮翻页重复送译（打标仍不做，窗口过后自动重试）
+          markEmpty(seg.locatorKey);
           result.empty++;
           return;
         }
@@ -142,6 +169,7 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
           el.setAttribute("data-reword-translated", "1");
           injectedSet.add(seg.locatorKey);
           failedSet.delete(seg.locatorKey);
+          emptySet.delete(seg.locatorKey);
           nodesByKey.set(seg.locatorKey, el);
           if (opts.showAiRedo && opts.onAiRedo) bindAiRedoDelegation(doc, opts.onAiRedo);
           if (opts.showHideSegment && opts.onHideSegment) {
@@ -197,9 +225,11 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
       return out;
     },
     isBlocked(key: string, now = Date.now()): boolean {
-      const rec = failedSet.get(key);
-      if (!rec) return false;
-      return rec.tries > maxRetries() || rec.nextAt > now;
+      const failed = failedSet.get(key);
+      if (failed && (failed.tries > maxRetries() || failed.nextAt > now)) return true;
+      // 空译文只看冷却时间（长冷却结束后仍可再试，不会永久拉黑）
+      const empty = emptySet.get(key);
+      return !!empty && empty.nextAt > now;
     },
     stats() {
       return { injected: injectedSet.size, failed: failedSet.size };

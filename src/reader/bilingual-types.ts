@@ -61,8 +61,13 @@ export interface BilingualOptions {
   to?: string;
   /** 书籍元数据回调（书名/作者/语言/目录），注入翻译 system prompt 提升准确性 */
   bookMeta?: () => BilingualBookMeta | null;
-  /** 进度回调（done / total，按本轮送译数计） */
-  onProgress?: (done: number, total: number) => void;
+  /**
+   * 进度回调（done / total，按本轮送译数计）。
+   * `final`：本轮是否已结束（增量注入时每片译完都会回调一次，此时 final=false；
+   * 只有最后一次/异常收尾才是 true）。UI 的失败提示与收尾刷新应判断它，
+   * 否则增量中间态（done 还很小）会被误判为「大量段落失败」。
+   */
+  onProgress?: (done: number, total: number, final?: boolean) => void;
   /** Token 用量回调（每次翻译批次完成后调用；累计值跨批次累加） */
   onTokenUsage?: (usage: { promptTokens: number; completionTokens: number; totalTokens: number }) => void;
   /** 可视过滤开关（默认 true；测试可关掉以翻译全部段落） */

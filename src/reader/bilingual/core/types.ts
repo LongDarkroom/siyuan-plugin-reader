@@ -31,12 +31,14 @@
 /**
  * 切分后的文本块。
  *
- * locatorKey 刻意**只由原文决定**（`hashText(text)`，不带译文风格 mode）：
- * 隐藏集合、脏标记、注入进度都以它为锚；若带上 mode，用户切换「直译/简洁版」
- * 会让这些状态整体漂移。缓存键仍用带 mode 的 `hashText(text, mode)`（旧缓存免迁移）。
+ * locatorKey 由「原文指纹 + 节内稳定序号」组成（`hash#section.ordinal`），不带
+ * 译文风格 mode：隐藏集合、注入去重、失败退避都以它为锚；若带上 mode，用户切换
+ * 「直译/简洁版」会让这些状态整体漂移。序号只统计结构合格的候选块（与是否已注入
+ * 无关），因此重复文本的每个出现位置都有独立键，不会被去重逻辑吞掉。
+ * 缓存键仍用带 mode 的 `hashText(text, mode)`（重复段共享缓存、旧缓存免迁移）。
  */
 export interface Segment {
-  /** 稳定定位键（hashText(text)） */
+  /** 稳定定位键（文本指纹 + 节内序号） */
   locatorKey: string;
   /** 原文（已 trim，可直接送译） */
   text: string;

@@ -464,10 +464,20 @@ export class TranslateHost {
     return out;
   }
 
+  /** 缓存命名空间按目标语言隔离（与 run.ts 的 key 规则保持一致；zh 为默认不加后缀） */
+  private withTarget(ns: string, to?: string): string {
+    return to && to !== "zh" ? `${ns}|${to}` : ns;
+  }
+
   /** 查某书某批原文的缓存命中（整书预翻译弹窗统计用；跨引擎命名空间取并集） */
-  async checkCacheHits(bookId: string, texts: string[], mode?: TranslationMode): Promise<boolean[]> {
+  async checkCacheHits(
+    bookId: string,
+    texts: string[],
+    mode?: TranslationMode,
+    to = "zh",
+  ): Promise<boolean[]> {
     try {
-      const namespaces = this.cacheNamespaces();
+      const namespaces = this.cacheNamespaces().map((ns) => this.withTarget(ns, to));
       const hits = texts.map(() => false);
       let pending = texts.map((_, i) => i);
       for (const ns of namespaces) {
@@ -495,10 +505,11 @@ export class TranslateHost {
     bookId: string,
     texts: string[],
     mode?: TranslationMode,
+    to = "zh",
   ): Promise<Map<string, string>> {
     const out = new Map<string, string>();
     try {
-      const namespaces = this.cacheNamespaces();
+      const namespaces = this.cacheNamespaces().map((ns) => this.withTarget(ns, to));
       const pending = texts.map((_, i) => i);
       for (const ns of namespaces) {
         if (!pending.length) break;

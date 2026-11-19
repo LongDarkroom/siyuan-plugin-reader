@@ -131,8 +131,14 @@ export async function runTranslate(
     opts?.engine,
   );
   const namespaces: string[] = [];
+  /**
+   * 目标语言隔离（2026-11-19）：缓存键此前不含目标语言，用户在「翻译到」
+   * 换成日/韩后仍会命中旧的中文译文。默认目标 zh 不加后缀 → 旧缓存零迁移；
+   * 其他目标加 `|to` 后缀，与 zh 缓存互不污染。
+   */
+  const targetSuffix = to && to !== "zh" ? `|${to}` : "";
   for (const p of chain) {
-    const ns = p.cacheNs ?? "";
+    const ns = (p.cacheNs ?? "") + targetSuffix;
     if (!namespaces.includes(ns)) namespaces.push(ns);
   }
 
@@ -187,7 +193,7 @@ export async function runTranslate(
       const tr = res.texts || [];
       trLog(`${deps.tag}: 引擎返回 provider=${res.provider}, ${tr.length} 条译文, 非空 ${tr.filter((t) => t?.trim()).length} 条`);
       // 写入实际命中引擎的命名空间：换引擎后旧译文不会被覆盖，切回时还能复用
-      const writeNs = chain.find((p) => p.name === res.provider)?.cacheNs ?? "";
+      const writeNs = (chain.find((p) => p.name === res.provider)?.cacheNs ?? "") + targetSuffix;
       const pairs: Array<[string, string]> = [];
       misses.forEach((idx, j) => {
         // 写侧净化：引擎返回先规整为整洁单行再入缓存（拦截「AI 解说体」）

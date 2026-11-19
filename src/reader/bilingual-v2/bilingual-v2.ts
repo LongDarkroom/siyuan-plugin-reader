@@ -8,7 +8,8 @@
  * 保留的既有行为（对外契约与可观测性不变）：
  *  1. 渲染仍是「兄弟节点」方案（render.ts），原文 DOM 零改动 → CFI/标注/批注/TTS 不受影响。
  *  2. Telemetry 总线照旧 emit（done / hit / try / cost / error），面板零埋点订阅。
- *  3. 300ms 防抖注入、120s 翻译超时、跨文档去重、onSectionsCached 回传。
+ *  3. 300ms 防抖注入、跨文档去重、onSectionsCached 回传（2026-11-19：窗口翻译改为
+ *     与引擎分片对齐的「增量注入」——每片译完立即注入，单片 60s 超时不连坐）。
  *  4. createBilingualV2 名字与 BilingualHandle 契约不变 → ReaderView 零改动。
  *
  * 变化：注入改为「分帧有界 + 读写分离 + 三态」，预翻译改为「全本/渐进队列 +
@@ -26,13 +27,37 @@ import { createSegmenter } from "../bilingual/runtime/segmenter.ts";
 import { createVisibility } from "../bilingual/runtime/visibility.ts";
 import { createInjector } from "../bilingual/runtime/injector.ts";
 import { createPretranslateQueue } from "../bilingual/runtime/pretranslate.ts";
+import { chunkTexts } from "../../translate/providers/batch.ts";
 import { telemetry } from "./telemetry.ts";
 import { getLogger } from "../../core/logger.ts";
+
+/**
+ * 窗口增量注入的分片预算（2026-11-19 P1-5）。
+ * 与千问单次请求预算（3500 字 / 12 段）对齐：每片 ≈ 1 次引擎请求，
+ * 译完一片就注入一片，用户不必等整窗全部返回（旧实现要等所有分片串行跑完）。
+ */
+const INJECT_BATCH_MAX_CHARS = 3500;
+const INJECT_BATCH_MAX_SEGMENTS = 12;
+/** 单片超时：超时只作废这一片（按空译退避），后续分片照常进行，不再整窗连坐 */
+const INJECT_BATCH_TIMEOUT_MS = 60_000;
+
+/** 给 Promise 套单片超时，按时清理定时器（旧实现 race 的定时器从不回收） */
+function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    p.then(
+      (v) => { clearTimeout(timer); resolve(v); },
+      (e) => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
 
 export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
   let enabled = false;
   let injectTimer: any = null;
   let injecting = false;
+  /** 翻译进行中又有翻页/刷新触发的调度：本批结束后补跑一轮（否则那次调度被静默丢弃） */
+  let injectDirty = false;
   /**
    * 整书预翻译进行中：暂停「窗口注入」这条通路。
    * 预翻译队列自己会注入闸门内的段（getLiveSegment + injectBatch），
@@ -167,27 +192,31 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     onProgress: () => emitProgress(queue.state().status),
   });
 
-  /** 收集「窗口内 + 未注入 + 未被退避挡住 + 跨文档去重」的待处理段 */
+  /** 收集「窗口内 + 未注入 + 未被退避挡住」的待处理段（定位键已含节内序号，重复文本各自保留） */
   function collectPending(): ReturnType<typeof segmenter.segmentsOfDocs> {
     const docs = opts.getContents() || [];
     const cur = opts.getCurrentSection?.() ?? 0;
     const gate = { aheadSections: aheadOf() };
-    const seen = new Set<string>();
     return segmenter
       .segmentsOfDocs(docs, cur)
       .filter((s) => visibility.withinInjectGate(s.sectionIndex, gate))
       .filter((s) => !injector.hasInjected(s.locatorKey))
       // 失败段退避过滤：仍在退避期 / 已超重试上限的不重复送译（避免每轮即时无上限重试）
-      .filter((s) => !injector.isBlocked(s.locatorKey))
-      .filter((s) => (seen.has(s.locatorKey) ? false : (seen.add(s.locatorKey), true)));
+      .filter((s) => !injector.isBlocked(s.locatorKey));
   }
 
   async function injectAll(): Promise<void> {
     if (!enabled) return;
-    if (pretranslating) return; // 预翻译队列负责窗口内注入，避免同一段重复送译
-    if (injecting) return; // 防重入
+    // 预翻译队列负责窗口内注入，避免同一段重复送译；它收尾时自会 scheduleInject 补跑
+    if (pretranslating) return;
+    if (injecting) {
+      // 翻译进行中翻页触发的调度不能直接丢：记脏，本批结束后自动补跑一轮
+      injectDirty = true;
+      return;
+    }
     injecting = true;
     let total = 0;
+    let injectedTotal = 0;
     try {
       const pending = collectPending();
       total = pending.length;
@@ -195,30 +224,109 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
         getLogger().info("[REword][双语] injectAll：无待注入段落（docs=0 或全部已注入/被排除）");
         return;
       }
-      getLogger().info(`[REword][双语] injectAll：窗口内待注入 ${total} 段`);
-      const ctxBefore = pending.map((s) => (s.prev && s.prev.trim() ? s.prev : null));
-      const t0 = Date.now();
-      const res = await Promise.race([
-        translateTexts(pending.map((s) => s.text), ctxBefore),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error("翻译超时(120s)：AI 服务无响应，请检查网络与 API 配置")), 120000),
-        ),
-      ]);
-      const latencyMs = Date.now() - t0;
-      const translations = res.texts;
-      const nonEmpty = translations.filter((t) => (t || "").trim()).length;
-      getLogger().info(`[REword][双语] 翻译返回：${translations.length} 条（非空 ${nonEmpty}，耗时 ${latencyMs}ms）`);
+      // 重复文本在窗口里可能出现多次（重复对白 / 分隔符）：送译按文本去重，
+      // 注入仍按每个出现位置各做一次 —— 同一句只付一次钱，但不留空白。
+      const textIdx = new Map<string, number>();
+      const uniqTexts: string[] = [];
+      const uniqCtx: (string | null)[] = [];
+      const fanout: number[] = [];
+      for (const s of pending) {
+        let i = textIdx.get(s.text);
+        if (i === undefined) {
+          i = uniqTexts.length;
+          textIdx.set(s.text, i);
+          uniqTexts.push(s.text);
+          uniqCtx.push(s.prev && s.prev.trim() ? s.prev : null);
+        }
+        fanout.push(i);
+      }
+      // uniq 序号 → 窗口内哪些段落用到它（注入按出现位置逐个做）
+      const segsByUniq = new Map<number, number[]>();
+      fanout.forEach((u, j) => {
+        const arr = segsByUniq.get(u);
+        if (arr) arr.push(j);
+        else segsByUniq.set(u, [j]);
+      });
+      const batches = chunkTexts(uniqTexts, INJECT_BATCH_MAX_CHARS, INJECT_BATCH_MAX_SEGMENTS);
+      getLogger().info(
+        `[REword][双语] injectAll：窗口内待注入 ${total} 段（去重 ${uniqTexts.length} 条，${batches.length} 片增量注入）`,
+      );
 
-      // —— 成本与引擎状态遥测 ——
-      const cacheHits = res.fromCache.filter(Boolean).length;
+      const uniqTr: string[] = new Array(uniqTexts.length).fill("");
+      const uniqProvider: (string | null)[] = new Array(uniqTexts.length).fill(null);
+      const uniqFromCache: boolean[] = new Array(uniqTexts.length).fill(false);
+      const sectionsCached = new Set<number>();
+      const t0 = Date.now();
+      let failedBatches = 0;
+      /** 被预翻译接管而中断：剩余段由队列负责，不算「本轮失败」 */
+      let interrupted = false;
+
+      for (const batch of batches) {
+        if (!enabled) return; // 关闭双语：立即停，不再送译后续分片
+        // 预翻译接管：后续由队列负责注入，已发出的这批结果仍会入缓存
+        if (pretranslating) {
+          interrupted = true;
+          break;
+        }
+
+        try {
+          const res = await withTimeout(
+            translateTexts(batch.map((i) => uniqTexts[i]), batch.map((i) => uniqCtx[i])),
+            INJECT_BATCH_TIMEOUT_MS,
+            "翻译超时(60s)：AI 服务无响应，请检查网络与 API 配置",
+          );
+          batch.forEach((ui, j) => {
+            uniqTr[ui] = res.texts[j] ?? "";
+            uniqProvider[ui] = res.providers[j] ?? null;
+            uniqFromCache[ui] = !!res.fromCache[j];
+          });
+        } catch (e) {
+          // 单片失败/超时只影响这一片：留空交给注入器退避，后续分片照常跑
+          failedBatches++;
+          getLogger().warn(
+            `[REword][双语] 分片翻译失败（${batch.length} 段），继续后续分片：${String((e as Error)?.message || e)}`,
+          );
+        }
+
+        // 本片译完立即注入（这就是「增量注入」：首批译文不必等整窗）
+        if (!enabled) return;
+        const segs: ReturnType<typeof collectPending> = [];
+        const trs: string[] = [];
+        for (const ui of batch) {
+          const tr = uniqTr[ui] || "";
+          for (const j of segsByUniq.get(ui) ?? []) {
+            segs.push(pending[j]);
+            trs.push(tr);
+            if (tr.trim()) {
+              const p = pending[j];
+              if (typeof p.sectionIndex === "number" && p.sectionIndex >= 0) sectionsCached.add(p.sectionIndex + 1);
+            }
+          }
+        }
+        const ir = await injector.injectBatch({ segments: segs, translations: trs });
+        injectedTotal += ir.injected;
+        opts.onProgress?.(injectedTotal, total, false);
+      }
+
+      const latencyMs = Date.now() - t0;
+      getLogger().info(
+        `[REword][双语] 窗口注入完成：成功 ${injectedTotal}/${total} 段，失败分片 ${failedBatches}/${batches.length}，耗时 ${latencyMs}ms`,
+      );
+      if (injectedTotal === 0 && total > 0) {
+        getLogger().warn("[REword][双语] 窗口内 0 段注入成功（AI 返回空译文或元素已断开）");
+      }
+
+      // —— 成本与引擎状态遥测（按唯一文本聚合，避免重复段重复计数）——
+      const answered = uniqTexts.length;
+      const cacheHits = uniqFromCache.filter(Boolean).length;
       const engineCounts: Record<string, number> = {};
       let tencentChars = 0;
-      res.providers.forEach((p, i) => {
+      uniqProvider.forEach((p, i) => {
         if (!p) return;
         engineCounts[p] = (engineCounts[p] || 0) + 1;
-        if (p === "tencent") tencentChars += pending[i]?.text.length || 0;
+        if (p === "tencent") tencentChars += uniqTexts[i]?.length || 0;
       });
-      telemetry.emit({ phase: "done", bookId: opts.bookId, segmentCount: translations.length, latencyMs, runId });
+      telemetry.emit({ phase: "done", bookId: opts.bookId, segmentCount: answered, latencyMs, runId });
       if (cacheHits > 0) {
         telemetry.emit({ phase: "hit", bookId: opts.bookId, engine: "cache", segmentCount: cacheHits, runId });
       }
@@ -235,38 +343,29 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
       telemetry.emit({
         phase: "cost",
         bookId: opts.bookId,
-        segmentCount: translations.length,
+        segmentCount: answered,
         fromCache: cacheHits > 0,
         chars: tencentChars,
         runId,
       });
 
-      if (opts.onSectionsCached) {
-        const secSet = new Set<number>();
-        pending.forEach((p, i) => {
-          const tr = (translations[i] || "").trim();
-          if (tr && typeof p.sectionIndex === "number" && p.sectionIndex >= 0) secSet.add(p.sectionIndex + 1);
-        });
-        if (secSet.size) opts.onSectionsCached(opts.bookId, [...secSet].sort((a, b) => a - b));
+      if (opts.onSectionsCached && sectionsCached.size) {
+        opts.onSectionsCached(opts.bookId, [...sectionsCached].sort((a, b) => a - b));
       }
-
-      if (!enabled) return; // 中断安全
-      // 分帧有界注入 + 三态（成功才打标；失败/空译文不打标，下轮重试）
-      const ir = await injector.injectBatch({ segments: pending, translations });
-      getLogger().info(
-        `[REword][双语] 注入完成：成功 ${ir.injected}，留空 ${ir.empty}，失败 ${ir.failed}（共 ${total} 段）`,
-      );
-      if (ir.injected === 0 && total > 0) {
-        getLogger().warn("[REword][双语] 窗口内 0 段注入成功（AI 返回空译文或元素已断开）");
-      }
-      opts.onProgress?.(ir.injected, total);
+      // 被预翻译接管时不做「本轮完成」判定：剩余段由队列补，避免误弹部分失败提示
+      opts.onProgress?.(injectedTotal, total, !interrupted);
     } catch (e) {
       console.warn("[REword] 双语v2 注入失败:", e);
       getLogger().error("[REword][双语] injectAll 异常:", { error: String((e as Error)?.message || e) });
       telemetry.emit({ phase: "error", bookId: opts.bookId, error: String((e as Error)?.message || e), runId });
-      opts.onProgress?.(0, total);
+      opts.onProgress?.(injectedTotal, total, true);
     } finally {
       injecting = false;
+      // 翻译期间被吞掉的调度在这里补跑（关闭双语后不补）
+      if (injectDirty) {
+        injectDirty = false;
+        if (enabled) scheduleInject();
+      }
     }
   }
 

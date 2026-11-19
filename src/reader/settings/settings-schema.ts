@@ -1090,38 +1090,31 @@ export const TABS: TabDef[] = [
     groups: [
       {
         title: t("对照阅读"),
-        // 关闭态只留一个开关会显得「其余设置丢了」——补一句说明填补空白。
-        note: {
-          text: t("开启翻译后，语言、预取与重试等选项才会显示"),
-          showIf: (s) => !s.bilingual,
-        },
+        // 2026-11-19：关闭态不再隐藏其余选项。
+        // 此前用 showIf 让语言 / 预取 / 重试只在开启后出现，用户点完「开始翻译」
+        // 再进设置会看到整组突然多出 6 行（布局跳动，像换了一个页面）。
+        // 现在全部常驻：开关只决定是否注入译文，参数可以先配好、开启即生效。
         rows: [
           { path: "bilingual", label: t("启用翻译"), ctrl: "switch",
             hint: t("原文下插入译文，边读边译"), apply: "render", scope: "book" },
-          // ---- 以下 6 项仅在开启翻译后显示 ----
           { path: "bilingualShowSource", label: t("显示原文"), ctrl: "switch",
-            apply: "render", scope: "book",
-            showIf: (s) => !!s.bilingual },
+            apply: "render", scope: "book" },
           // 悬停显形：只淡出译文、不收起占位，鼠标扫过正文时不会上下跳动；
           // 与「显示原文 = 关」互斥（原文都藏了，译文再藏会是空白页）。
           { path: "bilingualHoverShow", label: t("悬停显示译文"), ctrl: "switch",
             apply: "render", scope: "book",
-            hint: t("悬停原文时才显示译文"),
-            showIf: (s) => !!s.bilingual && s.bilingualShowSource !== false },
+            hint: t("悬停原文时才显示译文") },
           { path: "bilingualTarget", label: t("翻译到"), ctrl: "select",
             // 2026-10-06：原先此行既无 options 也无 optionsFrom → 下拉渲染成空，
             // 用户以为功能坏了。选项复用双语模块的既有语言表（含简繁中文）。
             options: TARGET_LANG_OPTIONS,
-            apply: "render", scope: "book",
-            showIf: (s) => !!s.bilingual },
+            apply: "render", scope: "book" },
           { path: "bilingualPrefetchPages", label: t("渐进预取分节"), ctrl: "stepper",
-            min: 0, max: 20, step: 1, unit: t("节"), showIf: (s) => !!s.bilingual },
+            min: 0, max: 20, step: 1, unit: t("节") },
           { path: "translationFontSize", label: t("译文字号"), ctrl: "slider",
-            min: 0.4, max: 1.2, step: 0.02, unit: "%", showIf: (s) => !!s.bilingual },
-          { path: "bilingualSkipCached", label: t("跳过已缓存"), ctrl: "switch",
-            showIf: (s) => !!s.bilingual },
-          { path: "bilingualRetry", label: t("失败自动重试"), ctrl: "switch",
-            showIf: (s) => !!s.bilingual },
+            min: 0.4, max: 1.2, step: 0.02, unit: "%" },
+          { path: "bilingualSkipCached", label: t("跳过已缓存"), ctrl: "switch" },
+          { path: "bilingualRetry", label: t("失败自动重试"), ctrl: "switch" },
         ],
       },
       {

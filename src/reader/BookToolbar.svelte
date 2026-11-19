@@ -93,14 +93,29 @@
   {#if menuOpen}
     <div class="rb-menu" role="menu" aria-label={t("双语")}>
       <button class="rb-item" role="menuitem" on:click={() => pick(onPretranslate)}>
-        <span>{t("整本预翻译…")}</span>
-        <span class="rb-item-hint">{t("后台译完，边读边命中")}</span>
+        <svg class="rb-item-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.sparkles}</svg>
+        <span class="rb-item-body">
+          <span class="rb-item-label">{t("整本预翻译…")}</span>
+          <span class="rb-item-hint">{t("后台译完，边读边命中")}</span>
+        </span>
       </button>
       <button class="rb-item" role="menuitem" on:click={() => pick(onToggleBilingual)}>
-        <span>{bilingualOn ? t("关闭双语对照") : t("开启双语对照")}</span>
+        <svg class="rb-item-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.translate}</svg>
+        <span class="rb-item-body">
+          <span class="rb-item-label">{bilingualOn ? t("关闭双语对照") : t("开启双语对照")}</span>
+          <span class="rb-item-hint">{t("在每段原文下注入译文")}</span>
+        </span>
+        {#if bilingualOn}
+          <svg class="rb-item-check" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.check}</svg>
+        {/if}
       </button>
+      <div class="rb-sep" aria-hidden="true"></div>
       <button class="rb-item" role="menuitem" on:click={() => pick(onOpenSettings)}>
-        <span>{t("双语翻译设置")}</span>
+        <svg class="rb-item-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.settings}</svg>
+        <span class="rb-item-body">
+          <span class="rb-item-label">{t("双语翻译设置")}</span>
+          <span class="rb-item-hint">{t("引擎、密钥与术语表")}</span>
+        </span>
       </button>
     </div>
   {/if}
@@ -147,15 +162,17 @@
     top: calc(100% + 6px);
     right: 0;
     z-index: 10;
-    width: 208px;
-    padding: 6px;
+    width: 236px;
+    padding: 5px;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    border-radius: 10px;
-    background: var(--b3-theme-surface, #fff);
-    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
+    gap: 1px;
+    border-radius: 12px;
+    background: var(--b3-menu-background, var(--b3-theme-surface, #fff));
+    border: 0.5px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
+    box-shadow:
+      0 12px 32px rgba(0, 0, 0, 0.14),
+      0 2px 6px rgba(0, 0, 0, 0.06);
     transform-origin: top right;
     animation: rb-menu-in 140ms ease-out;
   }
@@ -165,27 +182,66 @@
   }
   .rb-item {
     display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
+    align-items: flex-start;
+    gap: 9px;
     width: 100%;
-    min-height: 32px;
-    padding: 6px 8px;
+    min-height: 0;
+    padding: 7px 9px;
     border: none;
-    border-radius: 6px;
+    border-radius: 8px;
     background: none;
     cursor: pointer;
     text-align: left;
-    font-size: 13px;
+    font-family: inherit;
     color: var(--b3-theme-on-background, #333);
   }
   .rb-item:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.06));
   }
+  .rb-item-ic {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    margin-top: 1px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.75;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    opacity: 0.68;
+  }
+  .rb-item-check {
+    flex: none;
+    width: 15px;
+    height: 15px;
+    margin: 2px 0 0 auto;
+    fill: none;
+    stroke: #2f9e44;
+    stroke-width: 2;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .rb-item-body {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+  }
+  .rb-item-label {
+    font-size: 13px;
+    line-height: 1.35;
+    white-space: nowrap;
+  }
   .rb-item-hint {
     font-size: 11px;
+    line-height: 1.4;
     opacity: 0.55;
-    white-space: nowrap;
+    white-space: normal;
+  }
+  .rb-sep {
+    height: 1px;
+    margin: 4px 6px;
+    background: var(--b3-border-color, rgba(128, 128, 128, 0.2));
   }
 
   /* 触屏：点按目标放大，▾ 不能再是 18px 的细条 */
@@ -201,6 +257,7 @@
     }
     .rb-item {
       min-height: 40px;
+      padding: 8px 9px;
     }
   }
 
@@ -216,7 +273,7 @@
       width: 12px;
       height: 12px;
     }
-    .rb-item {
+    .rb-item-label {
       font-size: 12.5px;
     }
   }

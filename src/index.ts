@@ -616,11 +616,11 @@ export class ReaderPlugin extends Plugin {
     return h.translateBatchDetailed(texts, from, to, bookId, ctxBefore, meta, opts);
   }
 
-  /** 整书预翻译弹窗用：查某批原文的缓存命中 */
-  public async checkTranslationCacheHits(bookId: string, texts: string[]): Promise<boolean[]> {
+  /** 整书预翻译弹窗用：查某批原文的缓存命中（to 用于目标语言隔离的缓存命名空间） */
+  public async checkTranslationCacheHits(bookId: string, texts: string[], to?: string): Promise<boolean[]> {
     const h = this.getTranslate();
     if (!h) return texts.map(() => false);
-    return h.checkCacheHits(bookId, texts);
+    return h.checkCacheHits(bookId, texts, undefined, to);
   }
 
   /**

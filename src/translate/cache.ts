@@ -71,12 +71,14 @@ export interface CacheStats {
 /**
  * 命名空间 → 引擎标识。
  * 空串是历史/腾讯键（腾讯不隔离命名空间）；未知值原样返回，UI 兜底展示。
+ * 非默认目标语言的命名空间带 `|to` 后缀，先剥掉再归类。
  */
 export function engineFromNamespace(ns: string): string {
-  if (!ns) return "tencent";
-  if (ns.startsWith("qwen-mt")) return "qwen-mt";
-  if (ns.startsWith("openai")) return "openai-compat";
-  if (ns === "ai") return "ai";
+  const base = ns.includes("|") ? ns.slice(0, ns.indexOf("|")) : ns;
+  if (!base) return "tencent";
+  if (base.startsWith("qwen-mt")) return "qwen-mt";
+  if (base.startsWith("openai")) return "openai-compat";
+  if (base === "ai") return "ai";
   return ns;
 }
 
