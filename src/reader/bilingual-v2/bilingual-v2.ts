@@ -79,6 +79,9 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
 
   const segmenter = createSegmenter({
     isSegmentHidden: (h) => !!opts.isSegmentHidden?.(h),
+    // 2026-11-20 块级语种闸门：目标语言用中日韩文书写时，中文主导的块不送译
+    // （英文书里夹的中文简介页 / 人物介绍 / 推广页，送过去就是原样回吐的重复行）
+    targetLang: to,
   });
   const visibility = createVisibility({
     getCurrentSection: () => opts.getCurrentSection?.() ?? 0,
@@ -217,6 +220,8 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     injecting = true;
     let total = 0;
     let injectedTotal = 0;
+    /** 译文与原文一致（已是目标语言）而未注入的段数 */
+    let skippedTotal = 0;
     try {
       const pending = collectPending();
       total = pending.length;
@@ -305,12 +310,13 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
         }
         const ir = await injector.injectBatch({ segments: segs, translations: trs });
         injectedTotal += ir.injected;
+        skippedTotal += ir.skipped ?? 0;
         opts.onProgress?.(injectedTotal, total, false);
       }
 
       const latencyMs = Date.now() - t0;
       getLogger().info(
-        `[REword][双语] 窗口注入完成：成功 ${injectedTotal}/${total} 段，失败分片 ${failedBatches}/${batches.length}，耗时 ${latencyMs}ms`,
+        `[REword][双语] 窗口注入完成：成功 ${injectedTotal}/${total} 段（${skippedTotal} 段原文已是目标语言，不注入），失败分片 ${failedBatches}/${batches.length}，耗时 ${latencyMs}ms`,
       );
       if (injectedTotal === 0 && total > 0) {
         getLogger().warn("[REword][双语] 窗口内 0 段注入成功（AI 返回空译文或元素已断开）");

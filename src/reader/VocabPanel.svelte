@@ -20,7 +20,10 @@
   export let bookId = "";
   export let bookTitle = "";
   export let t: (key: string, params?: Record<string, any>) => string = (k) => k;
-  export let onOpenWord: ((word: string, entry: VocabEntry) => void) | undefined = undefined;
+  /** anchor = 被点条目在视口里的矩形，供阅读器把词典卡贴着这条排 */
+  export let onOpenWord:
+    ((word: string, entry: VocabEntry, anchor?: { left: number; top: number; right: number; bottom: number }) => void)
+    | undefined = undefined;
 
   const BOOK_COLORS = ["#d69a2b", "#62a2ff", "#d66b6b", "#58b78b", "#8e7cc3", "#4fa3a5"];
   const timeFmt = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
@@ -114,14 +117,18 @@
     return BOOK_COLORS[h % BOOK_COLORS.length];
   }
 
-  function openWord(entry: VocabEntry): void {
-    onOpenWord?.(entry.word, entry);
+  function openWord(entry: VocabEntry, rowEl?: unknown): void {
+    const r = (rowEl as HTMLElement | null | undefined)?.getBoundingClientRect?.();
+    const anchor = r && r.width > 0
+      ? { left: r.left, top: r.top, right: r.right, bottom: r.bottom }
+      : undefined;
+    onOpenWord?.(entry.word, entry, anchor);
   }
 
   function onRowKey(e: KeyboardEvent, entry: VocabEntry): void {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      openWord(entry);
+      openWord(entry, e.currentTarget);
     }
   }
 
@@ -208,7 +215,7 @@
             role="button"
             tabindex="0"
             title={t("查看释义")}
-            on:click={() => openWord(entry)}
+            on:click={(e) => openWord(entry, e.currentTarget)}
             on:keydown={(e) => onRowKey(e, entry)}
           >
             <div class="vocab-word-line">

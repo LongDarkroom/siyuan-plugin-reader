@@ -3296,7 +3296,7 @@ import { getLogger } from "../core/logger.ts";
         dictPopupSource = null;
         hoverWord = null;
         hoverAnchorRect = null;
-        hoverAnchorViewport = null;
+        dictAnchorViewport = null;
       }
     }, delay);
   }
@@ -3314,7 +3314,8 @@ import { getLogger } from "../core/logger.ts";
    */
   function placeHoverDictPopup(anchor: SelRect): { x: number; y: number; maxH: number; placement: "below" | "above"; tailX: number } {
     const pad = 8;
-    const gap = 6;
+    // 与 demo / 划词工具栏同一口径：卡片边到锚点 8px（尾巴占住这段距离）。
+    const gap = 8;
     // 下方至少能放这么多才留在下方；连这么高都没有才翻上去（卡片本身可滚动）
     const MIN_BELOW = 180;
     const MIN_H = 160;
@@ -3338,12 +3339,14 @@ import { getLogger } from "../core/logger.ts";
     const room = placement === "below" ? belowSpace : aboveSpace;
     // 卡片被夹到内容区边缘时，词未必还在卡片正中；尾巴按词中心在卡内的相对位置落点。
     const tailLeft = Math.min(Math.max(rawX - (x - halfW), 18), Math.max(18, cardW - 18));
+    const y = placement === "below" ? anchor.bottom - off.top + gap : anchor.top - off.top - gap;
+    const tailX = x - halfW + tailLeft;
     return {
       x,
-      y: placement === "below" ? anchor.bottom - off.top + gap : anchor.top - off.top - gap,
+      y,
       maxH: Math.max(MIN_H, Math.min(cap, room)),
       placement,
-      tailX: x - halfW + tailLeft,
+      tailX,
     };
   }
 
@@ -3353,7 +3356,7 @@ import { getLogger } from "../core/logger.ts";
    */
   function repositionHoverDict(anchor: SelRect) {
     if (!dictPopup.visible || dictPopupSource !== "hover") return;
-    hoverAnchorViewport = anchor;
+    dictAnchorViewport = anchor;
     const box = placeHoverDictPopup(anchor);
     dictPopupPlacement = box.placement;
     dictTailX = box.tailX;
@@ -3367,7 +3370,7 @@ import { getLogger } from "../core/logger.ts";
   function showHoverDict(word: string, anchor: SelRect) {
     clearHoverHide();
     hoverWord = word;
-    hoverAnchorViewport = anchor;
+    dictAnchorViewport = anchor;
     dictPopupSource = "hover";
     dictExpanded = false;
     const box = placeHoverDictPopup(anchor);
@@ -3446,6 +3449,9 @@ import { getLogger } from "../core/logger.ts";
     };
 
     // 词矩形先换算到视口坐标：弹窗定位（placeHoverDictPopup）与内容边界同为视口基准。
+    // 2026-11-20：这里曾是锚点的唯一来源 —— 旧的「词矩形偏离指针 > 24px 就改用指针」
+    // 兜底已删除。那个兜底本意是防换算整体偏移，实际后果是卡片跟着光标跑、尾巴指不到词；
+    // 换算真出错时它也只是把错误藏起来。锚点恒等于词。
     const toViewportAnchor = (rect: DOMRect): SelRect => {
       const frame = (doc.defaultView as any)?.frameElement as HTMLElement | null;
       const fr = frame?.getBoundingClientRect();
@@ -3455,28 +3461,6 @@ import { getLogger } from "../core/logger.ts";
         right: rect.right + (fr?.left ?? 0),
         bottom: rect.bottom + (fr?.top ?? 0),
       };
-    };
-
-    /**
-     * 命中词的矩形应当包含指针。固定版式（页面缩放 / transform）下 iframe 局部坐标
-     * 与父窗口的换算一旦整体偏移，卡片就会飞到离词很远的地方。
-     * 这里做一次合理性校验：矩形偏离指针超过 24px 就不再信任它，
-     * 直接以指针位置为锚点 —— 宁可贴着光标，也不能飘去别处。
-     */
-    let fallbackLoggedAt = 0;
-    const anchorForWord = (rect: DOMRect, vx: number, vy: number): SelRect => {
-      const a = toViewportAnchor(rect);
-      const near =
-        vx >= a.left - 24 && vx <= a.right + 24 && vy >= a.top - 24 && vy <= a.bottom + 24;
-      if (near) return a;
-      // 每次 hover 只记一条，避免 mousemove 高频刷日志
-      if (Date.now() - fallbackLoggedAt > 5000) {
-        fallbackLoggedAt = Date.now();
-        getLogger().debug(
-          `[RE 悬浮] 词矩形与指针偏差过大（rect ${Math.round(a.left)},${Math.round(a.top)} vs 指针 ${Math.round(vx)},${Math.round(vy)}），改按指针定位`,
-        );
-      }
-      return { left: vx - 6, right: vx + 6, top: vy - 10, bottom: vy + 6 };
     };
 
     const HOVER_TOLERANCE = 16; // px：悬浮取词容差带，轻微移动不消失（2026-08-30）
@@ -3527,13 +3511,13 @@ import { getLogger } from "../core/logger.ts";
         const a = hoverAnchorRect;
         if (!a || Math.abs(a.left - found.rect.left) > 2 || Math.abs(a.top - found.rect.top) > 2) {
           hoverAnchorRect = found.rect;
-          repositionHoverDict(anchorForWord(found.rect, vx, vy));
+          repositionHoverDict(toViewportAnchor(found.rect));
         }
         return;
       }
       // 4) 不同单词 → 仅当确实离开原词容差带才更新（容差带内不重复触发，避免抖动/闪烁）
       hoverAnchorRect = found.rect;
-      showHoverDict(found.word, anchorForWord(found.rect, vx, vy));
+      showHoverDict(found.word, toViewportAnchor(found.rect));
     };
 
     trackDocListener(doc, "mousemove", onMove as EventListener);
@@ -3650,6 +3634,13 @@ import { getLogger } from "../core/logger.ts";
 
       view.addEventListener("relocate", (e: any) => {
         const d = e.detail;
+        // 2026-11-20：用户自己翻页 / 滚动 ⇒ 立刻释放沉浸锚点锁。
+        // （'navigation' 是我们自己的 goTo 回锚，'anchor' 是重排后 foliate 的
+        //   anchor 恢复，这两种不能算用户操作，否则锁会被自己的回锚冲掉。）
+        const relocReason = d?.reason;
+        if (relocReason && relocReason !== "navigation" && relocReason !== "anchor") {
+          releaseRelayoutAnchor();
+        }
         const frac = typeof d?.fraction === "number" ? d.fraction : 0;
         progress = frac;
         if (!dragging) progressText = fmtPct(frac);
@@ -5156,6 +5147,89 @@ import { getLogger } from "../core/logger.ts";
     return String(view?.lastLocation?.cfi ?? "");
   }
 
+  /**
+   * 2026-11-20：即时读取「当前视口第一个可见字符」的 CFI（重排回锚专用）。
+   *
+   * ⚠️ 为什么不能直接用 currentCfi()：
+   *   foliate 的翻页是**带 300ms 动画**的（`#scrollTo` → cssAnimateScroll /
+   *   ViewTransition），`relocate` 事件和 `view.lastLocation` 都要等动画**结束**
+   *   才更新。用户在翻页途中、或刚落页的瞬间进出沉浸时，lastLocation 还停在
+   *   上一页 —— 拿它回锚，读者就被带回上一页（即「关掉沉浸莫名往回翻一页」）。
+   *
+   * 做法：分页时容器 scrollLeft/Top 就是「当前页起点」在内容坐标里的位置，
+   *   直接用 caretRangeFromPoint 反查该位置的字符，再用 view.getCFI 换 CFI。
+   *   内容坐标与视口宽度无关，所以「进沉浸（变宽）/退沉浸（变窄）」前后读到的
+   *   都是同一页首字符，天然不受布局变动影响。
+   *   取不到（PDF / 竖排 / 坐标点刚好落在空白）时退回 lastLocation。
+   */
+  function visibleCfiNow(): string {
+    const fallback = currentCfi();
+    try {
+      const renderer: any = (view as any)?.renderer;
+      const contents: any[] = renderer?.getContents?.() ?? [];
+      if (!contents.length) return fallback;
+      const box: DOMRect | undefined = renderer.getBoundingClientRect?.();
+      if (!box || box.width <= 0 || box.height <= 0) return fallback;
+      const scrollLeft = Math.abs(Number(renderer.scrollLeft) || 0);
+      const scrollTop = Math.abs(Number(renderer.scrollTop) || 0);
+      // 纵向（scrolled 模式 / 竖排版式）用 y 轴，其余按横向分页处理
+      const useY = scrollTop > 1 && scrollLeft <= 1;
+      let viewOffset = 0;
+      for (const item of contents) {
+        const doc: Document | null = item?.doc ?? null;
+        if (!doc) continue;
+        const root: any = doc.documentElement;
+        if (!root) continue;
+        const rootRect = root.getBoundingClientRect?.() ?? { width: 0, height: 0 };
+        const viewLen = useY
+          ? (root.scrollHeight || rootRect.height || 0)
+          : (root.scrollWidth || rootRect.width || 0);
+        // 该 view 在容器滚动坐标里的起点 → 换成本 view 自己的内容坐标
+        const localStart = (useY ? scrollTop : scrollLeft) - viewOffset;
+        // 第一个 view 永远尝试（这里量出来的宽度可能不等于容器里的排布宽，
+        // 一旦算错就把唯一的 view 跳过了 → 白白退回 lastLocation）
+        if (viewOffset > 0 && (localStart < -2 || (viewLen > 0 && localStart > viewLen))) {
+          viewOffset += viewLen;
+          continue;
+        }
+        const caret: ((x: number, y: number) => Range | null) | undefined =
+          (doc as any).caretRangeFromPoint?.bind(doc);
+        if (!caret) return fallback;
+        const xs = useY
+          ? [6, Math.max(24, box.width * 0.3)]
+          : [localStart + 6, localStart + Math.max(24, box.width * 0.3)];
+        const ys = useY
+          ? [localStart + 6, localStart + Math.max(24, box.height * 0.3)]
+          : [6, Math.max(20, box.height * 0.12), Math.max(40, box.height * 0.45)];
+        for (const x of xs) {
+          for (const y of ys) {
+            let r: Range | null = null;
+            try { r = caret(x, y); } catch { r = null; }
+            if (!r) continue;
+            // caretRangeFromPoint 给的是塌缩 range：getClientRects() 为空，
+            // foliate 会当成「定位不到」而跳到章节开头 —— 只接受文本节点，
+            // 并展开成 1 个字符，保证 rect 落在当前列内。
+            const sc: any = r.startContainer;
+            if (!sc || sc.nodeType !== 3 || !sc.length) continue;
+            const so = r.startOffset;
+            if (so >= sc.length) continue;
+            try {
+              r = r.cloneRange();
+              r.setEnd(sc, so + 1);
+            } catch { continue; }
+            if (r.collapsed) continue;
+            const cfi = String(view?.getCFI?.(item.index, r) ?? "");
+            if (cfi) return cfi;
+          }
+        }
+        viewOffset += viewLen;
+      }
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · visibleCfiNow", "debug");
+    }
+    return fallback;
+  }
+
   function refreshBookmarks() {
     const all = store?.getBookmarks?.(bookId) ?? [];
     // 2026-09-03 双保险：只显示与当前书籍 bookType 一致的书签（旧数据无字段则放行）
@@ -5598,11 +5672,35 @@ import { getLogger } from "../core/logger.ts";
   //   再按该 CFI 调 view.goTo 回锚——CFI 是内容坐标，任意重排都落同一段文字。
   //   PDF 不生成 cfi，自动跳过。
   let resizeGestureCfi: string | null = null;
+  /**
+   * 2026-11-20：沉浸进出的「锚点锁定窗」。
+   * 沉浸切换会让思源外框恢复 / 让位，窗口尺寸会连续抖动好几次（宿主 resize、
+   * iframe resize、自动版式重算），每次抖动都会重新调度一次重排。若每次都重抓
+   * 锚点，第二次抓到的就可能是「上一次重排已经跳歪」的位置，越修越偏。
+   * 所以进出沉浸时先抓一次权威锚点并锁住几百毫秒，窗口内的所有重排都用它。
+   */
+  let relayoutAnchorHold: { cfi: string; until: number } | null = null;
+  function holdRelayoutAnchor(cfi: string, ttl = 1800): void {
+    if (!cfi) return;
+    relayoutAnchorHold = { cfi, until: Date.now() + ttl };
+  }
+  function releaseRelayoutAnchor(): void {
+    relayoutAnchorHold = null;
+  }
+
   function scheduleReaderRelayout() {
     // 手势起始：抓取当前 CFI（仅抓一次，避免 foliate 重排期间的 relocate 污染）
+    // 2026-11-20：改用 visibleCfiNow() —— lastLocation 要等翻页动画（300ms）跑完
+    // 才更新，翻页后立刻进出沉浸会抓到上一页，回锚就把读者带回上一页。
     if (resizeGestureCfi === null) {
-      const c = currentCfi();
-      if (c) resizeGestureCfi = c;
+      const hold = relayoutAnchorHold;
+      if (hold && hold.cfi && Date.now() < hold.until) {
+        resizeGestureCfi = hold.cfi;
+      } else {
+        if (hold) relayoutAnchorHold = null;
+        const c = visibleCfiNow();
+        if (c) resizeGestureCfi = c;
+      }
     }
     if (readerRelayoutTimer) clearTimeout(readerRelayoutTimer);
     readerRelayoutTimer = setTimeout(() => {
@@ -5627,9 +5725,42 @@ import { getLogger } from "../core/logger.ts";
         setTimeout(() => {
           try { void view?.goTo(anchor); }
           catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · scheduleReaderRelayout goTo", "debug"); }
+          // 2026-11-20：回锚后再确认一次。重排是异步的（ResizeObserver →
+          // render → scrollToAnchor），goTo 之后 foliate 还可能再 render 一轮，
+          // 若它把位置甩到锚点之前，视觉上就是「莫名往回翻一页」。
+          if (relayoutAnchorHold && Date.now() < relayoutAnchorHold.until) {
+            setTimeout(() => verifyRelayoutAnchor(anchor), 260);
+          }
         }, 80);
       }
     }, 200);
+  }
+
+  /**
+   * 2026-11-20：回锚结果的最后一道校验。
+   * 只在「锚点锁还有效」（说明期间没有用户自己的翻页，relocate 里的
+   * page / snap / scroll 分支会把锁释放掉）时才纠正，避免把用户拉回去。
+   * 当前视口起点若早于锚点（compareBoundaryPoints < 0），补一次 goTo ——
+   * goTo 到同一位置是幂等的（foliate 里 |位移| < 1 直接短路，不重绘不动画）。
+   */
+  function verifyRelayoutAnchor(anchorCfi: string): void {
+    if (!anchorCfi || isPdfBook()) return;
+    if (!relayoutAnchorHold || Date.now() >= relayoutAnchorHold.until) return;
+    try {
+      const cur: any = view?.lastLocation;
+      const curRange: Range | null = cur?.range ?? null;
+      const resolved: any = (view as any)?.resolveNavigation?.(anchorCfi);
+      if (!curRange || !resolved) return;
+      if (typeof cur.index === "number" && typeof resolved.index === "number" && cur.index !== resolved.index) return;
+      const doc = curRange.startContainer?.ownerDocument ?? null;
+      if (!doc) return;
+      const target: Range | null = resolved.anchor?.(doc) ?? null;
+      if (!target || target.startContainer?.ownerDocument !== doc) return;
+      const cmp = curRange.compareBoundaryPoints(Range.START_TO_START, target);
+      if (cmp < 0) void view?.goTo(anchorCfi);
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · verifyRelayoutAnchor", "debug");
+    }
   }
 
   function onDeviceClassResize() {
@@ -7882,6 +8013,13 @@ import { getLogger } from "../core/logger.ts";
   // 拖选到视口边缘会触发自动滚动，此时不能因 scroll 就把正在扩展的手柄/选区收起。
   let contentPointerHeld = false;
   let dictPopup: { visible: boolean; x: number; y: number; maxH?: number; html: string; word?: string; source?: "sel" | "hover" | null } = { visible: false, x: 0, y: 0, html: "", word: "", source: null };
+  /** 词卡定位样式必须整串一次写入。
+   *  ⚠️ 别改回 style="top:{y}px{cond ? '; --h:…' : ''}"：Svelte 会把紧跟在值后面的动态段并进上一条声明，
+   *  编译出 setProperty("top","432px; --dict-max-h:361px") —— 浏览器判整条非法直接丢弃，
+   *  卡片退回 top:auto（=容器 0px），maxH 也一并失效。2026-11-20「卡片离词很远」的真根因就是这个。 */
+  $: dictPopupStyle =
+    `left:${dictPopup.x}px; top:${dictPopup.y}px` +
+    (dictPopup.maxH ? `; --dict-max-h:${dictPopup.maxH}px` : "");
   // 2026-08-27：Option+悬浮取词（英文）相关状态
   let dictPopupEl: HTMLElement | null = null;       // 弹窗 DOM 引用（用于命中检测）
   let dictPopupSource: "sel" | "hover" | null = null; // 当前弹窗来源（sel=划词工具栏, hover=悬浮）
@@ -7890,13 +8028,14 @@ import { getLogger } from "../core/logger.ts";
   // 悬浮词卡放在词的哪一侧。above 时 top 是卡片的**下沿**（CSS 用 translateY(-100%) 上翻），
   // 这样卡片长高了往上长，永远不会压住词 —— 见 placeHoverDictPopup 的说明。
   let dictPopupPlacement: "below" | "above" = "below";
-  // 悬浮卡小尾巴在容器里的横坐标；只在 hover 来源显示，随词的位置和边缘夹紧一起更新。
+  // 词卡小尾巴在容器里的横坐标；凡是带锚点开出来的卡（悬浮/划词/生词本）都有值。
   let dictTailX = 0;
+  /** 当前词卡的锚点矩形（视口坐标）；非空即说明这张卡是「贴着锚点」排的，重查/换源要沿用它 */
+  let dictAnchorViewport: SelRect | null = null;
 
   let hoverHideTimer: any = null;                   // 悬浮弹窗延迟收起计时器
   let hoverWord: string | null = null;             // 当前悬浮命中的单词（去重用）
   let hoverAnchorRect: DOMRect | null = null;       // 当前悬浮词在 iframe 坐标系下的矩形（容差带判定用）
-  let hoverAnchorViewport: SelRect | null = null;   // 当前悬浮词的视口矩形（切数据源重查时保持同一锚点）
   let toastMsg = "";
   let toastTimer: any = null;
 
@@ -11306,8 +11445,9 @@ import { getLogger } from "../core/logger.ts";
        · 垂直：原来**完全没夹** —— 工具栏落在屏幕下半部时词卡下半截直接出屏。
          词卡最高 62vh，先量高度再夹会闪一帧，改成「按剩余空间给 max-height」
          （CSS 读 --dict-max-h），y 只需要保证顶部有个下界即可。
-       2026-11-20：悬浮来源切数据源重查时传 `anchor`（词的视口矩形），
-       走与悬浮开卡相同的「贴边定位」，避免上翻的卡切个源就盖回单词上。 */
+       2026-11-20：三条入口（悬浮 / 划词 / 生词本）统一传 `anchor`（词、选区、条目的
+       视口矩形），全部走 placeHoverDictPopup 的「贴锚点定位」：默认贴在锚点下方、
+       空间不够翻到上方，尾巴始终指回锚点。不传 anchor 的调用才退回工具栏坐标夹紧。 */
     const rawX = opts?.x ?? selToolbar.x;
     const rawY = opts?.y ?? (selToolbar.y + toolbarH);
     const hoverBox = opts?.anchor ? placeHoverDictPopup(opts.anchor) : null;
@@ -11322,9 +11462,10 @@ import { getLogger } from "../core/logger.ts";
     // setDictMode 自带在线总闸检查：在线被关时会回落离线。
     if (!opts?.keepMode) setDictMode(settings.dictDefaultSource === "online" ? "online" : "offline");
     dictExpanded = false;
-    // 划词卡固定从锚点往下方排；悬浮卡沿用贴边算法给出的那一侧
+    // 贴边算法给出的那一侧；未传锚点时固定从工具栏下沿往下排
     dictPopupPlacement = hoverBox?.placement ?? "below";
     dictTailX = hoverBox?.tailX ?? 0;
+    dictAnchorViewport = opts?.anchor ?? null;
     dictPopupSource = source;
     dictPopup = { visible: true, x, y, maxH, html: renderLoading(), word, source };
     setTimeout(async () => {
@@ -11394,10 +11535,19 @@ import { getLogger } from "../core/logger.ts";
     return seed;
   }
 
-  /** 生词页签点词：复用阅读器词典卡，位置放在正文顶部居中。 */
-  function openVocabWord(word: string) {
+  /** 生词页签点词：复用阅读器词典卡，贴着被点的条目排（与悬浮/划词同一套锚点算法）。 */
+  function openVocabWord(
+    word: string,
+    _entry?: unknown,
+    anchor?: { left: number; top: number; right: number; bottom: number },
+  ) {
     const w = String(word || "").trim();
     if (!w) return;
+    if (anchor) {
+      runDictLookup(w, { anchor: anchor as SelRect, source: "sel", sentence: "" });
+      return;
+    }
+    // 拿不到条目矩形（老调用方/键盘路径异常）才退回正文顶部居中
     const b = getContentBounds();
     const off = getReaderViewOffset();
     runDictLookup(w, {
@@ -11411,7 +11561,8 @@ import { getLogger } from "../core/logger.ts";
   function onSelDict() {
     const text = selToolbar.text?.trim();
     if (!text) return;
-    runDictLookup(text);
+    // 贴选区排卡（与悬浮同一套算法），不再借用划词工具栏的坐标
+    runDictLookup(text, { anchor: lastSelRect ?? undefined });
     closeSelToolbar();
   }
 
@@ -13905,19 +14056,89 @@ import { getLogger } from "../core/logger.ts";
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · toggleImmersive", "warn"); }
   }
 
+  let immersiveVeilEl: HTMLDivElement | null = null;
+  let immersiveVeilTimer = 0;
+  let immersiveIconPop = false;
+  let immersiveIconPopTimer = 0;
+
+  /**
+   * 2026-11-20：播一次沉浸切换遮罩（纯 CSS keyframes，见 .re-immersive-veil）。
+   *
+   * 为什么要用 classList + 强制重排，而不是 Svelte 布尔量：
+   *   连续快速切换时，同一个类名不会让动画「重新播」——浏览器认为 animation-name
+   *   没变就继续跑旧的。必须先摘类、读一次 offsetWidth 逼出重排，再加回去。
+   *
+   * prefers-reduced-motion 下整层直接 display:none，不播（与全项目动效降级一致）。
+   */
+  function playImmersiveVeil(kind: "enter" | "exit"): void {
+    const el = immersiveVeilEl;
+    if (!el) return;
+    try {
+      if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    } catch { /* matchMedia 不可用时照常播 */ }
+    // 底色取正文容器当前的实际纸色（applyContainerBg 写在 container.style.background）：
+    // 用户换成米黄纸 / 深色纸时，遮罩必须是同一个颜色才看不出"闪了下别的颜色"。
+    try {
+      const bg = container?.style.background;
+      if (bg) el.style.background = bg;
+    } catch { /* container 可能已销毁 */ }
+    el.classList.remove("re-veil-enter", "re-veil-exit");
+    // 强制重排：让「摘掉类」这一帧真正落地，否则下面的 add 不会重启动画
+    void el.offsetWidth;
+    el.classList.add(kind === "enter" ? "re-veil-enter" : "re-veil-exit");
+    window.clearTimeout(immersiveVeilTimer);
+    immersiveVeilTimer = window.setTimeout(() => {
+      el.classList.remove("re-veil-enter", "re-veil-exit");
+    }, 420);
+  }
+
+  /** 按钮图标的一次回弹：给「点到了」一个即时反馈（图标本身是整块替换，没有过渡） */
+  function popImmersiveIcon(): void {
+    try {
+      if (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches) return;
+    } catch { /* 同上 */ }
+    immersiveIconPop = true;
+    window.clearTimeout(immersiveIconPopTimer);
+    immersiveIconPopTimer = window.setTimeout(() => { immersiveIconPop = false; }, 260);
+  }
+
   function enterReaderImmersive(): void {
+    // 先在**布局变动之前**抓权威锚点（此刻视口还是旧尺寸，读到的是用户真在看的那一页）
+    holdRelayoutAnchor(visibleCfiNow());
+    if (!isDestroyed) {
+      // 2026-11-20：进入沉浸时把插件自己的上下栏一起收走（它们本来就是浮层，
+      // 已有 200ms 滑出过渡），否则「外框都让位了、插件的栏还悬在正文上」很割裂。
+      // 用 dismissChrome 而不是 collapseChrome：浮层（设置/搜索/⋯）一并关掉，
+      // 否则栏收起来了、浮层还挂在半空成了孤儿。
+      dismissChrome();
+      popImmersiveIcon();
+      playImmersiveVeil("enter");
+    }
     enterImmersive(document, readerViewEl ?? null);
     readerImmersive = true;
     immersiveEnteredAt = Date.now();
-    // 外框让位后阅读区尺寸变了：按当前 CFI 重排回原阅读位
+    // 外框让位后阅读区尺寸变了：按抓到的锚点重排回原阅读位
     scheduleReaderRelayout();
   }
 
   function exitReaderImmersive(): void {
     window.clearTimeout(immersiveExitTimer);
     immersiveExitTimer = 0;
+    // 同上：外框恢复前先抓锚点。exitImmersive 里会同步派发一次 window resize
+    // （让思源重算布局），那次 resize 会立刻走一次 scheduleReaderRelayout ——
+    // 锚点必须在那之前就锁好，否则抓到的就是抖动中途的位置。
+    holdRelayoutAnchor(visibleCfiNow());
     exitImmersive(document);
     readerImmersive = false;
+    // 组件正在销毁（关页签 / 切书）时不碰界面状态：那一帧已经在拆 DOM 了，
+    // 再触发动画与 chrome 状态只会产生无意义的更新。
+    if (!isDestroyed) {
+      popImmersiveIcon();
+      playImmersiveVeil("exit");
+      // 退出后把上下栏还回来（200ms 滑入），与外框恢复一起完成，观感是「一起回来」
+      chromePinned = true;
+      topBarKept = false;
+    }
     scheduleReaderRelayout();
   }
 
@@ -14325,11 +14546,12 @@ import { getLogger } from "../core/logger.ts";
 
     // ── 候选词再查 / 变形还原·相关词跳转（同一路径：就地重查该词） ──
     if ((action === "lookup-candidate" || action === "dict-jump" || action === "lookup-word") && word) {
-      // 悬浮卡点候选词/跳词：仍以**原词**为锚点重排 —— 拿当前卡片左上角当 y
-      // 会让上翻的卡瞬间翻回词下方、盖住正文
-      const anchor = dictPopupSource === "hover" ? hoverAnchorViewport : null;
-      if (anchor) runDictLookup(word, { anchor, source: "hover" });
-      else runDictLookup(word, { x: dictPopup.x, y: dictPopup.y, source: (dictPopupSource as any) ?? "hover" });
+      // 带锚点的卡（悬浮/划词/生词本）点候选词、跳词：仍以**原锚点**重排 —— 拿当前卡片
+      // 左上角当 y，会让上翻的卡瞬间翻回锚点下方、盖住正文
+      const anchor = dictAnchorViewport;
+      const src = (dictPopupSource as "sel" | "hover") ?? "hover";
+      if (anchor) runDictLookup(word, { anchor, source: src });
+      else runDictLookup(word, { x: dictPopup.x, y: dictPopup.y, source: src });
       return;
     }
 
@@ -14362,10 +14584,11 @@ import { getLogger } from "../core/logger.ts";
       // keepMode：切换后重查**不能**被「对齐设置默认源」覆盖回去
       const w = dictPopup.word;
       if (w) {
-        // 悬浮卡带着原词的矩形重排；否则沿用当前卡片左上角（划词卡行为不变）
-        const anchor = dictPopupSource === "hover" ? hoverAnchorViewport : null;
-        if (anchor) runDictLookup(w, { anchor, source: "hover", keepMode: true });
-        else runDictLookup(w, { x: dictPopup.x, y: dictPopup.y, source: (dictPopupSource as any) ?? "hover", keepMode: true });
+        // 带锚点的卡带着原锚点矩形重排；否则沿用当前卡片左上角
+        const anchor = dictAnchorViewport;
+        const src = (dictPopupSource as "sel" | "hover") ?? "hover";
+        if (anchor) runDictLookup(w, { anchor, source: src, keepMode: true });
+        else runDictLookup(w, { x: dictPopup.x, y: dictPopup.y, source: src, keepMode: true });
       }
       return;
     }
@@ -15006,6 +15229,17 @@ import { getLogger } from "../core/logger.ts";
   class:sidebar-docked={anyDockPanel()}
   style="--re-sidebar-w:{sidebarWidth}px;--re-kb:{kbInset}px"
 >
+  <!-- 2026-11-20：沉浸切换的过渡遮罩。
+       思源外框（顶栏/状态栏/左右竖条/页签行）是 display:none **瞬时**让位的，
+       阅读区会「跳」一下变大 —— 这个跳变本身没法用 CSS 过渡（改宿主布局尺寸会
+       和思源的布局重算打架）。所以在切换的那一瞬间用一层书页底色快速淡入淡出，
+       把跳变藏在中间：眼睛读到的是「过渡」，而不是「闪一下变样」。
+       平时 opacity:0、不拦事件；只在 enter/exit 时播一次（见 playImmersiveVeil）。 -->
+  <div
+    class="re-immersive-veil"
+    bind:this={immersiveVeilEl}
+    aria-hidden="true"
+  ></div>
   <!-- 2026-11-19：沉浸阅读 + 上下栏都收起时的退出兜底（顶栏按钮此时不可见）。
        只在这种状态下出现，正常阅读时不占视觉。 -->
   {#if readerImmersive && !topBarRevealed}
@@ -15124,7 +15358,8 @@ import { getLogger } from "../core/logger.ts";
         <!-- 2026-11-19：沉浸阅读 —— 只隐藏思源顶栏/侧栏/页签栏/状态栏，
              系统全屏仍由 macOS 绿钮控制（两者可叠加） -->
         <button
-          class="reader-btn reader-chrome-btn"
+          class="reader-btn reader-chrome-btn reader-immersive-btn"
+          class:reader-immersive-btn-pop={immersiveIconPop}
           title={readerImmersive ? t("退出沉浸阅读（Esc）") : t("沉浸阅读（隐藏思源界面，F11）")}
           aria-label={readerImmersive ? t("退出沉浸阅读") : t("沉浸阅读")}
           class:reader-btn-active={readerImmersive}
@@ -16424,7 +16659,7 @@ import { getLogger } from "../core/logger.ts";
       <div class="reader-dict-backdrop" on:click={closeDictPopup} aria-hidden="true"></div>
     {/if}
     <div class="reader-dict-popup" class:is-above={dictPopupPlacement === "above"} bind:this={dictPopupEl}
-         style="left:{dictPopup.x}px; top:{dictPopup.y}px{dictPopup.maxH ? `; --dict-max-h:${dictPopup.maxH}px` : ''}"
+         style={dictPopupStyle}
          on:mouseenter={onDictPopupEnter} on:mouseleave={onDictPopupLeave}>
       <div class="reader-dict-head">
         <span>{t("词典")}</span>
@@ -16435,8 +16670,9 @@ import { getLogger } from "../core/logger.ts";
       </div>
       <div class="reader-dict-body" on:click={onDictBodyClick}>{@html dictPopup.html}</div>
     </div>
-    <!-- 悬浮卡小尾巴：必须是 popup 的兄弟节点（popup 自带 overflow:auto，伪元素会被裁掉） -->
-    {#if dictPopupSource === "hover"}
+    <!-- 词卡小尾巴：必须是 popup 的兄弟节点（popup 自带 overflow:auto，伪元素会被裁掉）。
+         带锚点开出来的卡（悬浮 / 划词 / 生词本）才有 tailX，退回工具栏坐标的卡不画尾巴。 -->
+    {#if dictTailX > 0}
       <div class="reader-dict-tail" class:is-above={dictPopupPlacement === "above"}
            style="left:{dictTailX}px; top:{dictPopup.y}px" aria-hidden="true"></div>
     {/if}
@@ -16618,6 +16854,68 @@ import { getLogger } from "../core/logger.ts";
   .reader-immersive-exit:hover,
   .reader-immersive-exit:focus-visible {
     opacity: 1;
+  }
+  /* ================================================================
+   * 沉浸切换的过渡遮罩 / 按钮反馈（2026-11-20）
+   * ----------------------------------------------------------------
+   * 宿主的顶栏、状态栏、左右图标竖条、页签行都是 `display:none` —— 让位是
+   * **瞬时**的，阅读区会「跳」一下变大。这个跳变不能用 CSS 过渡修：给宿主的
+   * 外框做位移/淡出只会「先动画、再跳一次」（display:none 不占动画时间），
+   * 给阅读区做 width 过渡又会和思源自己的布局重算互相打架。
+   * ⇒ 改用一层书页底色快速淡入淡出，在遮住的那一瞬完成切换，眼睛读到的是过渡。
+   *
+   * z-index 取 55：压过顶栏/底栏(--rz-toolbar=5)，但低于图片查看器(60)，
+   * 免得遮住正在看的图。pointer-events:none —— 它是纯视觉层，不能拦点击。
+   * ================================================================ */
+  .re-immersive-veil {
+    position: absolute;
+    inset: 0;
+    z-index: 55;
+    pointer-events: none;
+    opacity: 0;
+    background: var(--b3-theme-background, #fff);
+    /* 只动 opacity：不新建合成层树以外的东西，切换期间不会拖慢重排 */
+    will-change: opacity;
+  }
+  .re-immersive-veil.re-veil-enter {
+    animation: re-imm-veil-in var(--reword-dur-slow, 250ms) var(--reword-ease) both;
+  }
+  .re-immersive-veil.re-veil-exit {
+    animation: re-imm-veil-out var(--reword-dur-slow, 250ms) var(--reword-ease) both;
+  }
+  /* 进入：盖得实一点（90%）—— 这一刻外框刚消失，最需要遮住跳变 */
+  @keyframes re-imm-veil-in {
+    0% { opacity: 0; }
+    32% { opacity: 0.9; }
+    100% { opacity: 0; }
+  }
+  /* 退出：盖得轻一点（55%）—— 外框回来是「还原」，太重会像闪黑 */
+  @keyframes re-imm-veil-out {
+    0% { opacity: 0; }
+    26% { opacity: 0.55; }
+    100% { opacity: 0; }
+  }
+  /* 按钮反馈：图标是整块替换（{@html}），没有过渡可用，
+     所以点击时给一次「缩小→回弹」的 keyframes，让点击有手感。 */
+  .reader-immersive-btn .reader-ic {
+    transition: transform var(--reword-dur-fast) var(--reword-ease);
+  }
+  .reader-immersive-btn:active .reader-ic {
+    transform: scale(0.86);
+  }
+  .reader-immersive-btn-pop .reader-ic {
+    animation: re-imm-icon-pop var(--reword-dur-base) var(--reword-ease);
+  }
+  @keyframes re-imm-icon-pop {
+    0% { transform: scale(0.72) rotate(-8deg); }
+    62% { transform: scale(1.12) rotate(3deg); }
+    100% { transform: scale(1) rotate(0deg); }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    /* 全项目统一口径：该降级就降到底，不留半套 */
+    .re-immersive-veil { display: none; }
+    .reader-immersive-btn .reader-ic,
+    .reader-immersive-btn-pop .reader-ic { animation: none; transition: none; }
   }
   .reader-toolbar {
     display: grid;

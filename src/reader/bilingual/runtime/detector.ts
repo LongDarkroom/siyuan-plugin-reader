@@ -5,18 +5,21 @@
  * 非英文书不进入双语流程（不切分、不送译、不注入），避免中文书白跑一遍
  * 翻译链路、白白烧 token。
  *
- * 判定顺序（用户 2026-09-05 拍板：**元数据优先 + 正文采样兜底**）：
- *   1) 读 EPUB 的 dc:language（BookMeta.language）：en* → 英文直接放行；
- *      已知非英文语种（zh/ja/ko/...）→ 直接拦下。零采样开销。
- *   2) 元数据缺失 / 不在已知表内（TXT/MD/PDF 常没有 dc:language）→ 采样正文：
+ * 判定顺序（2026-09-05 立「元数据优先」，2026-11-20 改成「元数据优先 + 正文复核」）：
+ *   1) 读 EPUB 的 dc:language（BookMeta.language）：en* → 英文直接放行，零采样开销。
+ *   2) 元数据是已知非英文语种（zh/ja/ko/...）→ **不是一票否决**，再用正文采样复核：
+ *      正文拉丁主导、且 CJK 占比 ≤ 10% → 判英文（站点把英文书误标 zh-CN 的常见情形，
+ *      如《怦然心动 Flipped》：英文正文 + 中文简介/人物介绍页）；否则按元数据拦下。
+ *   3) 元数据缺失 / 不在已知表内（TXT/MD/PDF 常没有 dc:language）→ 采样正文：
  *      统计拉丁字母 vs CJK 字符占比 + 英文停用词命中数。
- *   3) 采样也无结论（样本太短或语种混杂）→ unknown，**放行**不拦（宁可让用户
+ *   4) 采样也无结论（样本太短或语种混杂）→ unknown，**放行**不拦（宁可让用户
  *      自己试，也不要误杀一本真英文书）。
  *
  * 本文件是纯函数：不 import 任何 DOM / foliate / 思源 API，
  * 因此可被 test/ 直接 import 做单元测试。
  */
 
+import { countScripts } from "../core/scripts.ts";
 import type { LanguageDetection, LanguageSource, LanguageVerdict } from "../core/types.ts";
 
 /* ================================================================
@@ -59,6 +62,14 @@ const STOPWORD_HITS_EN = 3;
 const EN_LATIN_RATIO_STRONG = 0.8;
 const STRONG_SAMPLE_MIN_CHARS = 200;
 
+/**
+ * 元数据与正文冲突时，正文要「干净到什么程度」才允许推翻元数据。
+ * 2026-11-20 加：WeLib / Epubor 一类站点的英文书常把 dc:language 误标成 zh-CN
+ * （书是英文正文，只多了中文简介 / 人物介绍页），旧逻辑元数据一票否决 → 真英文书开不了双语。
+ * 0.1 的口径：正文里 CJK 只允许当点缀；中英对照书 CJK 占比远高于此，仍然拦（双语对它没意义）。
+ */
+const META_OVERRIDE_MAX_CJK = 0.1;
+
 /** 采样时跳过的过短文本（页码、章节号、图片说明碎片） */
 const MIN_BLOCK_CHARS = 20;
 
@@ -78,24 +89,48 @@ export interface DetectBookLanguageInput {
  * 返回 verdict + 依据 + 置信度，便于 UI 提示与日志排查。
  */
 export function detectBookLanguage(input: DetectBookLanguageInput = {}): LanguageDetection {
-  // 1) 元数据优先
+  // 1) 元数据优先：dc:language 是 en 直接放行
   const meta = normalizeLang(input.metaLanguage);
   if (meta === "en") return { verdict: "en", source: "meta", confidence: 1 };
-  if (meta && NON_EN_LANGS.has(meta)) return { verdict: "other", source: "meta", confidence: 1 };
+  // 元数据说是已知非英文语种 —— 但**不再一票否决**（见 META_OVERRIDE_MAX_CJK 注释），
+  // 要再用正文采样复核一次；复核不过才拦。
+  const metaOther = !!meta && NON_EN_LANGS.has(meta);
 
-  // 2) 正文采样兜底
+  // 2) 正文采样
   const texts = (input.sampleTexts ?? []).filter(
     (t): t is string => typeof t === "string" && t.trim().length > 0,
   );
   const sample = texts.join("\n").slice(0, SAMPLE_MAX_CHARS);
-  if (sample.trim().length === 0) return { verdict: "unknown", source: "none", confidence: 0 };
+  if (sample.trim().length === 0) {
+    // 没正文可采：元数据说是非英文就照它拦，否则维持「无结论 → 放行」
+    if (metaOther) return { verdict: "other", source: "meta", confidence: 1 };
+    return { verdict: "unknown", source: "none", confidence: 0 };
+  }
 
   const { latin, cjk } = countScripts(sample);
   const denom = latin + cjk;
-  if (denom === 0) return { verdict: "unknown", source: "sample", confidence: 0 };
+  if (denom === 0) {
+    if (metaOther) return { verdict: "other", source: "meta", confidence: 1 };
+    return { verdict: "unknown", source: "sample", confidence: 0 };
+  }
 
   const cjkRatio = cjk / denom;
   const latinRatio = latin / denom;
+  const hits = countStopwordHits(sample);
+  // 正文的英文证据：拉丁主导 + 停用词达标，或拉丁压倒性主导且样本够长（诗歌/对话体）
+  const enBySample =
+    (latinRatio >= EN_LATIN_RATIO && hits >= STOPWORD_HITS_EN) ||
+    (latinRatio >= EN_LATIN_RATIO_STRONG && sample.length >= STRONG_SAMPLE_MIN_CHARS);
+
+  // 3) 元数据与正文冲突：以正文为准，但要求正文几乎不含 CJK
+  if (metaOther) {
+    // 正文里连一个汉字都没有 → 元数据明显不可信（目录页 / 版权页也算），放行
+    if (cjk === 0 && latin > 0) return { verdict: "en", source: "sample", confidence: round2(latinRatio) };
+    if (enBySample && cjkRatio <= META_OVERRIDE_MAX_CJK) {
+      return { verdict: "en", source: "sample", confidence: round2(latinRatio) };
+    }
+    return { verdict: "other", source: "meta", confidence: 1 };
+  }
 
   // 中日韩文字主导 → 明确非英文
   if (cjkRatio >= CJK_RATIO_BLOCK) {
@@ -103,14 +138,8 @@ export function detectBookLanguage(input: DetectBookLanguageInput = {}): Languag
   }
 
   // 拉丁主导 + 停用词命中 → 英文
-  const hits = countStopwordHits(sample);
-  if (latinRatio >= EN_LATIN_RATIO && hits >= STOPWORD_HITS_EN) {
+  if (enBySample) {
     return { verdict: "en", source: "sample", confidence: round2(Math.min(1, latinRatio)) };
-  }
-
-  // 拉丁占绝对主导且样本够长：停用词不足也判英文（诗歌/对话体）
-  if (latinRatio >= EN_LATIN_RATIO_STRONG && sample.length >= STRONG_SAMPLE_MIN_CHARS) {
-    return { verdict: "en", source: "sample", confidence: round2(latinRatio * 0.8) };
   }
 
   return { verdict: "unknown", source: "sample", confidence: 0 };
@@ -180,28 +209,8 @@ function normalizeLang(raw?: string | null): string | null {
 }
 
 /**
- * 统计拉丁字母与 CJK 字符数。
- * CJK 含：日文假名、CJK 扩展 A、统一表意文字、兼容表意文字、韩文音节。
+ * 拉丁 / CJK 字符统计见 core/scripts.ts：整书闸门与块级闸门共用同一把尺子。
  */
-function countScripts(sample: string): { latin: number; cjk: number } {
-  let latin = 0;
-  let cjk = 0;
-  for (const ch of sample) {
-    const code = ch.codePointAt(0) ?? 0;
-    if ((code >= 0x41 && code <= 0x5a) || (code >= 0x61 && code <= 0x7a)) {
-      latin++;
-    } else if (
-      (code >= 0x3040 && code <= 0x30ff) || // 日文平假名 / 片假名
-      (code >= 0x3400 && code <= 0x4dbf) || // CJK 扩展 A
-      (code >= 0x4e00 && code <= 0x9fff) || // CJK 统一表意文字
-      (code >= 0xf900 && code <= 0xfaff) || // CJK 兼容表意文字
-      (code >= 0xac00 && code <= 0xd7af) // 韩文音节
-    ) {
-      cjk++;
-    }
-  }
-  return { latin, cjk };
-}
 
 /** 统计英文停用词命中数（不同词计数，达到门槛即早停） */
 function countStopwordHits(sample: string): number {

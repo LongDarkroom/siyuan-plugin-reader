@@ -43,7 +43,8 @@ export function isTranslatedPeer(el: Element): boolean {
 /**
  * 取译文块对应的原文文本。
  * 段落：译文是紧邻兄弟，前一个兄弟即原文；
- * 单元格：译文是单元格最后一个子节点，兄弟不是原文 → 克隆单元格后剔除译文块再取文本。
+ * 单元格：译文是单元格最后一个子节点，兄弟不是原文 → 克隆单元格后剔除译文块再取文本；
+ * 裸文本块（2026-11-20 方案 A）：前一个节点是原文文本本身，而不是元素。
  */
 export function sourceTextOf(wrap: Element): string {
   const parent = wrap.parentElement;
@@ -51,6 +52,12 @@ export function sourceTextOf(wrap: Element): string {
     const clone = parent!.cloneNode(true) as Element;
     clone.querySelectorAll("." + REWORD_BILINGUAL).forEach((n) => n.remove());
     return (clone.textContent || "").trim();
+  }
+  // 裸文本块的译文（2026-11-20 方案 A）：原文是文本节点而非元素。
+  // 先认「紧邻的前一个节点」：译文正是插在它后面，中间不会有别的元素。
+  const prev = wrap.previousSibling;
+  if (prev && prev.nodeType === 3 && (prev.textContent || "").trim()) {
+    return (prev.textContent || "").trim();
   }
   const src = wrap.previousElementSibling;
   return src ? (src.textContent || "").trim() : "";
@@ -227,6 +234,39 @@ export function injectSibling(paragraphEl: Element, translationEl: HTMLElement):
   }
   paragraphEl.insertAdjacentElement("afterend", translationEl);
   return true;
+}
+
+/**
+ * 裸文本块（方案 A，2026-11-20）是否已注入译文。
+ *
+ * 这类块没有可打标的原文元素（文本节点没有 setAttribute，父容器又是整章共用的），
+ * 所以幂等判定看结构：紧跟其后的第一个非空白兄弟若正是我们插的译文块 → 已处理。
+ */
+export function isLooseTextTranslated(run: Node | null | undefined): boolean {
+  let n: Node | null = run ? run.nextSibling : null;
+  while (n && n.nodeType === 3 && !(n.textContent || "").trim()) n = n.nextSibling;
+  return !!n && n.nodeType === 1 && !!(n as Element).classList?.contains(REWORD_BILINGUAL);
+}
+
+/**
+ * 裸文本块的译文插入：插在 `before` 之前（before 为空 / 已不在容器内 → 追加到容器末尾）。
+ *
+ * 与 injectSibling 一样「只插不标」。cfi-inert 由 buildTranslationEl 统一带上，
+ * 所以插在中间不会挪动后续段落的 CFI 索引。
+ */
+export function injectLooseText(
+  container: Element,
+  before: Element | null,
+  translationEl: HTMLElement,
+): boolean {
+  if (!container || typeof container.insertBefore !== "function") return false;
+  const anchor = before && before.parentElement === container ? before : null;
+  try {
+    container.insertBefore(translationEl, anchor as Node | null);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** 译文左侧竖线宽度（CSS 常量；不再运行时读 getComputedStyle） */
