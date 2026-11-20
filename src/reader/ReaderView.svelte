@@ -37,6 +37,8 @@ import { getLogger } from "../core/logger.ts";
   import BookToolbar from "./BookToolbar.svelte";
   // 2026-11-06 统一线性图标：上下栏不再用字符/emoji 拼贴
   import { ICONS } from "./icons.ts";
+  // 2026-11-19 沉浸阅读：只隐藏思源外框，系统全屏留给 macOS 绿钮
+  import { enterImmersive, exitImmersive, removeImmersiveStyle, resyncImmersiveTabBar } from "./immersive.ts";
   // 2026-11-04 图片右键菜单（复制/保存），正文与灯箱共用
   import ImageContextMenu from "./ImageContextMenu.svelte";
   import PdfToolbar from "./PdfToolbar.svelte";
@@ -165,6 +167,11 @@ import { getLogger } from "../core/logger.ts";
     type ReaderProgressStyle,
   } from "../reader/reader-settings";
   import {
+    applyAutoTypographyToSettings,
+    computeAutoTypography,
+    type AutoTypography,
+  } from "./auto-typography.ts";
+  import {
     FontStore,
     collectHostFontFaces,
     collectHostFontUrls,
@@ -236,13 +243,18 @@ import { getLogger } from "../core/logger.ts";
   // Phase 1：划词即时词典——复用现有离线词典引擎与卡片渲染（与「查词典」Tab 同源）
   import { lookupSmart, searchCandidates } from "../dict/dict-engine";
   import {
+    extractSenses,
     parseDictEntry,
+    renderDictCard,
     renderDictCardSimple,
     renderDictSuggestions,
+    renderDictUnavailable,
     renderLoading,
   } from "../dict/dict-renderer";
+  import VocabPanel from "./VocabPanel.svelte";
+  import type { ReaderVocabStore, VocabSeed } from "./vocab-store.ts";
   // 2026-09-07 查词典功能：弹窗双源（🌐 切在线词海）
-  import { fetchOnlineDict, renderOnlineDictCardSimple } from "../dict/online-dict";
+  import { fetchOnlineDict, renderOnlineDictCard, renderOnlineDictCardSimple } from "../dict/online-dict";
   import { togglePosCollapsed } from "../dict/pos-toggle";
   // Phase 2：划词高亮 + 批注（阅读器 / foliate 集成）
   // @ts-ignore - foliate-js 为纯 JS vendor（无类型声明）
@@ -456,9 +468,7 @@ import { getLogger } from "../core/logger.ts";
   export let onAskAiInDock:
     | ((bookId: string, quote: AiChatQuote) => boolean)
     | undefined = undefined;
-  /** 翻译选中文本并直接发送到 AI 精读面板（委托 plugin.translateToAi） */
-  export let onTranslateToAi: ((text: string) => void) | undefined = undefined;
-  /** 双语段落批量翻译（委托 plugin.translateBatch，按书缓存 + 引擎链兜底）；
+    /** 双语段落批量翻译（委托 plugin.translateBatch，按书缓存 + 引擎链兜底）；
    *  2026-08-30 增加 extra（model/overwrite/signal）以支持整书预翻译细化选项
    *  2026-08-30 修复：ctxBefore（前文参考）+ meta（书籍元数据）透传，供 AI 语境理解与
    *    v1.3.0 专有名词一致性生效；bridge 端 reader-tab.ts 会兜底补 meta（plugin.getBookMeta） */
@@ -514,13 +524,13 @@ import { getLogger } from "../core/logger.ts";
   /** 2026-08-31：双语设置独立弹窗增量保存 AI 设置（翻译风格/提示词/引擎/参数） */
   export let onSaveAiSettings: ((partial: Partial<AiSettings>) => Promise<void> | void) | undefined = undefined;
   /** 加入词库（委托 plugin vocabStore.addWord） */
-  export let onAddToVocab: ((word: string) => Promise<void> | void) | undefined = undefined;
-  /** 在 REword 侧边栏查词（委托 plugin.openWordInSidebar → 跨插件调 REword：切到查词 Tab、自动填词查询；mode 同步小窗当前词典源） */
-  export let onOpenInSidebar: ((word: string, mode?: "offline" | "online") => void) | undefined = undefined;
-  /** 移出词库（委托 plugin vocabStore.removeWord） */
+  export let onAddToVocab: ((word: string | VocabSeed) => Promise<void> | void) | undefined = undefined;
+    /** 移出词库（委托 plugin vocabStore.removeWord） */
   export let onRemoveFromVocab: ((word: string) => Promise<void> | void) | undefined = undefined;
   /** 判断单词是否在词库（委托 plugin vocabStore.hasWord） */
   export let isInVocab: ((word: string) => boolean) | undefined = undefined;
+  /** 本地生词本实例（「我的标记 → 生词」页签直接订阅列表变化） */
+  export let vocabStore: ReaderVocabStore | null = null;
   /**
    * 钉住阅读 Tab（调用 `tab.pin()`）。
    *
@@ -1087,6 +1097,8 @@ import { getLogger } from "../core/logger.ts";
   // 2026-10-14 双语重设计：设置弹窗打开时聚焦的目标 Tab（null=沿用上次/默认）。
   // 顶栏「双语设置」入口用它直达新的「双语翻译」Tab，取代已下线的独立双语设置弹窗。
   let settingsInitialTab: string | null = null;
+  /** 设置弹窗打开时直达的二级页（词典弹窗的「去导入/启用词典」用） */
+  let settingsInitialSub: "dict" | null = null;
   /**
    * 词典管理器实例（由插件入口挂在 window 上，此处读取并注入设置弹窗）。
    * ⚠️ 模板里不能写 TS 类型断言（`(window as any).x` 会 ParseError），
@@ -1361,6 +1373,13 @@ import { getLogger } from "../core/logger.ts";
    * 两个子列表（书签 / 摘录）共用一个抽屉，渲染时各自按 bookType 双重保险过滤。
    */
   let showMarks = false; // 「我的标记」抽屉（书签 + 摘录合并）
+  /** 2026-11-20：合并抽屉改为「书签 / 标注 / 生词」三页签。 */
+  let marksTab: "bookmarks" | "annots" | "vocab" = "bookmarks";
+  let vocabCount = 0;
+  let unsubVocabStore: (() => void) | null = null;
+  function syncVocabCount() {
+    vocabCount = vocabStore?.count?.() ?? 0;
+  }
   let bookmarks: BookMark[] = [];
   let annotsList: any[] = [];
 
@@ -1523,7 +1542,7 @@ import { getLogger } from "../core/logger.ts";
    * 保留这次显式写入是为了**复位** —— 若同一页面会话内曾经写过旧版的
    * `base + reserve` 历史值，需要在此写回纯 `base`，否则改过底栏后回不去。
    */
-  function applyBottomBarReserve() {
+  function applyBottomBarReserve(eff: ReaderSettings = settings) {
     if (isDestroyed) return;
     if (!view?.renderer?.style) return;
     // ⚠️ 底栏是**纯浮层**（对标微信读书）：浮在文字上层、盖住部分正文，
@@ -1534,7 +1553,7 @@ import { getLogger } from "../core/logger.ts";
     // 现在只做一件事：把下边距**恒等于用户设定值**。
     // 之所以还要显式写一次（而不是删掉整个函数）：设置变更时若上一轮曾写过
     // `base + reserve` 的历史值，需要在此复位，否则同一页面会话内改过底栏就回不去。
-    const base = Math.max(0, Number(settings.layout.marginBottomPx) || 0);
+    const base = Math.max(0, Number(eff.layout.marginBottomPx) || 0);
     try {
       view.renderer.style.setProperty("--_reword-margin-bottom", `${base}px`);
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · applyBottomBarReserve", "debug"); }
@@ -1737,6 +1756,8 @@ import { getLogger } from "../core/logger.ts";
   });
 
   let settings: ReaderSettings = { ...READER_DEFAULT_SETTINGS };
+  /** 自动版式的推导摘要（传给设置弹窗的 extra，不落盘） */
+  let autoTypographySummary = "";
 
   // 阅读统计（时长 / 剩余时间估算）
   let totalChars = 0;
@@ -2339,7 +2360,145 @@ import { getLogger } from "../core/logger.ts";
     return { palette, output };
   }
 
-  function buildStyles() {
+  /* ================= 深色反图：只翻「白底图」（2026-11-19） =================
+   * 旧实现把书里所有 img 一律 invert：白底示意图不刺眼了，但彩色插画与照片
+   * 直接变负片（用户实测水彩插图整页发灰偏色）。现在改为采样判定：
+   * 把图片缩到 24×24 画在**白底**画布上算平均亮度，只有接近纯白的图才打
+   * `.reword-img-invert`（CSS 规则见 reader-style.ts）。
+   * · 照片 / 彩色插画：亮度不够 → 保持原色；
+   * · 透明底黑线稿：白底画布下判为浅底 → 反色后线条变白，深色页上反而可读；
+   * · 画布被跨域污染读不出像素：保持原图，宁可不反也不误伤。
+   */
+  const IMG_INVERT_LUM_MIN = 0.8;
+  let imgInvertTimer: any = null;
+
+  function smartImgInvertActive(): boolean {
+    try {
+      if (settings.invertImagesInDark !== true) return false;
+      // 与 buildReaderStyles 同一套明暗判定（deriveStyleOutput），避免两处结论分叉
+      return resolvePalette().output.isDark;
+    } catch {
+      return false;
+    }
+  }
+
+  function scheduleSmartImgInvert(): void {
+    if (imgInvertTimer) return;
+    imgInvertTimer = setTimeout(() => {
+      imgInvertTimer = null;
+      try {
+        if (!smartImgInvertActive() || !caps.reflow) return;
+        const contents: any[] = view?.renderer?.getContents?.() ?? [];
+        for (const c of contents) if (c?.doc) scanImgInvert(c.doc);
+      } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · scheduleSmartImgInvert", "debug"); }
+    }, 150);
+  }
+
+  function scanImgInvert(doc: Document): void {
+    let list: Element[] = [];
+    try { list = Array.from(doc.querySelectorAll("img:not([data-reword-inv])")); } catch { return; }
+    for (const el of list) classifyImgInvert(el as HTMLImageElement);
+  }
+
+  function classifyImgInvert(img: HTMLImageElement): void {
+    // 先打标再采样：load 事件可能在采样前再次触发，避免同一张图反复进队列
+    if (!img.hasAttribute("data-reword-inv")) img.setAttribute("data-reword-inv", "1");
+    const run = () => {
+      try {
+        if (!img.naturalWidth || !img.naturalHeight) return;
+        const S = 24;
+        const canvas = document.createElement("canvas");
+        canvas.width = S;
+        canvas.height = S;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return;
+        ctx.fillStyle = "#ffffff";
+        ctx.fillRect(0, 0, S, S);
+        ctx.drawImage(img, 0, 0, S, S);
+        const d = ctx.getImageData(0, 0, S, S).data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4) {
+          sum += 0.2126 * d[i] + 0.7152 * d[i + 1] + 0.0722 * d[i + 2];
+        }
+        const lum = sum / (S * S * 255);
+        if (lum >= IMG_INVERT_LUM_MIN) img.classList.add("reword-img-invert");
+      } catch (__swallowErr) {
+        // 跨域污染 / 图片尚未就绪：保持原图，不反色
+        logSwallow(__swallowErr, "ReaderView.svelte · classifyImgInvert", "debug");
+      }
+    };
+    if (img.complete && img.naturalWidth) run();
+    else img.addEventListener("load", run, { once: true });
+  }
+
+  /* ================= 自动版式（2026-11-20） =================
+   * 只在这里做「读环境 + 派生」，不写 settingsStore：
+   * 换书 / 拉窗口 / 改字号都重新算，关掉开关立刻回到用户原来的手动值。
+   * 需要固化当前结果时走「转为手动」（onSettingsDialogAction 里的
+   * autoTypographyApply）。
+   */
+  function autoScriptSample(): string {
+    try {
+      let s = "";
+      for (const d of getContentDocs().slice(0, 2)) {
+        s += (d.body?.textContent || "") + "\n";
+        if (s.length >= 2000) break;
+      }
+      if (s.trim().length < 80) s += `\n${meta?.title || ""}\n${meta?.author || ""}`;
+      return s.slice(0, 3000);
+    } catch {
+      return `${meta?.title || ""}\n${meta?.author || ""}`;
+    }
+  }
+
+  function autoTypographyEnabled(): boolean {
+    return (
+      settings.autoTypography === true &&
+      !isPdfBook() &&
+      settings.verticalWriting !== true
+    );
+  }
+
+  function resolveAutoTypography(): AutoTypography | null {
+    if (!autoTypographyEnabled()) return null;
+    const stage = readerStageEl ?? readerViewEl;
+    const vw = Math.round(stage?.clientWidth || 0);
+    const vh = Math.round(stage?.clientHeight || 0);
+    // 版面还没稳定时不猜，等下一次 applyStyles（开书 / resize 都会再进来）
+    if (vw < 200 || vh < 200) return null;
+    const uiLang =
+      typeof window !== "undefined" ? (window as any).siyuan?.config?.lang : undefined;
+    return computeAutoTypography({
+      language: meta?.language || undefined,
+      sampleText: autoScriptSample(),
+      fallbackScript: String(uiLang || "").toLowerCase().startsWith("zh") ? "cjk" : "latin",
+      viewportWidth: vw,
+      viewportHeight: vh,
+      fontSize: settings.fontSize,
+      deviceClass: viewportBp,
+      flow: settings.flow === "scrolled" ? "scrolled" : "paginated",
+    });
+  }
+
+  function describeAutoTypography(auto: AutoTypography): string {
+    const script = auto.script === "cjk" ? t("中文") : t("西文");
+    return t(
+      "{script} · 每行约 {chars} 字 · {cols} 栏 × {w}px · 行距 {lh} · 段距 {ps}em · 缩进 {indent}em · 上下边距 {mt}/{mb}px",
+      {
+        script,
+        chars: auto.estimatedCharsPerLine,
+        cols: auto.columnCount,
+        w: auto.columnWidthPx,
+        lh: auto.lineHeight.toFixed(2),
+        ps: auto.paragraphSpacing,
+        indent: auto.textIndent,
+        mt: auto.marginTopPx,
+        mb: auto.marginBottomPx,
+      },
+    );
+  }
+
+  function buildStyles(eff: ReaderSettings = settings) {
     // 2026-10-07：配色与明暗解耦（详见 resolvePalette）。
     //   · 配色 = 用户选的那份（themeOf）
     //   · 明暗 = settings.themeMode；auto 时看思源实际深浅
@@ -2355,12 +2514,8 @@ import { getLogger } from "../core/logger.ts";
     // 使 link/code/quote/译文块等样式能跟随思源外观（CSS 变量不跨 iframe 继承，必须显式抓取+注入）。
     const siyuanVars = captureSiyuanThemeVars(getSiyuanVar, resolveSiyuanColor);
     return buildReaderStyles(
-      // 2026-10-07：把「跟随思源边距」的运行时缓存挂上去。
-      // buildReaderStyles 第一参数就是 settings（形参名沿用 settings），
-      // 它只会读 sideMarginPx 这一个新字段，不参与任何持久化。
-      // 开关关闭时传 null —— layoutMarginStyles 随即回落到 widthPct 换算的百分比，
-      // 用户自己的左右边距设定值原样生效（不再被旧实现写进设置档后无法还原）。
-      { ...settings, sideMarginPx: settings.layout.followSiyuanMargin ? siyuanSideMarginPx : null },
+      // 2026-11-20：autoTypography 开启时传入的是派生副本（eff），不写回 store
+      { ...eff, sideMarginPx: eff.layout.followSiyuanMargin ? siyuanSideMarginPx : null },
       t,
       lw,
       fontFaceCss,
@@ -2409,12 +2564,21 @@ import { getLogger } from "../core/logger.ts";
   function applyStylesInner() {
     // 跟随思源文档边距：开时把宿主 .protyle-wysiwyg 的水平 padding 同步为阅读器左右边距
     applySiyuanDocMargin();
+    // 2026-11-20 自动版式：在这里一次性派生，样式与分页器几何共用同一份 eff，
+    // 避免两处各算一遍出现「摘要 2 栏、画面 1 栏」这类分叉。
+    const auto = resolveAutoTypography();
+    const eff = auto ? applyAutoTypographyToSettings(settings, auto) : settings;
+    autoTypographySummary = auto
+      ? describeAutoTypography(auto)
+      : autoTypographyEnabled()
+        ? t("正在等待版面尺寸…")
+        : "";
     // 2026-09-25 页面宽度：widthPct（铺满95/正常80/宽松70）与上下边距 relay 给 foliate
     // 分页器 —— 分页器几何由自身 CSS 变量驱动（--_max-inline-size / --_margin-*），
     // 注入 iframe 的 body padding 会被其内联样式覆盖（旧「点击没反应」的真根因），
     // 换算见 paginator.js #beforeRender 的 reword 段；随后 forceRelayout 重排生效。
     if (view?.renderer?.style) {
-      const pct = Math.min(100, Math.max(50, settings.layout.widthPct ?? 80));
+      const pct = Math.min(100, Math.max(50, eff.layout.widthPct ?? 80));
       /* ============================================================
        * 页宽模式（2026-10-08 语义修正，对标 Readest `getMaxInlineSize`）
        * ------------------------------------------------------------
@@ -2439,9 +2603,11 @@ import { getLogger } from "../core/logger.ts";
        *  pct  ：走原有 reword 通路（它自己会算 perColumn），
        *        但必须**清掉** `--_max-inline-size`，否则 fixed→pct 切换会沿用旧的每列宽。
        * ============================================================ */
-      if (settings.layout.widthMode === "fixed") {
-        // 每列舒适宽度（不是书页总宽！）。区间与 schema 的 stepper 对齐。
-        const col = Math.min(1000, Math.max(480, settings.layout.fixedWidthPx ?? 720));
+      if (eff.layout.widthMode === "fixed") {
+        // 每列舒适宽度（不是书页总宽！）。自动模式允许窄于手动的 480 下限（手机列宽）。
+        const col = auto
+          ? Math.min(1400, Math.max(240, auto.columnWidthPx))
+          : Math.min(1000, Math.max(480, eff.layout.fixedWidthPx ?? 720));
         view.renderer.style.setProperty("--_max-inline-size", `${col}px`);
         // ⚠️ 必须清空 —— 否则 pct 通路仍会生效并覆写 --_max-inline-size，
         // 回到「总宽被瓜分」的错位状态（用户反馈的正是这个）。
@@ -2458,15 +2624,24 @@ import { getLogger } from "../core/logger.ts";
       // （我们没有覆盖它时，无论书页多窄都最多只有 2 栏 —— 这正是用户截图只有 2 栏的原因）。
       // 暴露成设置项后，「窄列 + 多栏」这种报纸式排版才表达得出来。
       // 默认 2 = foliate 原生值，不改变现有观感。
-      const maxCols = Math.min(4, Math.max(1, Math.round(Number(settings.layout.maxColumnCount) || 2)));
+      const maxCols = Math.min(4, Math.max(1, Math.round(Number(eff.layout.maxColumnCount) || 2)));
       view.renderer.style.setProperty("--_max-column-count", String(maxCols));
-      view.renderer.style.setProperty("--_reword-margin-top", `${settings.layout.marginTopPx}px`);
+      view.renderer.style.setProperty("--_reword-margin-top", `${eff.layout.marginTopPx}px`);
+      // 自动模式同时收紧分页器的左右留白（默认各 48px 在手机上会挤掉一行字）；
+      // 退出自动后必须移除，让 paginator 自己回到默认值。
+      if (auto) {
+        view.renderer.style.setProperty("--_margin-left", `${auto.marginSidePx}px`);
+        view.renderer.style.setProperty("--_margin-right", `${auto.marginSidePx}px`);
+      } else {
+        view.renderer.style.removeProperty("--_margin-left");
+        view.renderer.style.removeProperty("--_margin-right");
+      }
         // 下边距经 applyBottomBarReserve() 复位（底栏是纯浮层，不参与分页几何）。
-      applyBottomBarReserve();
+      applyBottomBarReserve(eff);
     }
     if (view?.renderer?.setStyles) {
       try {
-        view.renderer.setStyles(buildStyles());
+        view.renderer.setStyles(buildStyles(eff));
       } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · applyStyles", "debug"); }
     }
     // 2026-09-02 修复：注入样式后主动触发一次重排，确保首次打开即按我们的 CSS 对齐。
@@ -2507,6 +2682,8 @@ import { getLogger } from "../core/logger.ts";
     // 2026-09-01 L0+L3：把内容 iframe 同步进 theme-bridge 注册表，
     // 新 iframe 注册时立即注入令牌；主题切换由 theme-bridge 统一重注（开书/翻页/主题切换全覆盖）。
     syncContentIframes();
+    // 2026-11-19：深色反图改为「按图判定」——样式刚换（开书 / 切主题 / 改设置）后补扫一次
+    scheduleSmartImgInvert();
   }
 
   /**
@@ -3099,15 +3276,18 @@ import { getLogger } from "../core/logger.ts";
   function isOverDictPopup(x: number, y: number): boolean {
     if (!dictPopupEl) return false;
     const r = dictPopupEl.getBoundingClientRect();
-    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    // 命中区向外放宽 8px：悬浮卡与词之间本来就只有 6px 间隙，
+    // 光标跨过缝隙时不能被判成「已离开」而启动收起计时。
+    const pad = 8;
+    return x >= r.left - pad && x <= r.right + pad && y >= r.top - pad && y <= r.bottom + pad;
   }
 
   function clearHoverHide() {
     if (hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; }
   }
 
-  /** 延迟收起悬浮弹窗（给光标移到弹窗留缓冲；2026-08-27 放宽至 450ms，2026-08-30 增强容差） */
-  function scheduleHoverHide(delay = 450) {
+  /** 延迟收起悬浮弹窗（给光标移到弹窗留缓冲；2026-11-20 再放宽到 700ms） */
+  function scheduleHoverHide(delay = 700) {
     clearHoverHide();
     hoverHideTimer = setTimeout(() => {
       hoverHideTimer = null;
@@ -3116,37 +3296,114 @@ import { getLogger } from "../core/logger.ts";
         dictPopupSource = null;
         hoverWord = null;
         hoverAnchorRect = null;
+        hoverAnchorViewport = null;
       }
     }, delay);
   }
 
-  /** 显示悬浮词典弹窗（英文单词） */
-  function showHoverDict(word: string, x: number, y: number) {
+  /**
+   * 悬浮词卡定位（2026-11-20 重写）。
+   *
+   * 旧实现用「词下方 + 固定估算 320px」再夹进内容区，两个问题叠加：
+   *  1) 真实词卡常高于 320（简化卡也可能 400+）⇒ 翻到上方后卡片底边仍压住单词；
+   *     `cy < 8` 的兜底还会把卡片往下推，进一步盖住词。
+   *  2) 翻上去后 --dict-max-h 仍按「卡片顶 → 内容底」给空间，等于允许卡片重新长回单词上。
+   *
+   * 现改为**按锚点边定位**：below 时 top = 词下沿 + 间隙；above 时 top = 词上沿 − 间隙
+   * 并用 translateY(-100%) 以底边为锚。卡片实际多高都不会跨过这条边，也就不必估高度。
+   */
+  function placeHoverDictPopup(anchor: SelRect): { x: number; y: number; maxH: number; placement: "below" | "above"; tailX: number } {
+    const pad = 8;
+    const gap = 6;
+    // 下方至少能放这么多才留在下方；连这么高都没有才翻上去（卡片本身可滚动）
+    const MIN_BELOW = 180;
+    const MIN_H = 160;
+    const off = getReaderViewOffset();
+    const b = getContentBounds();
+    const cardW = Math.min(360, Math.max(240, (readerViewEl?.clientWidth ?? 360) - 24));
+    const halfW = cardW / 2;
+    const minX = b.left - off.left + pad + halfW;
+    const maxX = b.right - off.left - pad - halfW;
+    const rawX = (anchor.left + anchor.right) / 2 - off.left;
+    const x = maxX >= minX ? Math.min(Math.max(rawX, minX), maxX) : (minX + maxX) / 2;
+    const topEdge = b.top - off.top + pad;
+    const bottomEdge = b.bottom - off.top - pad;
+    const belowSpace = bottomEdge - (anchor.bottom - off.top + gap);
+    const aboveSpace = anchor.top - off.top - gap - topEdge;
+    const cap = Math.round((readerViewEl?.clientHeight ?? 640) * 0.62);
+    // 优先下方（与阅读视线一致）；两侧都很局促时选空间大的一侧。
+    // 无论选哪侧，y 都是那一侧的「锚边」，因此卡片不会盖住词。
+    const placement: "below" | "above" =
+      belowSpace >= Math.min(MIN_BELOW, cap) || belowSpace >= aboveSpace ? "below" : "above";
+    const room = placement === "below" ? belowSpace : aboveSpace;
+    // 卡片被夹到内容区边缘时，词未必还在卡片正中；尾巴按词中心在卡内的相对位置落点。
+    const tailLeft = Math.min(Math.max(rawX - (x - halfW), 18), Math.max(18, cardW - 18));
+    return {
+      x,
+      y: placement === "below" ? anchor.bottom - off.top + gap : anchor.top - off.top - gap,
+      maxH: Math.max(MIN_H, Math.min(cap, room)),
+      placement,
+      tailX: x - halfW + tailLeft,
+    };
+  }
+
+  /**
+   * 同一个词在页面里出现多次时，光标换到另一处不能用「同词」短路。
+   * 这里只更新锚点和位置，不重新查词、不重置已展开的完整释义。
+   */
+  function repositionHoverDict(anchor: SelRect) {
+    if (!dictPopup.visible || dictPopupSource !== "hover") return;
+    hoverAnchorViewport = anchor;
+    const box = placeHoverDictPopup(anchor);
+    dictPopupPlacement = box.placement;
+    dictTailX = box.tailX;
+    dictPopup = { ...dictPopup, x: box.x, y: box.y, maxH: box.maxH };
+  }
+
+  /**
+   * 显示悬浮词典弹窗（英文单词）。
+   * 离线查词是同步的 ⇒ 直接出结果，不再「先 loading 再替换」（那是悬停闪动的来源之一）。
+   */
+  function showHoverDict(word: string, anchor: SelRect) {
     clearHoverHide();
     hoverWord = word;
+    hoverAnchorViewport = anchor;
     dictPopupSource = "hover";
-    // 2026-11-19 P1-6：悬浮入口同样走夹紧（鼠标在窗口下半部悬停时会出屏）
-    const box = clampDictPopupBox(x, y);
-    dictPopup = { visible: true, x: box.x, y: box.y, maxH: box.maxH, html: renderLoading(), word, source: "hover" };
+    dictExpanded = false;
+    const box = placeHoverDictPopup(anchor);
+    dictPopupPlacement = box.placement;
+    dictTailX = box.tailX;
+    const base = { visible: true, x: box.x, y: box.y, maxH: box.maxH, word, source: "hover" as const };
+    if (dictPopupMode === "offline") {
+      const entry = lookupSmart(word);
+      if (entry) {
+        dictPopup = {
+          ...base,
+          html: renderDictCardSimple(parseDictEntry(entry), {
+            showStar: true,
+            inVocab: isInVocab?.(word) ?? false,
+            onlineSwitchEnabled: dictCanSwitch,
+          }),
+        };
+      } else {
+        dictPopup = { ...base, html: dictUnavailableHtml() ?? renderDictSuggestions(word, searchCandidates(word, 3)) };
+      }
+      return;
+    }
+    dictPopup = { ...base, html: renderLoading() };
     setTimeout(async () => {
       if (isDestroyed) return; // 2026-11-03 泄漏清理：组件销毁后不得再写浮层状态
       // 期间来源/单词已切换则丢弃旧结果
       if (dictPopupSource !== "hover" || hoverWord !== word) return;
-      let html: string;
-      if (dictPopupMode === "online") {
-        const r = await fetchOnlineDict(word);
-        html = r
+      const r = await fetchOnlineDict(word);
+      // 网络期间可能已移到别的词：await 之后必须再判一次，否则旧结果会盖掉新词卡
+      if (isDestroyed || dictPopupSource !== "hover" || hoverWord !== word) return;
+      dictPopup = {
+        ...dictPopup,
+        html: r
           ? renderOnlineDictCardSimple(r, { inVocab: isInVocab?.(word) ?? false })
-          : renderDictSuggestions(word, searchCandidates(word, 3));
-      } else {
-        const entry = lookupSmart(word);
-        if (entry) {
-          html = renderDictCardSimple(parseDictEntry(entry), { showStar: true, inVocab: isInVocab?.(word) ?? false, onlineSwitchEnabled: dictCanSwitch });
-        } else {
-          html = renderDictSuggestions(word, searchCandidates(word, 3));
-        }
-      }
-      dictPopup = { ...dictPopup, html };
+          : renderDictSuggestions(word, searchCandidates(word, 3)),
+      };
     }, 30);
   }
 
@@ -3186,6 +3443,40 @@ import { getLogger } from "../core/logger.ts";
       const rect = r.getBoundingClientRect() as DOMRect;
       if (!rect || (rect.width === 0 && rect.height === 0)) return null;
       return { word, rect };
+    };
+
+    // 词矩形先换算到视口坐标：弹窗定位（placeHoverDictPopup）与内容边界同为视口基准。
+    const toViewportAnchor = (rect: DOMRect): SelRect => {
+      const frame = (doc.defaultView as any)?.frameElement as HTMLElement | null;
+      const fr = frame?.getBoundingClientRect();
+      return {
+        left: rect.left + (fr?.left ?? 0),
+        top: rect.top + (fr?.top ?? 0),
+        right: rect.right + (fr?.left ?? 0),
+        bottom: rect.bottom + (fr?.top ?? 0),
+      };
+    };
+
+    /**
+     * 命中词的矩形应当包含指针。固定版式（页面缩放 / transform）下 iframe 局部坐标
+     * 与父窗口的换算一旦整体偏移，卡片就会飞到离词很远的地方。
+     * 这里做一次合理性校验：矩形偏离指针超过 24px 就不再信任它，
+     * 直接以指针位置为锚点 —— 宁可贴着光标，也不能飘去别处。
+     */
+    let fallbackLoggedAt = 0;
+    const anchorForWord = (rect: DOMRect, vx: number, vy: number): SelRect => {
+      const a = toViewportAnchor(rect);
+      const near =
+        vx >= a.left - 24 && vx <= a.right + 24 && vy >= a.top - 24 && vy <= a.bottom + 24;
+      if (near) return a;
+      // 每次 hover 只记一条，避免 mousemove 高频刷日志
+      if (Date.now() - fallbackLoggedAt > 5000) {
+        fallbackLoggedAt = Date.now();
+        getLogger().debug(
+          `[RE 悬浮] 词矩形与指针偏差过大（rect ${Math.round(a.left)},${Math.round(a.top)} vs 指针 ${Math.round(vx)},${Math.round(vy)}），改按指针定位`,
+        );
+      }
+      return { left: vx - 6, right: vx + 6, top: vy - 10, bottom: vy + 6 };
     };
 
     const HOVER_TOLERANCE = 16; // px：悬浮取词容差带，轻微移动不消失（2026-08-30）
@@ -3229,39 +3520,20 @@ import { getLogger } from "../core/logger.ts";
         clearHoverHide();
         return;
       }
-      // 3) 同一单词且弹窗已显示：保持
+      // 3) 同一单词且弹窗已显示：词没换，但页面里可能有多个同名词。
+      //    位置真的变了就只重排卡片，不能因为 word 相同就停在第一个出现处。
       if (found.word === hoverWord && dictPopup.visible) {
         clearHoverHide();
+        const a = hoverAnchorRect;
+        if (!a || Math.abs(a.left - found.rect.left) > 2 || Math.abs(a.top - found.rect.top) > 2) {
+          hoverAnchorRect = found.rect;
+          repositionHoverDict(anchorForWord(found.rect, vx, vy));
+        }
         return;
       }
       // 4) 不同单词 → 仅当确实离开原词容差带才更新（容差带内不重复触发，避免抖动/闪烁）
       hoverAnchorRect = found.rect;
-      // 计算弹窗定位（词下方居中）
-      const frame = (doc.defaultView as any)?.frameElement as HTMLElement | null;
-      let wx = found.rect.left + found.rect.width / 2;
-      let wy = found.rect.bottom;
-      if (frame) {
-        const fr = frame.getBoundingClientRect();
-        wx += fr.left;
-        wy += fr.top;
-      }
-      const c = toContainerCoords(wx, wy + 4);
-      let cx = c.x;
-      let cy = c.y;
-      // 左右防溢出（弹窗宽约 360，transform translateX(-50%) 以 cx 为中点）
-      const stageW = readerStageEl?.clientWidth ?? readerViewEl?.clientWidth ?? 800;
-      const half = Math.min(180, Math.max(20, stageW / 2 - 8));
-      cx = Math.max(half, Math.min(stageW - half, cx));
-      // 底部空间不足则翻到词上方（估计弹窗高度 ~320）
-      const stageH = readerStageEl?.clientHeight ?? readerViewEl?.clientHeight ?? 600;
-      if (cy + 320 > stageH) {
-        let topVy = found.rect.top;
-        if (frame) topVy += frame.getBoundingClientRect().top;
-        const topC = toContainerCoords(found.rect.left + found.rect.width / 2, topVy - 8);
-        cy = topC.y - 320;
-        if (cy < 8) cy = 8;
-      }
-      showHoverDict(found.word, cx, cy);
+      showHoverDict(found.word, anchorForWord(found.rect, vx, vy));
     };
 
     trackDocListener(doc, "mousemove", onMove as EventListener);
@@ -4209,10 +4481,12 @@ import { getLogger } from "../core/logger.ts";
       dismissPretranslate();
       return;
     }
-    // Esc：先收浮层，再把顶/底两栏一起收起（微信读书同款）
+    // Esc：先收浮层，再把顶/底两栏一起收起（微信读书同款）；
+    // 两栏都已收起时再按一次 = 退出沉浸阅读（外框恢复），逐层剥离。
     if (e.key === "Escape") {
       e.preventDefault();
-      dismissChrome();
+      if (readerImmersive && !topBarRevealed) exitReaderImmersive();
+      else dismissChrome();
       return;
     }
     // 2026-10-10：? 与 Mac 的 Shift+/ 唤出/收起快捷键面板。
@@ -4260,7 +4534,7 @@ import { getLogger } from "../core/logger.ts";
         toggleTheme();
         return;
       case "toggleFullscreen":
-        toggleFullscreen();
+        toggleImmersive();
         return;
       case "fontIncrease":
         if (isPdfBook()) { zoomIn(); } else { changeFont(1); }
@@ -4687,6 +4961,7 @@ import { getLogger } from "../core/logger.ts";
   function toggleSettings() {
     showSettings = !showSettings;
     settingsInitialTab = null;
+    settingsInitialSub = null;
     showSearch = false;
     showToc = false;
     // v1.3.0：打开设置时刷新本书 Token 累计显示
@@ -4710,9 +4985,26 @@ import { getLogger } from "../core/logger.ts";
   function openBilingualSettingsPanel() {
     showSettings = true;
     settingsInitialTab = "translate";
+    settingsInitialSub = null;
     showSearch = false;
     showToc = false;
     ensureTopBarForPopover();
+  }
+
+  /** 从词典弹窗直达「词典管理」二级页（2026-11-20：无可用词典时的引导按钮） */
+  function openDictSettings() {
+    closeDictPopup();
+    settingsInitialTab = null;
+    settingsInitialSub = "dict";
+    showSettings = true;
+    showSearch = false;
+    showToc = false;
+    ensureTopBarForPopover();
+  }
+
+  function closeSettingsDialog() {
+    showSettings = false;
+    settingsInitialSub = null;
   }
 
   /* ================= 2026-10-24 移动端适配 Phase 2.1：紧凑顶栏 ⋯ 溢出菜单 =================
@@ -5236,6 +5528,19 @@ import { getLogger } from "../core/logger.ts";
   $: noteCardSheet = kbOpen;
   // ⋯ 溢出菜单（紧凑顶栏专属）
   let showMoreMenu = false;
+  /** 沉浸阅读：隐藏思源顶栏/侧栏/页签栏/状态栏（不动系统全屏，macOS 绿钮仍归用户） */
+  let readerImmersive = false;
+  /** 页签被切走（display:none）时自动退出沉浸，避免停留在别的 Tab 却没有任何思源外框 */
+  let immersiveObserver: IntersectionObserver | null = null;
+  /* 2026-11-20：自动退出的误判闸门。
+   * 进入沉浸会一次性隐藏顶栏/状态栏/左右栏 ⇒ 触发一次布局重排，阅读区可能瞬间
+   * 0 尺寸，IntersectionObserver 会立刻报「不可见」→ 当场自己退出沉浸。
+   * 用户体感就是「有时候进去又弹回来」。所以：
+   *   · 进入后 800ms 内的回调全部忽略；
+   *   · 之后也不立刻退，等 260ms 二次确认「确实不在屏幕上」（offsetParent 为空）。
+   * 这两条一起生效，才能真正区分「页签被切走」与「重排的中间态」。 */
+  let immersiveEnteredAt = 0;
+  let immersiveExitTimer = 0;
 
   /* 2026-11-06 AI 阅读助手：桌面全部交给思源右侧停靠栏，阅读器内不再停靠。
    * 2026-11-15 移动端全量走通 P0：**所有移动端**（手机 / 平板 / 手机浏览器）都走
@@ -5305,6 +5610,9 @@ import { getLogger } from "../core/logger.ts";
       if (!readerViewEl || !readerStageEl) { resizeGestureCfi = null; return; }
       // 1) 强制浏览器重排，确保 flex 高度已更新到最新窗口尺寸
       void readerStageEl.getBoundingClientRect();
+      // 2026-11-20 自动版式：窗口尺寸是推导输入之一，必须重算列宽/栏数/边距，
+      // 否则拉伸窗口后仍按旧尺寸的版式显示（摘要也会停在旧值）。
+      if (autoTypographyEnabled()) applyStyles();
       // 2) 向 foliate 内部 iframe 派发 resize，触发其列宽 / 分页重算
       try {
         const ifr = (view?.renderer as any)?.iframe as HTMLIFrameElement | null;
@@ -6932,6 +7240,21 @@ import { getLogger } from "../core/logger.ts";
 
   /** 特殊动作（目前只有「管理词典」，已由设置弹窗内部处理为二级页） */
   function onSettingsDialogAction(e: CustomEvent) {
+    // 2026-11-20：把当前自动推导结果一次性抄进设置并关掉自动，
+    // 之后用户就在这组值上继续微调（而不是回到很久以前手动设的值）。
+    if (e?.detail === "autoTypographyApply") {
+      const auto = resolveAutoTypography();
+      if (!auto) {
+        toast(t("当前版面还不稳定，稍后再试"));
+        return;
+      }
+      const taken = applyAutoTypographyToSettings(settings, auto);
+      settingsStore.update({ ...taken, autoTypography: false } as any);
+      settings = settingsStore.get();
+      applyStyles();
+      toast(t("已按当前自动版式转为手动设置"));
+      return;
+    }
     // 2026-10-07 第 3 批：词典管理改为弹窗内二级页后，SettingsDialog 自己
     // 切页（onAction 里判dictManager），**不再向外冒泡**。
     // 这里保留兜底：若将来有新动作从弹窗抛出，仍能在此集中处理。
@@ -7562,10 +7885,18 @@ import { getLogger } from "../core/logger.ts";
   // 2026-08-27：Option+悬浮取词（英文）相关状态
   let dictPopupEl: HTMLElement | null = null;       // 弹窗 DOM 引用（用于命中检测）
   let dictPopupSource: "sel" | "hover" | null = null; // 当前弹窗来源（sel=划词工具栏, hover=悬浮）
+  /** 当前词卡对应的选区/原句；从生词面板打开时显式清空，避免沿用上一次划词文本 */
+  let dictContextSentence = "";
+  // 悬浮词卡放在词的哪一侧。above 时 top 是卡片的**下沿**（CSS 用 translateY(-100%) 上翻），
+  // 这样卡片长高了往上长，永远不会压住词 —— 见 placeHoverDictPopup 的说明。
+  let dictPopupPlacement: "below" | "above" = "below";
+  // 悬浮卡小尾巴在容器里的横坐标；只在 hover 来源显示，随词的位置和边缘夹紧一起更新。
+  let dictTailX = 0;
 
   let hoverHideTimer: any = null;                   // 悬浮弹窗延迟收起计时器
   let hoverWord: string | null = null;             // 当前悬浮命中的单词（去重用）
   let hoverAnchorRect: DOMRect | null = null;       // 当前悬浮词在 iframe 坐标系下的矩形（容差带判定用）
+  let hoverAnchorViewport: SelRect | null = null;   // 当前悬浮词的视口矩形（切数据源重查时保持同一锚点）
   let toastMsg = "";
   let toastTimer: any = null;
 
@@ -8020,6 +8351,13 @@ import { getLogger } from "../core/logger.ts";
   function attachContentDoc(doc: Document | null | undefined) {
     if (!doc || attachedDocs.has(doc)) return;
     attachedDocs.add(doc);
+    // 2026-11-19 深色反图：分页模式下图片常常晚于文档就绪才解码完，load 时补判定；
+    // 已就绪的图由 scheduleSmartImgInvert 的即时扫描覆盖（两条路径都幂等）。
+    trackDocListener(doc, "load", ((e: Event) => {
+      const t = e.target as Element | null;
+      if (t?.tagName === "IMG") classifyImgInvert(t as HTMLImageElement);
+    }) as EventListener, true);
+    scheduleSmartImgInvert();
     // mouseup 用 capture 阶段，先于 bubble 阶段的正文监听处理
     trackDocListener(doc, "mouseup", onContentMouseUp, true);
     // 宿主分屏拖拽事件桥 A：书页 iframe 独立文档，事件不会冒泡回主文档
@@ -10892,6 +11230,8 @@ import { getLogger } from "../core/logger.ts";
   //   原先硬编码 "offline"，用户点了 🌐 切到在线，**刷新页面就悄悄变回离线** ——
   //   「我明明选了海词」的困惑就是这么来的。
   let dictPopupMode: "offline" | "online" = "offline";
+  /** 2026-11-20：弹窗是否处于「完整释义」形态（头部按钮切换，重新查词时复位） */
+  let dictExpanded = false;
   /** 在线词典总闸；关掉后 🌐 不可用且不发起任何网络请求 */
   $: onlineDictOn = settings.onlineDictEnabled !== false;
   /** 🌐 按钮是否可用（在线被关 ⇒ 强制离线） */
@@ -10935,24 +11275,56 @@ import { getLogger } from "../core/logger.ts";
     return { x, y, maxH };
   }
 
+  /**
+   * 离线查词落空时，是否应给「无可用词典」引导（2026-11-20）。
+   *
+   * `isReady` 为 true 说明引擎里至少加载成功一本——此时查不到就是
+   * 「词不在词典里」，应走相近词候选；否则候选必然为空，给导入/启用入口。
+   * 返回 null 表示按普通「未找到」处理。
+   */
+  function dictUnavailableHtml(): string | null {
+    let ready = false;
+    let hasDicts = false;
+    try {
+      ready = dictManagerRef?.isReady === true;
+      const list = dictManagerRef?.list?.();
+      hasDicts = Array.isArray(list?.dicts) && list.dicts.length > 0;
+    } catch {
+      ready = false;
+    }
+    if (ready) return null;
+    return renderDictUnavailable(hasDicts);
+  }
+
   function runDictLookup(
     word: string,
-    opts?: { x?: number; y?: number; source?: "sel" | "hover"; keepMode?: boolean },
+    opts?: { x?: number; y?: number; source?: "sel" | "hover"; keepMode?: boolean; anchor?: SelRect; sentence?: string },
   ) {
     /* 2026-11-19 P1-6：水平 + 垂直双夹紧（划词与悬浮两条入口共用）。
        · 水平：锚点原本是按划词工具栏（300px）夹出来的，词卡更宽（360px）
          ⇒ 左右各多出 30px，贴边时整块被裁。
        · 垂直：原来**完全没夹** —— 工具栏落在屏幕下半部时词卡下半截直接出屏。
          词卡最高 62vh，先量高度再夹会闪一帧，改成「按剩余空间给 max-height」
-         （CSS 读 --dict-max-h），y 只需要保证顶部有个下界即可。 */
+         （CSS 读 --dict-max-h），y 只需要保证顶部有个下界即可。
+       2026-11-20：悬浮来源切数据源重查时传 `anchor`（词的视口矩形），
+       走与悬浮开卡相同的「贴边定位」，避免上翻的卡切个源就盖回单词上。 */
     const rawX = opts?.x ?? selToolbar.x;
     const rawY = opts?.y ?? (selToolbar.y + toolbarH);
-    const { x, y, maxH } = clampDictPopupBox(rawX, rawY);
+    const hoverBox = opts?.anchor ? placeHoverDictPopup(opts.anchor) : null;
+    const { x, y, maxH } = hoverBox ?? clampDictPopupBox(rawX, rawY);
     const source = opts?.source ?? "sel";
+    // sentence 显式传入时以它为准（生词面板传空串 = 明确没有原句）
+    dictContextSentence = String(
+      opts?.sentence !== undefined ? opts.sentence : source === "sel" ? selToolbar.text : "",
+    ).trim();
     // 每次开弹窗都对齐设置的「默认数据源」——
     // 这样刷新页面后不会莫名回到离线（原先 dictPopupMode 是硬编码的内存变量）。
     // setDictMode 自带在线总闸检查：在线被关时会回落离线。
     if (!opts?.keepMode) setDictMode(settings.dictDefaultSource === "online" ? "online" : "offline");
+    dictExpanded = false;
+    // 划词卡固定从锚点往下方排；悬浮卡沿用贴边算法给出的那一侧
+    dictPopupPlacement = hoverBox?.placement ?? "below";
+    dictTailX = hoverBox?.tailX ?? 0;
     dictPopupSource = source;
     dictPopup = { visible: true, x, y, maxH, html: renderLoading(), word, source };
     setTimeout(async () => {
@@ -10975,8 +11347,7 @@ import { getLogger } from "../core/logger.ts";
           html = renderDictCardSimple(parsed, { showStar: true, inVocab: isInVocab?.(word) ?? false, onlineSwitchEnabled: dictCanSwitch });
           headword = parsed.word || word;
         } else {
-          const cands = searchCandidates(word, 3);
-          html = renderDictSuggestions(word, cands);
+          html = dictUnavailableHtml() ?? renderDictSuggestions(word, searchCandidates(word, 3));
         }
       }
       // 仅当来源未切换时更新（避免悬浮→划词切换时旧异步请求覆盖新弹窗）
@@ -10985,6 +11356,56 @@ import { getLogger } from "../core/logger.ts";
         if (headword) maybeAutoSpeakDictWord(headword);
       }
     }, 30);
+  }
+
+  /**
+   * 收词时尽量带上一份可离线展示的快照：离线词典命中就用音标/词性/首选释义，
+   * 并附当前书名与章节。词典缺失/查不到时只存单词，不阻断收藏。
+   */
+  function buildVocabSeed(word: string, sentence = ""): VocabSeed {
+    const w = String(word || "").trim();
+    const seed: VocabSeed = { word: w };
+    try {
+      const entry = lookupSmart(w);
+      if (entry) {
+        const parsed = parseDictEntry(entry);
+        const phonetic = String(parsed.phonetic || "").trim();
+        if (phonetic) seed.phonetic = phonetic;
+        const first = extractSenses(entry.definition, 1)[0];
+        if (first) {
+          if (first.pos) seed.pos = first.pos;
+          if (first.zh) seed.meaning = first.zh;
+        }
+        if (!seed.meaning) {
+          const fallback = String(parsed.resolvedZh || parsed.plainText || "")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (fallback) seed.meaning = fallback.slice(0, 160);
+        }
+      }
+    } catch { /* 词典不可用时仍可收藏单词 */ }
+    const chapter = String(resolveChapterTitle(currentSectionIndex) || chapterLabel || "").trim();
+    const titleNow = String(meta?.title || title || "").trim();
+    if (bookId) seed.bookId = String(bookId);
+    if (titleNow) seed.bookTitle = titleNow;
+    if (chapter) seed.chapter = chapter;
+    const ctx = String(sentence || "").replace(/\s+/g, " ").trim();
+    if (ctx) seed.sentence = ctx.slice(0, 400);
+    return seed;
+  }
+
+  /** 生词页签点词：复用阅读器词典卡，位置放在正文顶部居中。 */
+  function openVocabWord(word: string) {
+    const w = String(word || "").trim();
+    if (!w) return;
+    const b = getContentBounds();
+    const off = getReaderViewOffset();
+    runDictLookup(w, {
+      x: (b.left + b.right) / 2 - off.left,
+      y: Math.max(12, b.top - off.top + 16),
+      source: "sel",
+      sentence: "",
+    });
   }
 
   function onSelDict() {
@@ -11121,6 +11542,8 @@ import { getLogger } from "../core/logger.ts";
       return;
     }
     dbgHud.relocateCalls++;
+    // 2026-11-19：翻页后新 section 可能带来新图，补扫一次（已判定的图会被跳过）
+    scheduleSmartImgInvert();
     // 2026-11-06：翻页/滚动即收两栏（微信读书同款；浮层开着或指针按在栏上时避让）。
     retractChromeOnRelocate();
     // 2026-10-24 D2：跨页续接进行中 ⇒ **不收起**划词浮层，改为按新位置重锚。
@@ -12657,7 +13080,7 @@ import { getLogger } from "../core/logger.ts";
     for (const w of words) {
       try {
         if (isInVocab?.(w)) { skipped++; continue; }
-        onAddToVocab?.(w);
+        onAddToVocab?.(buildVocabSeed(w, txt));
         added++;
       } catch { /* 忽略单项失败 */ }
     }
@@ -12726,16 +13149,30 @@ import { getLogger } from "../core/logger.ts";
   // 翻译选中文本（2026-08-27 原行为：仅发 AI 精读面板；
   // 2026-08-27 晚 改：弹内联即译气泡，展示原文/译文，并保留「发 AI 精读」入口）
   /**
-   * 划词工具栏「翻译」按钮（2026-08-27 重设计）：
-   * 直接把选中文本拼上 AI 设置里的「翻译预置提示词」，发送并聚焦 AI 精读面板。
-   * 不再弹内联即译卡片（内联卡片已移除，译文改为顶栏「双语」开关逐段注入）。
+   * 划词工具栏「翻译」（2026-11-20 去耦）：选段 + 翻译指令投到本插件的 AI 面板，
+   * 由用户确认后发送。桌面走右栏/已开页签，手机走全屏浮层。
    */
   function onSelTranslate() {
     const text = selToolbar.text?.trim();
     closeSelToolbar();
     if (!text) return;
-    if (onTranslateToAi) onTranslateToAi(text);
-    else toast(t("翻译未配置：请先在 AI 设置中开启并填写 API"));
+    const quote: AiChatQuote = {
+      text,
+      sectionIndex: currentSectionIndex,
+      chapterTitle: resolveChapterTitle(currentSectionIndex) || chapterLabel || undefined,
+      prompt: t("请翻译引用的这段文字，只输出译文。"),
+    };
+    if (!aiOverlay) {
+      if (!onAskAiInDock) {
+        toast(t("翻译未配置：请先在 AI 设置中开启并填写 API"));
+        return;
+      }
+      retractChromeForAi();
+      onAskAiInDock(bookId, quote);
+      return;
+    }
+    if (!showAiPanel) toggleAiPanel();
+    void tick().then(() => aiPanelComp?.addQuote?.(quote));
   }
 
   // ========== 2026-08-27 重设计：双语对照开关 ==========
@@ -13453,24 +13890,47 @@ import { getLogger } from "../core/logger.ts";
   }
 
   /**
-   * F11 全屏：整块阅读区进入浏览器全屏（Esc 由浏览器原生退出）。
-   * reader-shortcuts.ts 的注册表里早就有 toggleFullscreen 这一项，
-   * 但此前没有任何地方接它，键位等于空头支票。
+   * 沉浸阅读（F11 / 顶栏按钮）：只隐藏思源自己的外框，阅读区自然铺满窗口。
+   * 不调用浏览器原生全屏 API —— 那会把 macOS 菜单栏和绿钮一起接管，用户就没法
+   * 再用系统全屏按钮控制窗口了。系统全屏完全交给绿钮，两者可以叠加使用。
    */
-  function toggleFullscreen() {
+  function toggleImmersive() {
     try {
-      // 2026-11-12：正在输入时绝不进全屏。
-      // 批注卡片里打字，焦点一旦短暂落到 body，F11 之类的按键就会走进来 ——
-      // 整窗进全屏（macOS 绿钮同款）会让用户完全失去上下文。宁可这次不响应。
+      // 2026-11-12：正在输入时不响应，避免批注卡片里打字被误触发。
       const ae = document.activeElement as HTMLElement | null;
       if (noteEditor.visible) return;
       if (ae && (ae.isContentEditable || ae.tagName === "INPUT" || ae.tagName === "TEXTAREA")) return;
-      if (document.fullscreenElement) {
-        void document.exitFullscreen?.();
-      } else {
-        void (readerViewEl as any)?.requestFullscreen?.();
-      }
-    } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · toggleFullscreen", "warn"); }
+      if (readerImmersive) exitReaderImmersive();
+      else enterReaderImmersive();
+    } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · toggleImmersive", "warn"); }
+  }
+
+  function enterReaderImmersive(): void {
+    enterImmersive(document, readerViewEl ?? null);
+    readerImmersive = true;
+    immersiveEnteredAt = Date.now();
+    // 外框让位后阅读区尺寸变了：按当前 CFI 重排回原阅读位
+    scheduleReaderRelayout();
+  }
+
+  function exitReaderImmersive(): void {
+    window.clearTimeout(immersiveExitTimer);
+    immersiveExitTimer = 0;
+    exitImmersive(document);
+    readerImmersive = false;
+    scheduleReaderRelayout();
+  }
+
+  /** 沉浸阅读入口在紧凑顶栏的 ⋯ 菜单里时，先收菜单再执行（与其它菜单项一致） */
+  function onMoreImmersive(): void {
+    showMoreMenu = false;
+    toggleImmersive();
+  }
+
+  /** 窗口尺寸/布局变化后补挂页签行隐藏类（内核可能重建了页签行节点） */
+  function onImmersiveResync(): void {
+    if (!readerImmersive) return;
+    resyncImmersiveTabBar(document);
   }
 
   /**
@@ -13850,7 +14310,11 @@ import { getLogger } from "../core/logger.ts";
           target.textContent = "☆";
           target.title = t("加入词库");
         } else {
-          onAddToVocab?.(w);
+          const sentence =
+            dictContextSentence && dictContextSentence.toLowerCase() !== w.toLowerCase()
+              ? dictContextSentence
+              : "";
+          onAddToVocab?.(buildVocabSeed(w, sentence));
           target.classList.add("star-on");
           target.textContent = "★";
           target.title = t("移出词库");
@@ -13860,8 +14324,29 @@ import { getLogger } from "../core/logger.ts";
     }
 
     // ── 候选词再查 / 变形还原·相关词跳转（同一路径：就地重查该词） ──
-    if ((action === "lookup-candidate" || action === "dict-jump") && word) {
-      runDictLookup(word, { x: dictPopup.x, y: dictPopup.y, source: (dictPopupSource as any) ?? "hover" });
+    if ((action === "lookup-candidate" || action === "dict-jump" || action === "lookup-word") && word) {
+      // 悬浮卡点候选词/跳词：仍以**原词**为锚点重排 —— 拿当前卡片左上角当 y
+      // 会让上翻的卡瞬间翻回词下方、盖住正文
+      const anchor = dictPopupSource === "hover" ? hoverAnchorViewport : null;
+      if (anchor) runDictLookup(word, { anchor, source: "hover" });
+      else runDictLookup(word, { x: dictPopup.x, y: dictPopup.y, source: (dictPopupSource as any) ?? "hover" });
+      return;
+    }
+
+    // ── 在线完整卡：折叠组 / 释义页签切换（2026-11-20 弹窗内展开后可见） ──
+    if (action === "dict-group-toggle") {
+      target.closest(".hiword-dict-group")?.classList.toggle("is-collapsed");
+      return;
+    }
+    if (action === "dict-pane-switch") {
+      const paneId = target.dataset.pane;
+      const group = target.closest(".hiword-dict-group");
+      if (group && paneId) {
+        group.querySelectorAll(".hiword-dict-group-tab").forEach((el) => el.classList.toggle("is-active", el === target));
+        group.querySelectorAll(".hiword-dict-pane").forEach((el) => {
+          (el as HTMLElement).hidden = el.id !== paneId;
+        });
+      }
       return;
     }
 
@@ -13876,13 +14361,18 @@ import { getLogger } from "../core/logger.ts";
       }
       // keepMode：切换后重查**不能**被「对齐设置默认源」覆盖回去
       const w = dictPopup.word;
-      if (w) runDictLookup(w, { x: dictPopup.x, y: dictPopup.y, source: (dictPopupSource as any) ?? "hover", keepMode: true });
+      if (w) {
+        // 悬浮卡带着原词的矩形重排；否则沿用当前卡片左上角（划词卡行为不变）
+        const anchor = dictPopupSource === "hover" ? hoverAnchorViewport : null;
+        if (anchor) runDictLookup(w, { anchor, source: "hover", keepMode: true });
+        else runDictLookup(w, { x: dictPopup.x, y: dictPopup.y, source: (dictPopupSource as any) ?? "hover", keepMode: true });
+      }
       return;
     }
 
-    // ── 2026-09-07 简化小窗卡：🔍 送侧边栏查词典（详细释义） ──
-    if (action === "lookup-in-sidebar") {
-      sendToSidebar();
+    // ── 2026-11-20：无可用离线词典 → 直达设置里的词典管理二级页 ──
+    if (action === "open-dict-settings") {
+      openDictSettings();
       return;
     }
 
@@ -13935,11 +14425,42 @@ import { getLogger } from "../core/logger.ts";
     dictPopup = { ...dictPopup, visible: false };
   }
 
-  /** 将当前弹窗单词发送到 REword 侧边栏查词（自动填入输入框并查询，不关闭阅读弹窗）；
-   *  带上小窗当前源（online/offline），侧边栏面板跟随，避免「小窗在线、面板离线」不一致 */
-  function sendToSidebar() {
-    const w = (dictPopup.word || hoverWord || "").trim();
-    if (w && onOpenInSidebar) onOpenInSidebar(w, dictPopupMode);
+  /**
+   * 弹窗「完整释义」展开/收起（2026-11-20 去 REword 化）。
+   * 就地换成完整词卡（离线 renderDictCard / 在线 renderOnlineDictCard），
+   * 不再把单词送到另一个插件的侧边栏。重新查词时 dictExpanded 复位。
+   */
+  async function toggleDictExpand() {
+    const w = (dictPopup.word || "").trim();
+    if (!w) return;
+    const source = dictPopupSource;
+    const mode = dictPopupMode;
+    const next = !dictExpanded;
+    const stale = () => dictPopupSource !== source || dictPopup.word !== w || dictPopupMode !== mode;
+    const prevHtml = dictPopup.html;
+    let html = "";
+    if (mode === "online") {
+      if (next) dictPopup = { ...dictPopup, html: renderLoading() };
+      const r = await fetchOnlineDict(w);
+      if (stale()) return;
+      if (!r) {
+        // 拉取失败：撤回 loading，保留原卡，避免卡在转圈态
+        dictPopup = { ...dictPopup, html: prevHtml };
+        return;
+      }
+      html = next
+        ? renderOnlineDictCard(r, isInVocab?.(w) ?? false)
+        : renderOnlineDictCardSimple(r, { inVocab: isInVocab?.(w) ?? false });
+    } else {
+      const entry = lookupSmart(w);
+      if (!entry) return;
+      const parsed = parseDictEntry(entry);
+      html = next
+        ? renderDictCard(parsed, { showStar: true, inVocab: isInVocab?.(w) ?? false, onlineSwitchEnabled: dictCanSwitch })
+        : renderDictCardSimple(parsed, { showStar: true, inVocab: isInVocab?.(w) ?? false, onlineSwitchEnabled: dictCanSwitch });
+    }
+    dictExpanded = next;
+    dictPopup = { ...dictPopup, html };
   }
 
   // 2026-08-27：悬浮弹窗——光标进入/离开时的收起控制
@@ -14244,10 +14765,33 @@ import { getLogger } from "../core/logger.ts";
     });
     // 2026-08-28：初始化连续朗读控制器
     ensureTtsController();
+    // 2026-11-20：生词页签计数与列表共用本地 store；面板自己也会订阅刷新
+    syncVocabCount();
+    unsubVocabStore = vocabStore?.subscribe?.(syncVocabCount) ?? null;
     // 2026-09-02 性能修复：跨 frame console 钩子改为按需作用域观察。
     // 只在阅读器挂载期间观察本组件容器，卸载即释放；避免插件在 document.body
     // 上常驻 subtree MutationObserver 拖累整个思源的 DOM 性能。
     setConsoleFilterRoot(readerViewEl ?? null);
+    // 2026-11-19：沉浸阅读期间若页签被切走（display:none，比如 ⌃Tab 或侧栏跳转），
+    // 自动退出沉浸 —— 否则用户停在别的页签上，却连思源顶栏/页签栏都没有。
+    if (typeof IntersectionObserver !== "undefined" && readerViewEl) {
+      immersiveObserver = new IntersectionObserver((entries) => {
+        if (!readerImmersive) return;
+        if (entries.some((en) => en.isIntersecting)) return;
+        // 刚进入的重排窗口期一律忽略（见 immersiveEnteredAt 注释）
+        if (Date.now() - immersiveEnteredAt < 800) return;
+        window.clearTimeout(immersiveExitTimer);
+        immersiveExitTimer = window.setTimeout(() => {
+          if (!readerImmersive || !readerViewEl) return;
+          // 二次确认：真的看不见了（页签被切走 / 所在面板被收起）才退
+          if (readerViewEl.isConnected && readerViewEl.offsetParent !== null) return;
+          exitReaderImmersive();
+        }, 260);
+      });
+      immersiveObserver.observe(readerViewEl);
+      // 沉浸期间页签行被内核重建（拆窗/拖页签）时补挂隐藏类（老 WebView 没有 :has() 时需要）
+      window.addEventListener("resize", onImmersiveResync, { passive: true });
+    }
   });
 
   /**
@@ -14262,6 +14806,16 @@ import { getLogger } from "../core/logger.ts";
 
   onDestroy(() => {
     isDestroyed = true; // 2026-10-06：阻断销毁后的 settings 订阅回调
+    unsubVocabStore?.();
+    unsubVocabStore = null;
+    // 2026-11-19：关闭阅读页签时必须还回思源外框，不能把宿主留在沉浸态
+    immersiveObserver?.disconnect();
+    immersiveObserver = null;
+    window.removeEventListener("resize", onImmersiveResync);
+    window.clearTimeout(immersiveExitTimer);
+    immersiveExitTimer = 0;
+    if (readerImmersive) exitReaderImmersive();
+    removeImmersiveStyle(document);
     cancelTipTimer();
     if (tipMq && tipMqHandler) tipMq.removeEventListener?.("change", tipMqHandler);
     document.removeEventListener("scroll", hideTip, true);
@@ -14337,6 +14891,8 @@ import { getLogger } from "../core/logger.ts";
     }
     // 2026-08-30：清理 resize 重排防抖定时器
     if (readerRelayoutTimer) clearTimeout(readerRelayoutTimer);
+    // 2026-11-19：清理深色反图采样定时器
+    if (imgInvertTimer) clearTimeout(imgInvertTimer);
     if (typeof document !== "undefined") {
       document.removeEventListener("selectionchange", onMainSelectionChange);
       // 2026-09-05：清掉选区读取的 rAF 节流句柄（组件销毁后回调不该再跑）
@@ -14450,6 +15006,19 @@ import { getLogger } from "../core/logger.ts";
   class:sidebar-docked={anyDockPanel()}
   style="--re-sidebar-w:{sidebarWidth}px;--re-kb:{kbInset}px"
 >
+  <!-- 2026-11-19：沉浸阅读 + 上下栏都收起时的退出兜底（顶栏按钮此时不可见）。
+       只在这种状态下出现，正常阅读时不占视觉。 -->
+  {#if readerImmersive && !topBarRevealed}
+    <button
+      class="reader-immersive-exit"
+      title={t("退出沉浸阅读（Esc）")}
+      aria-label={t("退出沉浸")}
+      on:click={exitReaderImmersive}
+    >
+      <svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.fullscreenExit}</svg>
+      <span>{t("退出沉浸")}</span>
+    </button>
+  {/if}
   <!-- 2026-11-06 微信读书式上下栏：顶栏永远是浮层（脱离文档流、浮在正文上方）。
        · reader-toolbar-floating —— 固定类名，不再有「常驻/悬浮」两档
        · reader-toolbar-revealed —— 显隐唯一开关（收起态见 CSS 的 translateY + opacity）
@@ -14552,6 +15121,15 @@ import { getLogger } from "../core/logger.ts";
           class:reader-btn-active={showSearch}
           on:click={toggleSearch}
         ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.search}</svg></button>
+        <!-- 2026-11-19：沉浸阅读 —— 只隐藏思源顶栏/侧栏/页签栏/状态栏，
+             系统全屏仍由 macOS 绿钮控制（两者可叠加） -->
+        <button
+          class="reader-btn reader-chrome-btn"
+          title={readerImmersive ? t("退出沉浸阅读（Esc）") : t("沉浸阅读（隐藏思源界面，F11）")}
+          aria-label={readerImmersive ? t("退出沉浸阅读") : t("沉浸阅读")}
+          class:reader-btn-active={readerImmersive}
+          on:click={toggleImmersive}
+        ><svg class="reader-ic" viewBox="0 0 24 24" aria-hidden="true">{@html readerImmersive ? ICONS.fullscreenExit : ICONS.fullscreen}</svg></button>
       {:else}
         <!-- 紧凑顶栏：双语/设置/搜索收进 ⋯（按钮 44×44 命中区由 .reader-toolbar-iphone /
              (pointer:coarse) 规则放大） -->
@@ -15088,100 +15666,143 @@ import { getLogger } from "../core/logger.ts";
       <button class="reader-more-item" role="menuitem" on:click={onMoreSearch}>
         <span>🔍 {t("搜索全书（F3 / ⌘F）")}</span>
       </button>
+      {#if !mobileOverlay}
+        <button class="reader-more-item" role="menuitem" on:click={onMoreImmersive}>
+          <span>{readerImmersive ? t("退出沉浸阅读") : t("沉浸阅读")}</span>
+        </button>
+      {/if}
     </div>
   {/if}
 
   {#if showMarks}
     <div class="reader-popover reader-marks" style="--tail-left:{tailLeft}px" on:wheel|stopPropagation>
-      <!-- 子区 1：书签 -->
-      <div class="reader-marks-section">
-        <div class="reader-popover-title">
-          {t("书签")}
+      <div class="reader-marks-head">
+        <div class="reader-marks-title">
+          <span>{t("我的标记")}</span>
           <button
             class="reader-pin-btn"
             class:on={sidebarPinned}
             title={sidebarPinned ? t("取消固定（恢复浮层）") : t("固定为侧边栏（正文让位，可拖宽）")}
             on:click={toggleSidebarPin}
           >{sidebarPinned ? "⇤" : "⇥"}</button>
-          {#if bookmarks.length}
-            <span class="reader-toc-count">{t("{n} 条", { n: bookmarks.length })}</span>
-          {/if}
         </div>
-        <div class="reader-bm-list">
-          <button class="reader-bm-add" on:click={toggleCurrentBookmark}>＋ {t("在当前页加书签")}</button>
-          {#each bookmarks as bm (bm.id)}
-            <div class="reader-bm-item">
-              <button class="reader-bm-main" title={t("跳转到书签")} on:click={() => jumpBookmark(bm)}>
-                <span class="reader-bm-label">{bm.label || t("书签")}</span>
-                {#if bm.excerpt}
-                  <span class="reader-bm-excerpt">{bm.excerpt}</span>
-                {/if}
-              </button>
-              <button class="reader-mini-btn" title={t("删除书签")} on:click={() => removeBookmark(bm)}>✕</button>
-            </div>
-          {:else}
-            <div class="reader-toc-empty">{t("还没有书签，点上面按钮在当前页加一个")}</div>
-          {/each}
+        <div class="reader-marks-tabs" role="tablist" aria-label={t("我的标记")}>
+          <button
+            class="reader-marks-tab"
+            class:active={marksTab === "bookmarks"}
+            role="tab"
+            aria-selected={marksTab === "bookmarks"}
+            on:click={() => (marksTab = "bookmarks")}
+          >{t("书签")} <span>{bookmarks.length}</span></button>
+          <button
+            class="reader-marks-tab"
+            class:active={marksTab === "annots"}
+            role="tab"
+            aria-selected={marksTab === "annots"}
+            on:click={() => (marksTab = "annots")}
+          >{t("标注")} <span>{annotsList.length}</span></button>
+          <button
+            class="reader-marks-tab"
+            class:active={marksTab === "vocab"}
+            role="tab"
+            aria-selected={marksTab === "vocab"}
+            on:click={() => (marksTab = "vocab")}
+          >{t("生词")} <span>{vocabCount}</span></button>
         </div>
       </div>
 
-      <!-- 子区 2：标注与摘录（含墨迹） -->
-      <!-- 2026-09-04 P0-3：墨迹笔触与文本摘录合并展示，按 createdAt 倒序。
-           kind === "ink" 的项展示笔触色点 + 笔刷信息 + 跳页；其他走文本路径。
-           2026-09-09 B：更名「标注与摘录」+ 每条加类型标识（高亮/直线/波浪/批注/矩形/墨迹），
-           此前一律只显示文字，高亮与批注分辨不出。 -->
-      <div class="reader-marks-section">
-        <div class="reader-popover-title">
-          {t("标注与摘录")}
-          {#if annotsList.length}
-            <span class="reader-toc-count">{t("{n} 条", { n: annotsList.length })}</span>
-            <button class="reader-mini-btn" title={t("导出文本摘录为 Markdown（按设置的导出方式写入剪贴板或指定文档；墨迹不导出）")} on:click={exportAnnots}>{t("导出")}</button>
-          {/if}
-        </div>
-        <div class="reader-annots-list">
-          {#each annotsList as it (it.id)}
-            <div class="reader-annot-item" class:reader-annot-item-ink={it.kind === "ink"}>
-              <span class="reader-annot-dot" style="background:{it.color || '#62a2ff'}"></span>
-              <span class="reader-annot-kind" title={annotKindLabel(it)}>{annotGlyph(it)}</span>
-              <!-- 整行可点 = 跳转。用 role=button 的 div 而不是 <button>：
-                   批注正文现在渲染 Lute 富文本（<p>/<ul>/<table>），
-                   块级元素塞进 button 是非法嵌套，浏览器表现也不稳定。 -->
-              <div
-                class="reader-annot-main"
-                role="button"
-                tabindex="0"
-                title={t("跳转到{kind}所在位置", { kind: annotKindLabel(it) })}
-                on:click={() => jumpAnnot(it)}
-                on:keydown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    void jumpAnnot(it);
-                  }
-                }}
-              >
-                <span class="reader-annot-text">
-                  {#if it.kind === "ink"}
-                    <span class="reader-annot-ink-tag">✎ {it.sentence}</span>
-                    <span class="reader-annot-ink-meta">{it.brush} · {it.style}</span>
-                  {:else}
-                    {String(it.selectedText || it.sentence || "").trim() || t("（无文本）")}
+      {#if marksTab === "bookmarks"}
+        <div class="reader-marks-section">
+          <div class="reader-marks-panel-head">
+            <span class="reader-marks-panel-title">{t("书签")}</span>
+            {#if bookmarks.length}
+              <span class="reader-toc-count">{t("{n} 条", { n: bookmarks.length })}</span>
+            {/if}
+          </div>
+          <div class="reader-bm-list">
+            <button class="reader-bm-add" on:click={toggleCurrentBookmark}>＋ {t("在当前页加书签")}</button>
+            {#each bookmarks as bm (bm.id)}
+              <div class="reader-bm-item">
+                <button class="reader-bm-main" title={t("跳转到书签")} on:click={() => jumpBookmark(bm)}>
+                  <span class="reader-bm-label">{bm.label || t("书签")}</span>
+                  {#if bm.excerpt}
+                    <span class="reader-bm-excerpt">{bm.excerpt}</span>
                   {/if}
-                </span>
-                {#if it.kind !== "ink" && String(it.note || "").trim()}
-                  <div class="reader-annot-note b3-typography">{@html renderAnnotationHTML(it.note)}</div>
-                {/if}
+                </button>
+                <button class="reader-mini-btn" title={t("删除书签")} on:click={() => removeBookmark(bm)}>✕</button>
               </div>
-              <button
-                class="reader-mini-btn"
-                title={it.kind === "ink" ? t("删除这条墨迹") : t("删除这条摘录")}
-                on:click={() => it.kind === "ink" ? removeInkStroke(it) : removeAnnot(it)}
-              >✕</button>
-            </div>
-          {:else}
-            <div class="reader-toc-empty">{t("本书还没有标注，划选文本后点「标注」或「批注」")}</div>
-          {/each}
+            {:else}
+              <div class="reader-toc-empty">{t("还没有书签，点上面按钮在当前页加一个")}</div>
+            {/each}
+          </div>
         </div>
-      </div>
+      {:else if marksTab === "annots"}
+        <!-- 子区 2：标注与摘录（含墨迹） -->
+        <!-- 2026-09-04 P0-3：墨迹笔触与文本摘录合并展示，按 createdAt 倒序。
+             kind === "ink" 的项展示笔触色点 + 笔刷信息 + 跳页；其他走文本路径。
+             2026-09-09 B：更名「标注与摘录」+ 每条加类型标识（高亮/直线/波浪/批注/矩形/墨迹），
+             此前一律只显示文字，高亮与批注分辨不出。 -->
+        <div class="reader-marks-section">
+          <div class="reader-marks-panel-head">
+            <span class="reader-marks-panel-title">{t("标注与摘录")}</span>
+            {#if annotsList.length}
+              <span class="reader-toc-count">{t("{n} 条", { n: annotsList.length })}</span>
+              <button class="reader-mini-btn" title={t("导出文本摘录为 Markdown（按设置的导出方式写入剪贴板或指定文档；墨迹不导出）")} on:click={exportAnnots}>{t("导出")}</button>
+            {/if}
+          </div>
+          <div class="reader-annots-list">
+            {#each annotsList as it (it.id)}
+              <div class="reader-annot-item" class:reader-annot-item-ink={it.kind === "ink"}>
+                <span class="reader-annot-dot" style="background:{it.color || '#62a2ff'}"></span>
+                <span class="reader-annot-kind" title={annotKindLabel(it)}>{annotGlyph(it)}</span>
+                <!-- 整行可点 = 跳转。用 role=button 的 div 而不是 <button>：
+                     批注正文现在渲染 Lute 富文本（<p>/<ul>/<table>），
+                     块级元素塞进 button 是非法嵌套，浏览器表现也不稳定。 -->
+                <div
+                  class="reader-annot-main"
+                  role="button"
+                  tabindex="0"
+                  title={t("跳转到{kind}所在位置", { kind: annotKindLabel(it) })}
+                  on:click={() => jumpAnnot(it)}
+                  on:keydown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      void jumpAnnot(it);
+                    }
+                  }}
+                >
+                  <span class="reader-annot-text">
+                    {#if it.kind === "ink"}
+                      <span class="reader-annot-ink-tag">✎ {it.sentence}</span>
+                      <span class="reader-annot-ink-meta">{it.brush} · {it.style}</span>
+                    {:else}
+                      {String(it.selectedText || it.sentence || "").trim() || t("（无文本）")}
+                    {/if}
+                  </span>
+                  {#if it.kind !== "ink" && String(it.note || "").trim()}
+                    <div class="reader-annot-note b3-typography">{@html renderAnnotationHTML(it.note)}</div>
+                  {/if}
+                </div>
+                <button
+                  class="reader-mini-btn"
+                  title={it.kind === "ink" ? t("删除这条墨迹") : t("删除这条摘录")}
+                  on:click={() => it.kind === "ink" ? removeInkStroke(it) : removeAnnot(it)}
+                >✕</button>
+              </div>
+            {:else}
+              <div class="reader-toc-empty">{t("本书还没有标注，划选文本后点「标注」或「批注」")}</div>
+            {/each}
+          </div>
+        </div>
+      {:else}
+        <VocabPanel
+          store={vocabStore}
+          {bookId}
+          bookTitle={meta?.title || title}
+          {t}
+          onOpenWord={openVocabWord}
+        />
+      {/if}
     </div>
   {/if}
 
@@ -15201,8 +15822,9 @@ import { getLogger } from "../core/logger.ts";
     <SettingsDialog
       open={showSettings}
       initialTab={settingsInitialTab}
+      initialSub={settingsInitialSub}
       {settings}
-      extra={{ tts: ttsCfg, readerMode, getBookMeta: () => (bookId ? store.get(bookId) : undefined) }}
+      extra={{ tts: ttsCfg, readerMode, autoTypographySummary, getBookMeta: () => (bookId ? store.get(bookId) : undefined) }}
       {readerMode}
       dictManager={dictManagerRef}
       translateHost={translateHostRef}
@@ -15217,7 +15839,7 @@ import { getLogger } from "../core/logger.ts";
       on:autoBind={onAutoBind}
       on:dictChanged={onDictManagerChanged}
       on:fontChanged={onFontManagerChanged}
-      on:close={() => (showSettings = false)}
+      on:close={closeSettingsDialog}
     />
 
     <!-- 2026-10-07 第 3 批：词典管理不再有独立弹窗（原 <DictManagerDialog> 已删）。
@@ -15801,18 +16423,23 @@ import { getLogger } from "../core/logger.ts";
     {#if dictPopupSource === "sel"}
       <div class="reader-dict-backdrop" on:click={closeDictPopup} aria-hidden="true"></div>
     {/if}
-    <div class="reader-dict-popup" bind:this={dictPopupEl}
+    <div class="reader-dict-popup" class:is-above={dictPopupPlacement === "above"} bind:this={dictPopupEl}
          style="left:{dictPopup.x}px; top:{dictPopup.y}px{dictPopup.maxH ? `; --dict-max-h:${dictPopup.maxH}px` : ''}"
          on:mouseenter={onDictPopupEnter} on:mouseleave={onDictPopupLeave}>
       <div class="reader-dict-head">
         <span>{t("词典")}</span>
         <div class="reader-dict-head-actions">
-          <button class="reader-dict-send" on:click={sendToSidebar} data-tip={t("在 REword 侧边栏查词（自动填入，无需手动输入）")}>{t("侧边栏")}</button>
+          <button class="reader-dict-send" on:click={toggleDictExpand} data-tip={dictExpanded ? t("收起完整释义") : t("展开完整释义（例句、词组、相关词）")}>{dictExpanded ? t("收起") : t("完整释义")}</button>
           <button class="reader-dict-close" on:click={closeDictPopup} data-tip={t("关闭")} aria-label={t("关闭")}>✕</button>
         </div>
       </div>
       <div class="reader-dict-body" on:click={onDictBodyClick}>{@html dictPopup.html}</div>
     </div>
+    <!-- 悬浮卡小尾巴：必须是 popup 的兄弟节点（popup 自带 overflow:auto，伪元素会被裁掉） -->
+    {#if dictPopupSource === "hover"}
+      <div class="reader-dict-tail" class:is-above={dictPopupPlacement === "above"}
+           style="left:{dictTailX}px; top:{dictPopup.y}px" aria-hidden="true"></div>
+    {/if}
   {/if}
 
   <!-- 自绘 Tooltip（2026-11-05）：浮层内唯一的提示层，由 [data-tip] 委托驱动。
@@ -15954,6 +16581,43 @@ import { getLogger } from "../core/logger.ts";
     --rwd-pop-border: rgba(255, 255, 255, 0.10);
     --rwd-pop-danger: #e5646e;
     --rwd-pop-shadow: 0 6px 20px rgba(0, 0, 0, 0.34), 0 1px 3px rgba(0, 0, 0, 0.24);
+  }
+  /* 夜间深色底上黑色投影本来就不明显，描边改用高亮白、投影加重才分得清边界 */
+  :global(.b3-theme-dark) .reader-popover {
+    border-color: rgba(255, 255, 255, 0.14);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.4),
+      0 10px 26px rgba(0, 0, 0, 0.46),
+      0 24px 56px rgba(0, 0, 0, 0.4);
+  }
+  /* 2026-11-19 沉浸阅读：隐藏思源外框后，上下栏都收起时的退出兜底。
+     低调小胶囊，悬停才完全不透明；只在沉浸 + 两栏收起时渲染。 */
+  .reader-immersive-exit {
+    position: absolute;
+    top: 10px;
+    right: 12px;
+    z-index: 2;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 28px;
+    padding: 0 10px;
+    border: 1px solid var(--rwd-pop-border);
+    border-radius: 999px;
+    background: var(--rwd-pop-bg);
+    color: var(--rwd-pop-fg);
+    font-size: 12px;
+    cursor: pointer;
+    opacity: 0.55;
+    transition: opacity 0.15s ease;
+  }
+  .reader-immersive-exit .reader-ic {
+    width: 15px;
+    height: 15px;
+  }
+  .reader-immersive-exit:hover,
+  .reader-immersive-exit:focus-visible {
+    opacity: 1;
   }
   .reader-toolbar {
     display: grid;
@@ -17486,6 +18150,32 @@ import { getLogger } from "../core/logger.ts";
     box-shadow: var(--rwd-pop-shadow);
     transform: translateX(-50%);
   }
+  /* 悬浮取词在下方放不下时翻到词上方：top 是卡片下沿，靠 translateY(-100%) 往上长。
+     不用先量高度再改 top —— 量了会闪一帧，而且展开「完整释义」后高度变化也不会压住词。 */
+  .reader-dict-popup.is-above {
+    transform: translate(-50%, -100%);
+  }
+  /* 悬浮卡小尾巴：旋转 45° 的方块，圆心压在卡片边缘上，一半露出、一半藏进卡下。
+     z-index 低于卡片，内侧边缘被卡片盖住，只留指向单词的那个尖。
+     不能做成 .reader-dict-popup 的伪元素 —— 卡片自带 overflow:auto 会把它裁掉。 */
+  .reader-dict-tail {
+    position: absolute;
+    z-index: 2;
+    width: 10px;
+    height: 10px;
+    background: var(--rwd-pop-bg);
+    border-top: 1px solid var(--rwd-pop-border);
+    border-left: 1px solid var(--rwd-pop-border);
+    transform: translate(-50%, -50%) rotate(45deg);
+    pointer-events: none;
+  }
+  /* 卡片翻到词上方：尾巴朝下，可见的两条边换到右下 */
+  .reader-dict-tail.is-above {
+    border-top: 0;
+    border-left: 0;
+    border-right: 1px solid var(--rwd-pop-border);
+    border-bottom: 1px solid var(--rwd-pop-border);
+  }
   .reader-dict-head {
     display: flex;
     align-items: center;
@@ -17852,9 +18542,18 @@ import { getLogger } from "../core/logger.ts";
        但远低于思源原生 UI，避免压住顶栏"管理"菜单 */
     z-index: var(--rz-popover);
     background: var(--b3-theme-background, #fff);
+    /* 2026-11-20：思源主题的 --b3-border-color 在 Neo 下只有 ~20% alpha，
+       1px 边框落在同色底上几乎看不见。先保留主题值做兜底，再用前景色混出
+       一条稳定可见的描边（换任何主题都跟着正文色走）。 */
     border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.15));
+    border-color: color-mix(in srgb, var(--b3-theme-on-background, #1f2329) 16%, transparent);
     border-radius: 10px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.14);
+    /* 三层投影：贴地一条勾边、中距离一层浮起、远距离一层柔和扩散，
+       解决「一张纸贴在正文上」没有层次的问题。 */
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.06),
+      0 8px 20px rgba(0, 0, 0, 0.12),
+      0 20px 48px rgba(0, 0, 0, 0.10);
   }
   .reader-popover-title {
     font-size: 13px;
@@ -18601,11 +19300,161 @@ import { getLogger } from "../core/logger.ts";
     min-width: 280px;
     max-width: 360px;
   }
-  /* 2026-09-03 半分半合：书签 + 摘录合并到同一抽屉，用分隔线区分两个子区 */
-  .reader-marks-section + .reader-marks-section {
-    margin-top: 10px;
-    padding-top: 10px;
-    border-top: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.12));
+  /* 2026-11-20：我的标记改为三页签（书签 / 标注 / 生词），抽屉本体只负责框架，
+     内容区独立滚动；宽度向生词 demo 靠拢，移动端/停靠/平板规则仍按更高特异性覆盖。 */
+  .reader-marks {
+    width: 356px;
+    min-width: 300px;
+    max-width: 380px;
+    max-height: 76vh;
+    max-height: 76dvh;
+    padding: 0;
+    overflow: visible; /* 保留顶部角标；内容滚动交给 .reader-marks-section */
+  }
+  .reader-marks-head {
+    flex: 0 0 auto;
+    padding: 12px 12px 0;
+  }
+  .reader-marks-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 1px 2px 10px;
+    color: var(--b3-theme-on-background, #333);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+  }
+  .reader-marks-title .reader-pin-btn {
+    margin-left: auto;
+  }
+  .reader-marks-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 3px;
+    border-radius: 9px;
+    /* 2026-11-20：--b3-theme-background-light 在 Neo 下是「同色 10% alpha」，
+       轨道和卡片底几乎同色 ⇒ 三个页签像文字漂在纸上。改成按正文色混 7%，
+       任何主题下都能看见一条实心轨道。 */
+    background: rgba(0, 0, 0, 0.05);
+    background: color-mix(in srgb, var(--b3-theme-on-background, #1f2329) 7%, transparent);
+  }
+  .reader-marks-tab {
+    flex: 1;
+    min-width: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 7px 4px;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    /* 未选中不再用 on-surface-light（Neo 下约 50% alpha 太淡），按正文色 74% 混 */
+    color: rgba(0, 0, 0, 0.62);
+    color: color-mix(in srgb, var(--b3-theme-on-background, #1f2329) 74%, transparent);
+    font-size: 12px;
+    line-height: 1.2;
+    white-space: nowrap;
+    cursor: pointer;
+    transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .reader-marks-tab span {
+    padding: 1px 5px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.06);
+    background: color-mix(in srgb, var(--b3-theme-on-background, #1f2329) 9%, transparent);
+    color: inherit;
+    font-size: 9.5px;
+    line-height: 1.4;
+    font-variant-numeric: tabular-nums;
+  }
+  .reader-marks-tab:hover {
+    color: var(--b3-theme-on-background, #333);
+    /* 不用 --b3-theme-background-light（审计 R1：Neo 下等于没变化） */
+    background: rgba(0, 0, 0, 0.05);
+    background: color-mix(in srgb, var(--b3-theme-on-background, #1f2329) 6%, transparent);
+  }
+  .reader-marks-tab.active {
+    background: var(--b3-theme-background, #fff);
+    color: var(--b3-theme-on-background, #222);
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08), 0 2px 6px rgba(0, 0, 0, 0.10);
+  }
+  .reader-marks-tab.active span {
+    background: var(--b3-theme-primary-lightest, rgba(55, 138, 221, 0.12));
+    color: var(--b3-theme-on-background, #333);
+  }
+  .reader-marks-section {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 10px 12px 12px;
+    overflow-y: auto;
+    overflow-x: hidden;
+    overscroll-behavior: contain;
+  }
+  .reader-marks-panel-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 20px;
+    padding: 0 2px 8px;
+    color: var(--b3-theme-on-surface-light, #888);
+    font-size: 11px;
+  }
+  .reader-marks-panel-title {
+    color: var(--b3-theme-on-background, #333);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .reader-marks .reader-bm-list,
+  .reader-marks .reader-annots-list {
+    margin-top: 0;
+    gap: 3px;
+  }
+  .reader-marks .reader-bm-add {
+    width: 100%;
+    box-sizing: border-box;
+    margin-bottom: 2px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    background: transparent;
+    font-size: 12px;
+  }
+  .reader-marks .reader-bm-item,
+  .reader-marks .reader-annot-item {
+    padding: 7px 7px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    transition: background 0.15s ease, border-color 0.15s ease;
+  }
+  .reader-marks .reader-bm-item:hover,
+  .reader-marks .reader-bm-item:focus-within,
+  .reader-marks .reader-annot-item:hover,
+  .reader-marks .reader-annot-item:focus-within {
+    background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+    border-color: var(--b3-border-color, rgba(0, 0, 0, 0.08));
+  }
+  .reader-marks .reader-bm-label {
+    font-size: 12.5px;
+    font-weight: 600;
+    line-height: 1.45;
+  }
+  .reader-marks .reader-bm-excerpt {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    white-space: normal;
+    font-family: Georgia, "Iowan Old Style", "Times New Roman", var(--b3-font-family, serif);
+    font-size: 11.5px;
+    line-height: 1.45;
+  }
+  .reader-marks .reader-annot-text {
+    font-size: 12.5px;
   }
   .reader-bm-list,
   .reader-annots-list {
@@ -18704,13 +19553,20 @@ import { getLogger } from "../core/logger.ts";
     font-size: 11px;
     line-height: 1.5;
     color: var(--b3-theme-on-surface-light, #888);
-    max-height: 3em;
+    /* 截断高度必须落在整行上：3 行 × 1.5 = 4.5em。
+       原来写 3em（= 2 行），一旦子元素行高被思源主题放大，
+       第二行就会在基线下被切掉半截。 */
+    max-height: 4.5em;
     overflow: hidden;
     pointer-events: none; /* 整块可点 = 跳转，内部富文本不抢点击 */
     word-break: break-word;
   }
-  /* b3-typography 给块级元素带了大段外边距，会把 3 行截断挤成半行空白 */
-  .reader-annot-note :global(*) { margin-block: 0; }
+  /* b3-typography 给块级元素带了大段外边距和更大的行高，
+     统一压平，否则截断线算不准、行与行之间还会多出空白。 */
+  .reader-annot-note :global(*) {
+    margin-block: 0;
+    line-height: inherit;
+  }
   .reader-annot-note :global(ul),
   .reader-annot-note :global(ol) { padding-inline-start: 1.4em; }
   .reader-annot-note :global(blockquote) {

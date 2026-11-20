@@ -1253,28 +1253,32 @@ html body :is(figcaption, small, .footnote, .footnote p) {
 }
 
 /**
- * 深色主题下图片反色（2026-10-07 接通，此前 `invertImagesInDark` 同样
- * 只有 schema / 类型 / 默认值，执行层零消费 —— 又一个纯死设置）。
+ * 深色主题下图片反色（2026-10-07 接通；2026-11-19 改为「仅白底图」）。
  *
  * ## 为什么需要
  * 夜间阅读时，EPUB 里的**白底插图**（书封、照片、示意图）在深色页面上
  * 是一块刺眼的白斑 —— 这是深色阅读最常见的视觉干扰。
  *
+ * ## 为什么不再全员反色
+ * 旧实现给 `img, svg image` 无差别加 `invert(1) hue-rotate(180deg)`：
+ * 白底示意图变暗确实不刺眼了，但**彩色插画与照片直接变负片**（用户实测
+ * 水彩插图整块发灰偏色）。现在只给带 `reword-img-invert` 标记的图片上规则，
+ * 标记由 ReaderView 采样图片平均亮度后添加 —— 只有接近纯白的图才反色，
+ * 彩色/深色图片保持原样。SVG 无法可靠采样，一律不标记（尊重原图）。
+ *
  * ## 为什么用 filter 而非 mix-blend-mode
  * `mix-blend-mode: difference` 会把**所有**像素取反，包括彩色图（红变青），
  * 适得其反。`filter: invert(1) hue-rotate(180deg)` 是社区标准解法：
- * 反色后旋转色相 180° 把颜色大致还原，只剩明暗关系被翻转
- * （照片会变成负片感，但**可读**，远好过刺眼白斑）。
+ * 反色后旋转色相 180° 把颜色大致还原，只剩明暗关系被翻转。
  *
- * 局限要诚实说清：照片会呈负片感，彩色插图颜色会偏。
- * 所以默认**关闭**，让用户按书的类型自己决定。
+ * 局限要诚实说清：纯白扫描页/线稿图仍有轻微负片感（本来就是黑白，影响很小）；
+ * 照片则完全不受影响。
  */
 export function invertImagesInDarkStyles(enable: boolean): string {
   if (!enable) return "";
   return `
-/* 深色下图片反色：invert 后转 180° 色相把颜色大致还原，只翻明暗 */
-html body img,
-html body svg image {
+/* 深色下图片反色：只作用于 ReaderView 采样判定为浅底图的 .reword-img-invert */
+html body img.reword-img-invert {
   filter: invert(1) hue-rotate(180deg);
   /* 反色后图片仍是「嵌入内容」，保留圆角与边框观感 */
   border-radius: 2px;

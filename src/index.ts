@@ -49,6 +49,9 @@ import { applyViewportTiers } from "./core/responsive.ts";
 import { logSwallow } from "./core/safe.ts";
 import { getLogger } from "./core/logger.ts";
 import { DictManager } from "./dict/dict-manager.ts";
+import { ReaderVocabStore } from "./reader/vocab-store.ts";
+import { InkSaver, INK_STORAGE_KEY } from "./reader/ink/persistence.ts";
+import { inkStrokes } from "./reader/ink/store.ts";
 import { TranslateHost } from "./translate/host.ts";
 import { DEFAULT_REWORD_TTS, type RewordTtsSettings } from "./reader/reader-tts.ts";
 // 2026-10-26 版本更新弹窗（对标 Excali Studio）：升级后弹一次「本次更新了什么」。
@@ -102,16 +105,19 @@ export class ReaderPlugin extends Plugin {
   private dictManager!: DictManager;
   /** 翻译宿主（引擎链装配 + 按书缓存 + AI 末端） */
   private translateHost: TranslateHost | null = null;
+  /** 墨迹持久化器：全插件共享一份，多个阅读页签的笔触统一落 hiword-ink.json */
+  private inkSaver: InkSaver | null = null;
+  /** inkStrokes 的订阅解除函数（onunload 摘除，避免热重载后旧实例继续写盘） */
+  private detachInkSaver: (() => void) | null = null;
   /** 朗读设置（本插件独立持久化，onload 载入，阅读器面板读写此副本） */
   private ttsSettings: RewordTtsSettings = { ...DEFAULT_REWORD_TTS };
   /** 已挂载的书架宿主 */
   private shelfMounted = false;
   /**
-   * 词库跨插件桥「未就绪」toast 的一次性闸门（2026-10-15 P0 断链接链）。
-   * hasWord 每次渲染词典卡都会调，写侧也可能被 AI 自动收词批量触发；
-   * 缺席时只在第一次写操作可见提示，其余静默降级为"未加词"，避免刷屏。
+   * 本地生词本（2026-11-20 · 方案 C 去耦）。
+   * 此前 ★ 直接读写 REword 的词库单例；现在真源在本插件 petal：reader-vocab.json。
    */
-  private vocabBridgeWarned = false;
+  private vocabStore: ReaderVocabStore | null = null;
 
   async onload(): Promise<void> {
     const plugin = this;
@@ -263,6 +269,21 @@ export class ReaderPlugin extends Plugin {
       getLogger().warn("[RE 阅读器] 标注偏好载入失败，使用默认值", { error: e });
     }
 
+    /* Apple Pencil 墨迹：必须早于任何 ReaderView 挂载。
+     * InkSaver 会把磁盘上的全量笔触灌进 inkStrokes，之后订阅 store 自动落盘；
+     * 此前只搬了 InkSaver 实现却没人实例化，导致墨迹重载思源后全部丢失。 */
+    try {
+      const saver = new InkSaver(
+        (data: unknown) => this.saveData(INK_STORAGE_KEY, data),
+        () => this.loadData(INK_STORAGE_KEY)
+      );
+      await saver.load();
+      this.detachInkSaver = saver.attach(inkStrokes);
+      this.inkSaver = saver;
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 墨迹持久化初始化失败，本次按内存笔触运行", { error: e });
+    }
+
     /* 朗读设置：本插件独立持久化（2026-10-14）。
      * 阅读器面板的 getTtsSettings/saveTtsSettings 透传到 self.plugin，
      * 而 ReaderPlugin 此前**并未实现这两个方法** → 透传恒返回 null、保存恒 no-op，
@@ -305,6 +326,19 @@ export class ReaderPlugin extends Plugin {
       await this.dictManager.init();
     } catch (e) {
       getLogger().error("[RE 阅读器] 词典初始化失败（划词查词不可用）", { error: e });
+    }
+
+    /* 本地生词本（2026-11-20）：不依赖任何其它插件，落本插件 petal。 */
+    try {
+      this.vocabStore = new ReaderVocabStore({
+        load: (file: string) => this.loadData(file),
+        save: async (file: string, data: unknown) => {
+          await this.saveData(file, data);
+        },
+      });
+      await this.vocabStore.load();
+    } catch (e) {
+      getLogger().warn("[RE 阅读器] 生词本载入失败，从空集合启动", { error: e });
     }
 
     /* 2026-10-13 深链接：监听 open-siyuan-url-plugin 事件，处理「回跳原书」URL。
@@ -546,7 +580,7 @@ export class ReaderPlugin extends Plugin {
    */
   askAiInDock(
     bookId: string,
-    quote: { text: string; sectionIndex?: number; chapterTitle?: string }
+    quote: { text: string; sectionIndex?: number; chapterTitle?: string; prompt?: string }
   ): boolean {
     try {
       if (this.aiTabs?.deliverQuote?.(bookId, quote)) return true;
@@ -743,117 +777,15 @@ export class ReaderPlugin extends Plugin {
   }
 
   /**
-   * 词典弹窗 🔍/「侧边栏」按钮 → REword 侧边栏「查词典」面板（2026-10-12 接链）。
-   * 阅读器自身 Dock 只有书架、无查词面板；简化小窗的完整释义由 REword 承载（同源分叉）。
-   * 走思源前端插件注册表拿 REword 实例调其 openWordInSidebar(w, mode)；
-   * 未安装/未启用/签名变更时 toast 兜底，不再静默失败。
-   */
-  public openWordInSidebar(w: string, mode?: "offline" | "online") {
-    const reword: any = (window as any).siyuan?.plugins?.["siyuan-plugin-reword"];
-    if (reword && typeof reword.openWordInSidebar === "function") {
-      try {
-        reword.openWordInSidebar(w, mode);
-        return;
-      } catch (e) {
-        getLogger().warn("[RE 阅读器] 调用 REword 侧边栏查词失败", { error: e });
-      }
-    }
-    showMessage(t("未能呼出 REword 侧边栏查词（主插件未启用或版本过旧）"), 3000, "error");
-  }
-
-  /**
-   * 词典「加入词库/移出词库/是否已加」跨插件桥（2026-10-15 P0 断链接链）。
-   * 阅读器无本地词库；真源在 RE word：`src/vocab/vocab-store.ts` 单例 +
-   * `hiword-vocab.json` 持久化。同 openWordInSidebar 走思源前端插件注册表。
+   * 生词本（2026-11-20 · 方案 C 去耦）。
    *
-   * 返**门面**（facade）而不是 store 实例本身：
-   *  - `hasWord`：缺席时静默 false。它是**渲染期调用**（每张词典卡打 ☆/★），
-   *    为它 toast 会每帧刷屏；☆ 就是"未加"态、语义可接受。
-   *  - `addWord / removeWord`：缺席、同步抛错或 async reject 时可见兜底；配合
-   *    `vocabBridgeWarned` 一次性闸门（AI 批量收词循环会连打多次，只提示第一次）。
-   *    REword 侧这两个写方法内部 `await persist()` ⇒ 是 Promise，同步 try/catch
-   *    抓不到 reject；而 ReaderView 的 ☆ 是**乐观翻转**（点击即改 ★，不 await），
-   *    所以不挂 `.catch` 的话写失败会留下一个假 ★。
+   * 阅读器页签经它做 ★/收词，**不再跨插件调 REword**：
+   * 实例由本插件 onload 创建并载入，数据落 petal `reader-vocab.json`。
+   * 未就绪（载入异常后仍会给实例）时返回 null，调用方均为可选链，
+   * 此时 ★ 显示为「未加词」、收词静默跳过 —— 不再弹跨插件 toast。
    */
-  public getVocabStore(): {
-    hasWord: (w: string) => boolean;
-    addWord: (w: string) => void;
-    removeWord: (w: string) => void;
-  } {
-    const resolve = (): any => {
-      const reword: any = (window as any).siyuan?.plugins?.["siyuan-plugin-reword"];
-      if (reword && typeof reword.getVocabStore === "function") {
-        try { return reword.getVocabStore(); } catch (e) {
-          getLogger().warn("[RE 阅读器] 调用 REword 词库失败", { error: e });
-        }
-      }
-      return null;
-    };
-    const warnOnce = () => {
-      if (this.vocabBridgeWarned) return;
-      this.vocabBridgeWarned = true;
-      showMessage(t("未能连接 REword 词库（主插件未启用或版本过旧）"), 3000, "error");
-    };
-    return {
-      hasWord(w: string) {
-        const s = resolve();
-        return s && typeof s.hasWord === "function" ? !!s.hasWord(w) : false;
-      },
-      addWord(w: string) {
-        const s = resolve();
-        if (!s || typeof s.addWord !== "function") { warnOnce(); return; }
-        // REword 侧 addWord/removeWord 是 async（内部 await persist()），
-        // 同步 try/catch 抓不到 reject ⇒ 必须挂 .catch，否则写失败时 ☆ 已乐观变成 ★ 会骗人。
-        try {
-          const r = s.addWord(w);
-          if (r && typeof r.catch === "function") {
-            r.catch((e: any) => {
-              getLogger().warn("[RE 阅读器] REword addWord 失败", { error: e });
-              warnOnce();
-            });
-          }
-        } catch (e) {
-          getLogger().warn("[RE 阅读器] REword addWord 抛错", { error: e });
-          warnOnce();
-        }
-      },
-      removeWord(w: string) {
-        const s = resolve();
-        if (!s || typeof s.removeWord !== "function") { warnOnce(); return; }
-        try {
-          const r = s.removeWord(w);
-          if (r && typeof r.catch === "function") {
-            r.catch((e: any) => {
-              getLogger().warn("[RE 阅读器] REword removeWord 失败", { error: e });
-              warnOnce();
-            });
-          }
-        } catch (e) {
-          getLogger().warn("[RE 阅读器] REword removeWord 抛错", { error: e });
-          warnOnce();
-        }
-      },
-    };
-  }
-
-  /**
-   * 划词工具栏「AI 精读」跨插件桥（2026-10-15 P0 断链接链）。
-   * 阅读器只带 AI 传输层与设置项，**没有**「拼 prompt→开面板→自动发送」这条；
-   * REword 的 `translateToAi` 内部已自带「未配置→提示用户去 AI 设置」的分支。
-   * 与 openWordInSidebar 同：缺席/抛错一律可见 toast，不再静默 no-op。
-   */
-  public translateToAi(text: string): void {
-    if (!text || !text.trim()) return;
-    const reword: any = (window as any).siyuan?.plugins?.["siyuan-plugin-reword"];
-    if (reword && typeof reword.translateToAi === "function") {
-      try {
-        reword.translateToAi(text);
-        return;
-      } catch (e) {
-        getLogger().warn("[RE 阅读器] 调用 REword AI 精读失败", { error: e });
-      }
-    }
-    showMessage(t("未能呼出 REword AI 精读（主插件未启用或版本过旧）"), 3000, "error");
+  public getVocabStore(): ReaderVocabStore | null {
+    return this.vocabStore;
   }
 
   /** 更新翻译设置（设置面板改动即时落盘） */
@@ -952,6 +884,22 @@ export class ReaderPlugin extends Plugin {
     }
     // 2026-10-13：批注落盘（防抖窗口内可能挂起的批注变更）
     void flushAnnotationStore();
+    // 2026-11-20：墨迹先解绑再强制落盘，避免防抖窗口里的最后几笔丢失
+    try {
+      this.detachInkSaver?.();
+      this.detachInkSaver = null;
+      if (this.inkSaver) void this.inkSaver.flush();
+    } catch (e) {
+      logSwallow(e, "index.ts · onunload · inkSaver.flush", "debug");
+    }
+    this.inkSaver = null;
+    // 2026-11-20：生词本同样可能卡在 400ms 防抖窗口里
+    try {
+      if (this.vocabStore) void this.vocabStore.flush();
+    } catch (e) {
+      logSwallow(e, "index.ts · onunload · vocabStore.flush", "debug");
+    }
+    this.vocabStore = null;
     // 2026-11-05：上次标注色/线型同样可能卡在 300ms 防抖窗口里
     try { flushAnnotationConfig(); } catch (e) { logSwallow(e, "index.ts · onunload · flushAnnotationConfig", "debug"); }
     // 2026-10-14：摘除深链接监听（与 onload 里 eventBus.on 配对）

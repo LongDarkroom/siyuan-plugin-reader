@@ -243,13 +243,19 @@ export interface GroupDef {
    */
   collapsed?: boolean;
   /**
+   * 整组条件显示（2026-11-20）。
+   * 用于「组内所有行会被同一个总开关接管」的场景：只给每行加 showIf
+   * 会留下一个空卡片和标题，比整组消失更像设置丢了。
+   */
+  showIf?: (s: any, extra: any) => boolean;
+  /**
    * 卡片下方的补充说明（2026-11-13）。
    *
    * 用于「主开关关掉后，本组其余行被 showIf 藏起」留下的空白：
    * 不留一句解释的话，用户只看到孤零零一个开关，会以为其余设置丢了。
    * 写成声明而非在组件里特判，保持 schema 是唯一真源。
    */
-  note?: { text: string; showIf?: (s: any, extra: any) => boolean };
+  note?: { text: string | ((s: any, extra: any) => string); showIf?: (s: any, extra: any) => boolean };
 }
 
 /** Tab 定义 */
@@ -568,6 +574,36 @@ export const TABS: TabDef[] = [
     icon: ICON_LAYOUT,
     groups: [
       {
+        // 2026-11-20：自动版式。开启后下面被它接管的滑块会隐藏，
+        // 卡片底部显示推导结果；不落盘，关掉即恢复手动值。
+        title: t("自动版式"),
+        rows: [
+          {
+            path: "autoTypography",
+            label: t("自动挑选版式"),
+            ctrl: "switch",
+            hint: t("按书籍语言与窗口自动计算"),
+            // PDF 是固定版式；竖排的轴与横排相反，暂不自动接管
+            showIf: (s, extra) => extra?.readerMode !== "pdf" && s.verticalWriting !== true,
+          },
+          {
+            path: "__autoTypographyApply",
+            label: t("转为手动"),
+            ctrl: "action",
+            action: "autoTypographyApply",
+            actionLabel: t("转为手动"),
+            showIf: (s, extra) => s.autoTypography === true && extra?.readerMode !== "pdf",
+          },
+        ],
+        note: {
+          text: (_s, extra) => String(extra?.autoTypographySummary || ""),
+          showIf: (s, extra) =>
+            s.autoTypography === true &&
+            extra?.readerMode !== "pdf" &&
+            s.verticalWriting !== true,
+        },
+      },
+      {
         // 2026-11-04：预设从 Tab 底部移到最前 —— 它一键套用的正是下面所有滑块的组合，
         // 放底部等于「先让你拖十个滑块，最后才告诉你有一键」。
         // 只渲染三档（custom 不是档位，而是派生状态）。
@@ -589,7 +625,7 @@ export const TABS: TabDef[] = [
             }),
             // PDF 是固定版式，排版设置不生效（fixed-layout 不接 setStyles）——
             // 显示一排点了没反应的预设比不显示更糟。
-            showIf: (_s, extra) => extra?.readerMode !== "pdf",
+            showIf: (_s, extra) => extra?.readerMode !== "pdf" && _s.autoTypography !== true,
           },
         ],
       },
@@ -602,11 +638,14 @@ export const TABS: TabDef[] = [
             label: t("覆盖版式布局"),
             ctrl: "switch",
             hint: t("覆盖原书段距 / 行距 / 对齐"),
+            // 自动版式天然要接管原书排版；自动开启时该开关由执行层强制为 true
+            showIf: (s) => s.autoTypography !== true,
           },
         ],
       },
       {
         title: t("排版"),
+        showIf: (s) => s.autoTypography !== true,
         rows: [
           {
             path: "layout.widthMode",
@@ -617,6 +656,7 @@ export const TABS: TabDef[] = [
               { value: "fixed", label: t("固定书页") },
             ],
             hint: t("随窗口伸缩，或按固定页宽分栏"),
+            showIf: (s) => s.autoTypography !== true,
           },
           // 每列宽度（2026-10-08 语义修正 + 补入口）。
           //
@@ -638,7 +678,7 @@ export const TABS: TabDef[] = [
             max: 1000,
             step: 20,
             unit: "px",
-            showIf: (s) => s.layout?.widthMode === "fixed",
+            showIf: (s) => s.layout?.widthMode === "fixed" && s.autoTypography !== true,
             hint: t("一列文字的宽度；栏数随窗口"),
           },
           // 栏数上限（2026-10-08 新增）：foliate 的 #top 默认样式硬编码
@@ -651,7 +691,7 @@ export const TABS: TabDef[] = [
             max: 4,
             step: 1,
             unit: t("栏"),
-            showIf: (s) => s.layout?.widthMode === "fixed",
+            showIf: (s) => s.layout?.widthMode === "fixed" && s.autoTypography !== true,
             hint: t("窗口不够宽时自动减少"),
           },
           // ⚠️ 2026-10-08 只在「随窗口」模式下显示。
@@ -674,7 +714,7 @@ export const TABS: TabDef[] = [
             max: 100,
             step: 5,
             unit: "%",
-            showIf: (s) => s.layout?.widthMode !== "fixed",
+            showIf: (s) => s.layout?.widthMode !== "fixed" && s.autoTypography !== true,
           },
         ],
       },
@@ -682,8 +722,9 @@ export const TABS: TabDef[] = [
         title: t("段落"),
         rows: [
           { path: "paragraph.paragraphSpacing", label: t("段间距"), ctrl: "stepper", min: 0, max: 3, step: 0.1,
-            hint: t("以字号为单位的倍数") },
-          { path: "lineHeight", label: t("行间距"), ctrl: "stepper", min: 1, max: 2.6, step: 0.1 },
+            hint: t("以字号为单位的倍数"), showIf: (s) => s.autoTypography !== true },
+          { path: "lineHeight", label: t("行间距"), ctrl: "stepper", min: 1, max: 2.6, step: 0.1,
+            showIf: (s) => s.autoTypography !== true },
           // 从旧「文本设置」移来（Readest 把它放在布局里）
           //
           // 2026-10-07：字间距去掉负值（原 min: -1）。
@@ -691,11 +732,14 @@ export const TABS: TabDef[] = [
           // 的字母粘连。Readest 的区间同样是 0 起的正值。
           // 2026-11-04：单位 px → em。px 不随字号缩放（17px 下 1px≈0.059em，
           // 22px 下只剩 0.045em），同一档设置在换字号后观感会漂。
-          { path: "text.letterSpacing", label: t("字间距"), ctrl: "stepper", min: 0, max: 0.3, step: 0.01, unit: "em" },
+          { path: "text.letterSpacing", label: t("字间距"), ctrl: "stepper", min: 0, max: 0.3, step: 0.01, unit: "em",
+            showIf: (s) => s.autoTypography !== true },
           // 词间距（Readest 有，我们此前完全没有）：
           // 只作用在词与词之间，是调西文/中英混排疏密的正确旋钮。
-          { path: "text.wordSpacing", label: t("词间距"), ctrl: "stepper", min: 0, max: 0.6, step: 0.01, unit: "em" },
-          { path: "paragraph.textIndent", label: t("首行缩进"), ctrl: "stepper", min: 0, max: 4, step: 0.1, unit: "em" },
+          { path: "text.wordSpacing", label: t("词间距"), ctrl: "stepper", min: 0, max: 0.6, step: 0.01, unit: "em",
+            showIf: (s) => s.autoTypography !== true },
+          { path: "paragraph.textIndent", label: t("首行缩进"), ctrl: "stepper", min: 0, max: 4, step: 0.1, unit: "em",
+            showIf: (s) => s.autoTypography !== true },
           // N2/N3 补齐：Readest 有，我们完全没有
           // 2026-10-07 接通：此前两端对齐是**完全死设置**（执行层硬编码 justify）。
           { path: "textAlign", label: t("两端对齐"), ctrl: "switch" },
@@ -718,6 +762,7 @@ export const TABS: TabDef[] = [
             step: 4,
             unit: "px",
             transform: "marginPair",
+            showIf: (s) => s.autoTypography !== true,
           },
           // 2026-10-07：新增 columnCount。CSS `column-gap` 只在多栏布局下才有作用，
           // 而此前全项目没有任何 column-count 输出 ⇒ 这个滑块**单栏时完全无效**
@@ -755,6 +800,7 @@ export const TABS: TabDef[] = [
             // 2026-10-07 修副作用前先说明：开启后会读宿主文档的左右内边距。
             // 旧实现把它**写回 settings**，关掉开关也不还原 ⇒ 已改为运行时缓存。
             hint: t("左右边距跟随思源正文宽度"),
+            showIf: (s) => s.autoTypography !== true,
           },
         ],
       },
@@ -849,7 +895,7 @@ export const TABS: TabDef[] = [
         rows: [
           // N4/N5 补齐：Readest 有，我们完全没有。夜间阅读的实际痛点。
           { path: "invertImagesInDark", label: t("深色主题下图片反色"), ctrl: "switch",
-            hint: t("照片会呈负片感") },
+            hint: t("只反白底图，照片保持原色") },
           { path: "overrideBookColor", label: t("覆盖书籍颜色"), ctrl: "switch",
             hint: t("拉回主题色，避免深底深字") },
         ],
@@ -1113,7 +1159,6 @@ export const TABS: TabDef[] = [
             min: 0, max: 20, step: 1, unit: t("节") },
           { path: "translationFontSize", label: t("译文字号"), ctrl: "slider",
             min: 0.4, max: 1.2, step: 0.02, unit: "%" },
-          { path: "bilingualSkipCached", label: t("跳过已缓存"), ctrl: "switch" },
           { path: "bilingualRetry", label: t("失败自动重试"), ctrl: "switch" },
         ],
       },

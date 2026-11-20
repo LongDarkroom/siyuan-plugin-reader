@@ -508,6 +508,20 @@
   font-size: 12px !important;
   opacity: 0.6;
 }
+.hiword-dict-empty-action {
+  margin-top: 10px;
+  padding: 4px 14px;
+  border: 1px solid var(--b3-theme-primary, #4183c4);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--b3-theme-primary, #4183c4);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.hiword-dict-empty-action:hover {
+  background: var(--b3-theme-primary, #4183c4);
+  color: var(--b3-theme-on-primary, #fff);
+}
 .hiword-dict-section {
   margin-top: 8px;
 }
@@ -633,12 +647,11 @@
   &:hover { background: var(--b3-theme-background-hover, rgba(0, 0, 0, 0.05)); }
 }
 
-/* 简化小窗卡：🌐 源切换 / 🔍 侧边栏入口（头部小图标按钮） */
+/* 简化小窗卡：🌐 源切换（头部小图标按钮） */
 .hiword-dict-card--simple .hiword-dict-actions {
   gap: 4px;
 }
-.hiword-dict-src-btn,
-.hiword-dict-side-btn {
+.hiword-dict-src-btn {
   border: none;
   background: transparent;
   cursor: pointer;

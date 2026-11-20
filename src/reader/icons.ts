@@ -46,6 +46,10 @@ export const ICONS = {
   prevChapter: '<path d="M11.5 6.5L6 12l5.5 5.5"/><path d="M18.5 6.5L13 12l5.5 5.5"/>',
   nextChapter: '<path d="M12.5 6.5L18 12l-5.5 5.5"/><path d="M5.5 6.5L11 12l-5.5 5.5"/>',
 
+  /* ---- 全屏 ---- */
+  fullscreen: '<path d="M9 4H4v5"/><path d="M15 4h5v5"/><path d="M9 20H4v-5"/><path d="M15 20h5v-5"/>',
+  fullscreenExit: '<path d="M4 9h5V4"/><path d="M20 9h-5V4"/><path d="M4 15h5v5"/><path d="M20 15h-5v5"/>',
+
   /* ---- 设置面板导航 ---- */
   font: '<path d="M6 19L12 5l6 14"/><path d="M8.5 14h7"/>',
   layout:

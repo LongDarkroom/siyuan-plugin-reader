@@ -36,6 +36,11 @@
   export let open = false;
   /** 打开时聚焦的 Tab key（null=沿用上次/默认第一个）。双语设置入口用它直达「双语翻译」Tab */
   export let initialTab: string | null = null;
+  /**
+   * 打开时直达的二级页（null=一级页）。
+   * 2026-11-20：词典弹窗「去导入/启用词典」按钮用它直达词典管理页。
+   */
+  export let initialSub: "dict" | null = null;
   /** 当前设置对象（顶层 ReaderSettings） */
   export let settings: any = {};
   /** 外部数据（TTS 配置、readerMode） */
@@ -133,7 +138,15 @@
    * 提到派生变量是必要的：Svelte 4 的 `{#each}` 不支持 `??` 与可选链
    * （写 `{#each activeTab?.groups ?? []}` 会报 ParseError: Expected as）。
    */
-  $: groups = activeTab && activeTab.groups ? activeTab.groups : [];
+  $: groups = (activeTab && activeTab.groups ? activeTab.groups : []).filter((g: any) => {
+    if (!g.showIf) return true;
+    // 与 RowControl 同口径：条件函数抛错时按「不显示」处理，不带崩面板
+    try {
+      return !!g.showIf(settings ?? {}, extra ?? {});
+    } catch {
+      return false;
+    }
+  });
 
   /**
    * 搜索结果（2026-10-07）。
@@ -194,6 +207,12 @@
       // 2026-10-14：宿主指定聚焦 Tab（如「双语设置」直达 translate）；非法 key 落到下面的合法性兜底。
       if (initialTab && visibleTabs.some((x) => x.key === initialTab)) {
         activeKey = initialTab;
+      }
+      // 2026-11-20：直达二级页（词典弹窗的「去导入词典」入口）。
+      // 词典管理入口在「语言」Tab 下，先把 Tab 对齐，返回时才落在正确位置。
+      if (initialSub === "dict") {
+        if (visibleTabs.some((x) => x.key === "lang")) activeKey = "lang";
+        subPage = "dict";
       }
       // 等 DOM 出现后再聚焦（弹窗内容在 {#if open} 里，此时还没渲染）
       void Promise.resolve().then(() => {
@@ -921,7 +940,11 @@
               {/each}
             </div>
             {#if showGroupNote(group, settings, extra)}
-              <p class="rwd-group-note">{group.note?.text}</p>
+              <p class="rwd-group-note">
+                {typeof group.note?.text === "function"
+                  ? group.note.text(settings ?? {}, extra ?? {})
+                  : group.note?.text}
+              </p>
             {/if}
           {/if}
         {/each}

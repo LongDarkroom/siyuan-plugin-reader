@@ -693,7 +693,9 @@
     };
     tab = "chat";
     notice = "";
+    const prompt = String(q?.prompt || "").trim();
     void tick().then(() => {
+      if (prompt) composer?.setText?.(prompt);
       composer?.focus?.();
       autoScroll(true);
     });

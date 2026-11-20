@@ -365,6 +365,15 @@ export interface ReaderSettings {
    */
   overrideBookLayout?: boolean;
   /**
+   * 自动版式（2026-11-20）：按书籍语言 + 屏幕尺寸 + 字号自动推导
+   * 页宽 / 栏数 / 行距 / 段距 / 首行缩进 / 上下边距。
+   *
+   * 自动模式下这些值**不写回设置档**，而是在渲染时派生（见 auto-typography.ts）：
+   * 换书、拉窗口、改字号都会重算，关掉开关即恢复用户原来的手动值。
+   * 想保留某次计算结果时，用「转为手动」把它一次性抄进设置。
+   */
+  autoTypography?: boolean;
+  /**
    * 竖排（中文竖排阅读）：默认关。
    * - `false`（默认）= 横排，与之前一致。
    * - `true` = 竖排（`writing-mode: vertical-rl`，从右往左逐列）。
@@ -591,8 +600,6 @@ export interface ReaderSettings {
   bilingualSourceLang?: string;
   /** 渐进式：翻页自动补译当前窗口（默认 true） */
   bilingualProgressiveAuto?: boolean;
-  /** 翻译时跳过已缓存段落（默认 true，避免重复消耗 token/额度） */
-  bilingualSkipCached?: boolean;
   /** 整书预翻译：边译边显示译文（默认 true；关则纯后台缓存，不注入 DOM） */
   bilingualRealtimePreview?: boolean;
   /**
@@ -698,6 +705,7 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
   overridePublisherFont: true,
   overrideBookFontSize: true,
   overrideBookLayout: true,
+  autoTypography: false,
   verticalWriting: false,
   verticalPunctuation: true,
   focusMode: false,
@@ -752,7 +760,6 @@ export const READER_DEFAULT_SETTINGS: ReaderSettings = {
   bilingualDefaultMode: "ask",
   bilingualSourceLang: "en",
   bilingualProgressiveAuto: true,
-  bilingualSkipCached: true,
   bilingualRealtimePreview: true,
   bilingualRetry: true,
   // 2026-08-31 Phase 2：译文归档默认关闭（会在用户思源里建文档，需明确启用）

@@ -134,6 +134,8 @@ export interface AiChatQuote {
   text: string;
   sectionIndex?: number;
   chapterTitle?: string;
+  /** 2026-11-20：随引用一起预填到输入框的指令（如「翻译」动作），不自动发送 */
+  prompt?: string;
 }
 
 export interface AiChatContextNote {

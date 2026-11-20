@@ -106,7 +106,8 @@ export const READER_SHORTCUTS: ShortcutSpec[] = [
   // 理由：与思源自身及浏览器「保存」撞车，且用户无法预期阅读器会拦下这个键。
   // 如需打开设置，点顶栏齿轮即可；后续要接也应先做冲突提示。
   { action: "toggleTheme",    label: "切换主题（明/暗）", ctrl: true, cmd: true, shift: true, key: "l", group: "view" },
-  { action: "toggleFullscreen", label: "全屏",  key: "F11", group: "view" },
+  // 2026-11-19：从「接管系统全屏」改为「隐藏思源外框」，action id 保持不变以免用户自定义键位失效
+  { action: "toggleFullscreen", label: "沉浸阅读",  key: "F11", group: "view" },
   // [REword patch 2026-08-29] PDF 缩放快捷键（参考 Obsidian PDF++）
   // 注意：fontIncrease / fontDecrease 跟 zoomIn / zoomOut 都用 "=" / "-"，
   // 实际触发哪个由"当前是否在 PDF"决定（ReaderView 内部按格式分流）。
@@ -134,7 +135,7 @@ export const HINT_GROUPS: Array<{ key: ShortcutGroup; label: string }> = [
 /** 无修饰键快捷键（独立处理） */
 export const NO_MODIFIER_SHORTCUTS: Array<{ action: ShortcutAction; label: string; key: string }> = [
   { action: "showHint",     label: "显示/隐藏快捷键面板",   key: "?" },
-  { action: "closeOverlay", label: "关闭浮窗 / 退出全屏",  key: "Escape" },
+  { action: "closeOverlay", label: "关闭浮窗 / 退出沉浸",  key: "Escape" },
 ];
 
 /** 用户自定义覆盖表：action → 部分字段（未给的字段沿用默认） */

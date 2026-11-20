@@ -4086,11 +4086,16 @@
      固定宽度是关键 —— 收起时外层宽度从 sideWidth 动画到 0，
      内层保持原宽被 overflow:hidden 裁掉，文字不会挤成竖条。 */
   .shelf-sb-inner {
+    /* 2026-11-20：显式 border-box。本项目没有全局重置，内层是「固定宽度 +
+       左右 padding」，外层 .shelf-sidebar 又是 overflow:hidden 的裁切壳；
+       content-box 下右 padding 会顶出壳外，计数 pill / 分组加号就贴边甚至被切。 */
+    box-sizing: border-box;
     flex: 1 1 auto;
     min-height: 0;
     width: var(--side-w, 200px);
     overflow-y: auto;
-    padding: 12px 10px;
+    /* 右侧多留 8px：计数 pill 与「我的分组 +」原本离边界只有 16~20px，视觉局促。 */
+    padding: 12px 18px 12px 10px;
     display: flex;
     flex-direction: column;
     gap: 14px;
@@ -4253,6 +4258,8 @@
     line-height: 1;
     color: var(--b3-theme-primary, #378add);
     padding: 0 2px;
+    /* 2026-11-20：标题行自身只有 4px 右 padding，加号比计数 pill 更贴边，单独再退一点。 */
+    margin-right: 2px;
   }
   .shelf-sb-item {
     position: relative;

@@ -18,6 +18,7 @@ import { openTab, showMessage } from "siyuan";
 import type { BookshelfStore } from "./bookshelf-store";
 import type { ReaderSettingsStore } from "./reader-settings";
 import type { FontStore } from "./reader-fonts";
+import type { VocabSeed } from "./vocab-store.ts";
 import { resolveReaderMode } from "./reader-mode.ts";
 import { loadPdfFontBytes } from "./pdf-font.ts";
 // 2026-10-24 移动端适配：思源移动端 openTab 是官方空实现（app/src/plugin/API.ts
@@ -123,8 +124,6 @@ export class ReaderTabController {
       // 2026-08-28：连续朗读控制器设置透传（get 读 / save 写，结构 = reader-tts 的 RewordTtsSettings）
       getTtsSettings: () => (self.plugin as any)?.getTtsSettings?.() ?? null,
       saveTtsSettings: (s: any) => (self.plugin as any)?.saveTtsSettings?.(s) ?? Promise.resolve(),
-      // 2026-08-27：翻译按钮发送到 AI 精读面板（自动打开）；悬浮取词「加入词库」委托 vocabStore
-      onTranslateToAi: (t: string) => self.plugin?.translateToAi?.(t),
       // 2026-08-27：双语段落批量翻译（按书缓存，引擎链兜底）
       // 2026-08-30：透传 extra（model/overwrite/signal）以支持整书预翻译细化选项
       // 2026-08-30 修复：ctxBefore（前文参考）+ meta（书籍元数据）必须透传，
@@ -180,10 +179,9 @@ export class ReaderTabController {
       onAskAiInDock: (bid: string, quote: any) => (self.plugin as any)?.askAiInDock?.(bid, quote) ?? false,
       onSaveTencentLock: (chars: number) => (self.plugin as any)?.saveTencentCharsLock?.(chars) ?? Promise.resolve(),
       onSaveAiSettings: (partial: any) => (self.plugin as any)?.updateAiSettings?.(partial) ?? Promise.resolve(),
-      onAddToVocab: (w: string) => self.plugin?.getVocabStore?.()?.addWord?.(w),
-      // 2026-10-12 接链：阅读器词典弹窗「侧边栏」按钮 → plugin.openWordInSidebar
-      // （内部跨插件调 REword 侧边栏查词面板，缺席时 toast 兜底；mode=小窗当前词典源）
-      onOpenInSidebar: (w: string, mode?: "offline" | "online") => (self.plugin as any)?.openWordInSidebar?.(w, mode),
+      // 2026-11-20：词典卡 ★ / 生词本全部走本插件自己的 ReaderVocabStore（不再跨插件调 REword）
+      vocabStore: self.plugin?.getVocabStore?.() ?? null,
+      onAddToVocab: (w: string | VocabSeed) => self.plugin?.getVocabStore?.()?.addWord?.(w),
       onRemoveFromVocab: (w: string) => self.plugin?.getVocabStore?.()?.removeWord?.(w),
       isInVocab: (w: string) => !!self.plugin?.getVocabStore?.()?.hasWord?.(w),
       getLabel: self.getLabel,
