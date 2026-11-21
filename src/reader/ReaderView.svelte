@@ -13542,12 +13542,33 @@ import { getLogger } from "../core/logger.ts";
           createDocument: () => s.createDocument(),
         }));
       },
-      // R6：当前所在分节。foliate getContents() 的原始元素带 index 字段
-      // （getContentDocs 已把它剥成纯 doc 数组，这里另取一次原始数组）。
+      // R6：当前所在分节。
+      // ⚠️ 2026-11-21 修正：这里必须给「正在读的那一节」，不能给「第一个已加载的分节」。
+      // foliate 会在当前节前后各挂几节备用，旧实现取 getContents()[0].index（=最靠前
+      // 的已加载节），于是双语闸门基准被压低；当压低的幅度超过「预取分节数」时，
+      // 正在读的这节整段落在校验之外 → 一段都不送译，界面全空白且无任何提示，
+      // 表现就是「同一本书时好时坏、重开一下又好了」。
       getCurrentSection: () => {
+        if (currentSectionIndex >= 0) return currentSectionIndex;
+        const pi = (view as any)?.renderer?.primaryIndex;
+        if (typeof pi === "number" && Number.isFinite(pi) && pi >= 0) return pi;
         const raw = (view as any)?.renderer?.getContents?.() as any[] | undefined;
         const idx = raw?.[0]?.index;
         return typeof idx === "number" && Number.isFinite(idx) ? idx : 0;
+      },
+      // 2026-11-21：已加载分节 + 各自真实节号。foliate 的 getContents() 会跳过还没
+      // 解析完的 view，双语若按「起始节号 + 数组下标」推节号就会整体错位，
+      // 定位键随之漂移（注入去重 / 断点续传 / 预翻译回映射全部对不上）。
+      getSectionEntries: () => {
+        const raw = (view as any)?.renderer?.getContents?.() as any[] | undefined;
+        if (!Array.isArray(raw)) return [];
+        const out: { index: number; doc: Document }[] = [];
+        raw.forEach((c, i) => {
+          if (!c?.doc) return;
+          const idx = typeof c.index === "number" && Number.isFinite(c.index) ? c.index : i;
+          out.push({ index: idx, doc: c.doc as Document });
+        });
+        return out;
       },
       // 2026-11-13：段落级「✨ 重译」重新上线 —— 不再绑定 AI，改为跟随当前引擎
       // （千问/大模型/腾讯），单段绕过缓存重译并覆盖写回，适合机翻结果不满意时重试。

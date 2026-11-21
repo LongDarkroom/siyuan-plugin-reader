@@ -21,9 +21,10 @@ import type {
   PretranslateOptions,
   PretranslateProgress,
   PretranslateScan,
+  SectionEntry,
 } from "../bilingual-types.ts";
 import { PRETRANSLATE_DEFAULTS } from "../bilingual/core/types.ts";
-import { createSegmenter } from "../bilingual/runtime/segmenter.ts";
+import { createSegmenter, diagnoseDoc } from "../bilingual/runtime/segmenter.ts";
 import { createVisibility } from "../bilingual/runtime/visibility.ts";
 import { createInjector } from "../bilingual/runtime/injector.ts";
 import { createPretranslateQueue } from "../bilingual/runtime/pretranslate.ts";
@@ -38,8 +39,10 @@ import { getLogger } from "../../core/logger.ts";
  */
 const INJECT_BATCH_MAX_CHARS = 3500;
 const INJECT_BATCH_MAX_SEGMENTS = 12;
-/** 单片超时：超时只作废这一片（按空译退避），后续分片照常进行，不再整窗连坐 */
+/** 单片超时：超时只作废这一片（记送译退避，稍后重试），后续分片照常进行，不再整窗连坐 */
 const INJECT_BATCH_TIMEOUT_MS = 60_000;
+/** 退避自动补跑的最长等待：超过它就认为是「重试到顶」，不再空转排表 */
+const BACKOFF_RETRY_MAX_MS = 6 * 60_000;
 
 /** 给 Promise 套单片超时，按时清理定时器（旧实现 race 的定时器从不回收） */
 function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> {
@@ -55,6 +58,12 @@ function withTimeout<T>(p: Promise<T>, ms: number, message: string): Promise<T> 
 export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
   let enabled = false;
   let injectTimer: any = null;
+  /**
+   * 「窗口整页被退避挡住」的自动补跑定时器（2026-11-21）。
+   * 退避只是「这会儿不送」，到点必须有谁再来问一次；否则用户停在这一页不动，
+   * 就再也等不到下一次翻页，页面永远空白。
+   */
+  let backoffTimer: any = null;
   let injecting = false;
   /** 翻译进行中又有翻页/刷新触发的调度：本批结束后补跑一轮（否则那次调度被静默丢弃） */
   let injectDirty = false;
@@ -172,21 +181,38 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     });
   }
 
+  /**
+   * 已加载分节 + **真实节号**（2026-11-21）。
+   *
+   * 旧口径是「起始节号 + 数组下标」猜：foliate 的 `getContents()` 会跳过还没解析完的
+   * view，一跳过，下标就整体错位 → 同一段落一会儿 `#11.5` 一会儿 `#12.5`，
+   * 注入去重、断点续传、full 预翻译映射回真实节点全跟着漂；闸门基准也跟着抖，
+   * 出现「整页一段都不译」。调用方给了节号就用节号，没给才退回旧口径。
+   */
+  function windowEntries(): SectionEntry[] {
+    const entries = opts.getSectionEntries?.();
+    if (entries && entries.length) return entries;
+    const cur = opts.getCurrentSection?.() ?? 0;
+    return (opts.getContents() || []).map((doc, i) => ({ index: cur + i, doc }));
+  }
+
   const queue = createPretranslateQueue({
     bookId: opts.bookId,
     segmenter,
     visibility,
     injector,
     getContents: () => opts.getContents() || [],
+    getEntries: windowEntries,
     getSections: opts.getSections,
     getCurrentSection: opts.getCurrentSection,
     translate: async (texts, ctx) => (await translateTexts(texts, ctx, txExtra)).texts,
     checkCached: opts.checkCached,
     getLiveSegment: (locatorKey, sectionIndex) => {
       // full 模式用 section.createDocument() 取段，节点不在当前视图；
-      // 这里到 getContents() 已挂载的 iframe doc 里重新切出同一段，保证 isConnected=true。
-      for (const doc of opts.getContents() || []) {
-        for (const s of segmenter.segmentsOf(doc, sectionIndex)) {
+      // 这里到已挂载文档里按「真实节号」取回同一段，保证 isConnected=true。
+      for (const e of windowEntries()) {
+        if (e.index !== sectionIndex) continue;
+        for (const s of segmenter.segmentsOf(e.doc, sectionIndex)) {
           if (s.locatorKey === locatorKey && !injector.hasInjected(s.locatorKey)) return s;
         }
       }
@@ -195,17 +221,64 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     onProgress: () => emitProgress(queue.state().status),
   });
 
-  /** 收集「窗口内 + 未注入 + 未被退避挡住」的待处理段（定位键已含节内序号，重复文本各自保留） */
+  /**
+   * 窗口里「还没注入却被退避挡住」时，等到最早恢复点自动补跑一轮。
+   * 超过 BACKOFF_RETRY_MAX_MS 的（失败次数封顶那种）不排：那已经不看时间了，
+   * 再排队只是每 6 分钟空转一次，交给关开双语/重开书处理。
+   */
+  function scheduleBackoffRetry(blockedKeys: string[]): void {
+    if (backoffTimer || !enabled || !blockedKeys.length) return;
+    const bs = injector.blockedSummary(blockedKeys);
+    if (!bs.blocked || bs.maxLeftMs > BACKOFF_RETRY_MAX_MS) return;
+    backoffTimer = setTimeout(() => {
+      backoffTimer = null;
+      if (!enabled || injecting || pretranslating) return;
+      scheduleInject();
+    }, bs.maxLeftMs + 400);
+  }
+
+  /**
+   * 收集「窗口内 + 未注入 + 未被退避挡住」的待处理段（定位键已含节内序号，重复文本各自保留）。
+   *
+   * 2026-11-21 临时诊断：漏斗结果为空时把每一级的计数打出来（切分 → 闸门 → 已注入 → 退避），
+   * 再逐节给结构计数。用于区分「切不出段」「被闸门挡」「记账说已注入」「DOM 里其实有译文块」。
+   * 问题定位完即可连同 diagnoseDoc 一起撤掉。
+   */
   function collectPending(): ReturnType<typeof segmenter.segmentsOfDocs> {
-    const docs = opts.getContents() || [];
+    const entries = windowEntries();
     const cur = opts.getCurrentSection?.() ?? 0;
     const gate = { aheadSections: aheadOf() };
-    return segmenter
-      .segmentsOfDocs(docs, cur)
-      .filter((s) => visibility.withinInjectGate(s.sectionIndex, gate))
-      .filter((s) => !injector.hasInjected(s.locatorKey))
-      // 失败段退避过滤：仍在退避期 / 已超重试上限的不重复送译（避免每轮即时无上限重试）
-      .filter((s) => !injector.isBlocked(s.locatorKey));
+    const all: ReturnType<typeof segmenter.segmentsOfDocs> = [];
+    for (const e of entries) all.push(...segmenter.segmentsOf(e.doc, e.index));
+    const inGate = all.filter((s) => visibility.withinInjectGate(s.sectionIndex, gate));
+    const notInjected = inGate.filter((s) => !injector.hasInjected(s.locatorKey));
+    const out = notInjected.filter((s) => !injector.isBlocked(s.locatorKey));
+    if (!out.length && entries.length) {
+      scheduleBackoffRetry(notInjected.map((s) => s.locatorKey));
+      const st = injector.stats();
+      const bs = injector.blockedSummary(inGate.map((s) => s.locatorKey));
+      const wait =
+        bs.maxLeftMs > 3_600_000 ? "超重试上限(等重开书)" : bs.maxLeftMs > 0 ? `${Math.ceil(bs.maxLeftMs / 1000)}s` : "0";
+      getLogger().info(
+        `[REword][双语] 窗口漏斗（空）：docs=${entries.length} 当前节=${cur} 已加载=[${entries
+          .map((e) => e.index)
+          .join(",")}] 预取=${gate.aheadSections} ` +
+          `切出=${all.length} 闸门后=${inGate.length} 未注入=${notInjected.length} 退避后=${out.length} ` +
+          `退避挡=${bs.blocked} 恢复=${wait} ` +
+          `目标=${to} 账本(已注入=${st.injected} 跳过=${st.skipped} 失败退避=${st.failed} 空译冷却=${st.empty} 送译退避=${st.sendFailed})`,
+      );
+      entries.slice(0, 5).forEach((e) => {
+        const d = diagnoseDoc(e.doc, e.index, {
+          isSegmentHidden: (h) => !!opts.isSegmentHidden?.(h),
+          targetLang: to,
+        });
+        getLogger().info(
+          `[REword][双语] 窗口漏斗 · 第${e.index}节：结构块=${d.blocks} 切出=${d.segments} ` +
+            `裸文本候选=${d.looseRuns} 已有译文块=${d.marks} 已打标=${d.tagged} 正文字符=${d.chars}`,
+        );
+      });
+    }
+    return out;
   }
 
   async function injectAll(): Promise<void> {
@@ -263,6 +336,10 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
       const sectionsCached = new Set<number>();
       const t0 = Date.now();
       let failedBatches = 0;
+      /** 送译失败/超时的去重条目：这些段不吃空串，改走注入器的送译退避 */
+      const failedUniq = new Set<number>();
+      /** 本轮留了退避账的定位键：到最早恢复点要自动补一轮，不能等用户翻页 */
+      const retryWatchKeys: string[] = [];
       /** 被预翻译接管而中断：剩余段由队列负责，不算「本轮失败」 */
       let interrupted = false;
 
@@ -286,8 +363,9 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
             uniqFromCache[ui] = !!res.fromCache[j];
           });
         } catch (e) {
-          // 单片失败/超时只影响这一片：留空交给注入器退避，后续分片照常跑
+          // 单片失败/超时只影响这一片：失败段记退避（秒级），后续分片照常跑
           failedBatches++;
+          batch.forEach((ui) => failedUniq.add(ui));
           getLogger().warn(
             `[REword][双语] 分片翻译失败（${batch.length} 段），继续后续分片：${String((e as Error)?.message || e)}`,
           );
@@ -297,8 +375,16 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
         if (!enabled) return;
         const segs: ReturnType<typeof collectPending> = [];
         const trs: string[] = [];
+        const sendFailedKeys: string[] = [];
         for (const ui of batch) {
+          if (failedUniq.has(ui)) {
+            for (const j of segsByUniq.get(ui) ?? []) sendFailedKeys.push(pending[j].locatorKey);
+            continue;
+          }
           const tr = uniqTr[ui] || "";
+          if (!tr.trim()) {
+            for (const j of segsByUniq.get(ui) ?? []) retryWatchKeys.push(pending[j].locatorKey);
+          }
           for (const j of segsByUniq.get(ui) ?? []) {
             segs.push(pending[j]);
             trs.push(tr);
@@ -308,11 +394,20 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
             }
           }
         }
-        const ir = await injector.injectBatch({ segments: segs, translations: trs });
-        injectedTotal += ir.injected;
-        skippedTotal += ir.skipped ?? 0;
-        opts.onProgress?.(injectedTotal, total, false);
+        if (sendFailedKeys.length) {
+          injector.markSendFailed(sendFailedKeys);
+          retryWatchKeys.push(...sendFailedKeys);
+        }
+        if (segs.length) {
+          const ir = await injector.injectBatch({ segments: segs, translations: trs });
+          injectedTotal += ir.injected;
+          skippedTotal += ir.skipped ?? 0;
+          opts.onProgress?.(injectedTotal, total, false);
+        }
       }
+
+      // 本轮欠的账自己还：退避一结束就补跑，用户停在这一页也能等来译文
+      if (!interrupted && retryWatchKeys.length) scheduleBackoffRetry(retryWatchKeys);
 
       const latencyMs = Date.now() - t0;
       getLogger().info(
@@ -382,17 +477,20 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     }, 300);
   }
 
+  /** 窗口内的全部段（与 collectPending 同一节号口径，避免两套统计互相打脸） */
+  function windowSegments(): ReturnType<typeof segmenter.segmentsOfDocs> {
+    const out: ReturnType<typeof segmenter.segmentsOfDocs> = [];
+    for (const e of windowEntries()) out.push(...segmenter.segmentsOf(e.doc, e.index));
+    return out;
+  }
+
   function segmentStats(): { count: number; chars: number } {
-    const docs = opts.getContents() || [];
-    const cur = opts.getCurrentSection?.() ?? 0;
-    const segs = segmenter.segmentsOfDocs(docs, cur);
+    const segs = windowSegments();
     return { count: segs.length, chars: segs.reduce((s, x) => s + x.text.length, 0) };
   }
 
   function segmentTexts(): string[] {
-    const docs = opts.getContents() || [];
-    const cur = opts.getCurrentSection?.() ?? 0;
-    return segmenter.segmentsOfDocs(docs, cur).map((s) => s.text);
+    return windowSegments().map((s) => s.text);
   }
 
   /**
@@ -499,6 +597,7 @@ export function createBilingualV2(opts: BilingualOptions): BilingualHandle {
     destroy(): void {
       enabled = false;
       if (injectTimer) clearTimeout(injectTimer);
+      if (backoffTimer) clearTimeout(backoffTimer);
       queue.cancel();
       injector.clear();
     },

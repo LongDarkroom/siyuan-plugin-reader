@@ -85,7 +85,18 @@ export interface Injector extends InjectorLike {
   retryableKeys(now?: number): string[];
   /** 该块是否被退避挡住（仍在退避期 或 已超重试上限）——collectPending 用它过滤 */
   isBlocked(locatorKey: string, now?: number): boolean;
-  stats(): { injected: number; failed: number };
+  /**
+   * 送译失败（分片抛错 / 超时）专用记账（2026-11-21）。
+   * 这类段落**不能走注入器的空串分支**：那里记的是「空译冷却」（重试用尽后 5 分钟），
+   * 一次网络抖动就能让整片十几段五分钟不出译文，而且被挡时界面毫无提示。
+   * 记进独立的「送译退避」表：秒级（最迟 1 分钟）自动放行，且不落进 failedSet
+   * 的重试上限——网络抖三段就该重试三次，不该被永久拉黑到重开书。
+   */
+  markSendFailed(locatorKeys: string[]): void;
+  /** 诊断用：这批键里被退避挡住多少、最长还要等多久（毫秒）；2026-11-21 查「整页无译文」 */
+  blockedSummary(keys: string[], now?: number): { blocked: number; maxLeftMs: number };
+  /** 账本计数（2026-11-21 补 empty/skipped：诊断「整页无译文」时要能看出是不是退避表吞掉了整段） */
+  stats(): { injected: number; failed: number; empty: number; skipped: number; sendFailed: number };
 }
 
 interface FailRecord {
@@ -95,6 +106,8 @@ interface FailRecord {
 
 /** 空译文重试用尽后的长冷却（不永久拉黑，网络恢复后还能自愈） */
 const EMPTY_COOLDOWN_MS = 5 * 60_000;
+/** 送译失败退避的上限：网络类故障再久也不该让用户 1 分钟以上看不见译文 */
+const SEND_FAIL_MAX_MS = 60_000;
 
 export function createInjector(opts: InjectorOptions = {}): Injector {
   const perFrameDefault = opts.perFrame ?? INJECT_DEFAULTS.perFrame;
@@ -115,6 +128,12 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
    * 只是分类记录（stats 仍只把异常算作 failed）。
    */
   const emptySet = new Map<string, FailRecord>();
+  /**
+   * 送译失败退避（2026-11-21）：分片抛错/超时专用，只看冷却时间、永不拉黑。
+   * 不复用 failedSet —— 那张表超过 maxRetries 就永久挡住（整书预翻译要靠它止损），
+   * 一次网络抖动足以让一页段落到顶，之后只有重开书才救得回来。
+   */
+  const sendFailSet = new Map<string, FailRecord>();
   const nodesByKey = new Map<string, Element>();
   /** 裸文本块的译文元素：它们不是任何原文元素的兄弟，只能自己记着自己 */
   const looseDivsByKey = new Map<string, HTMLElement>();
@@ -141,6 +160,20 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
   }
 
   /**
+   * 送译失败（分片抛错 / 超时）专用记账：秒级退避、到点自动重试，且清掉
+   * 「空译冷却」和「失败上限」两本旧账 —— 那两条分别会把一段压成 5 分钟和永久黑箱。
+   */
+  function markSendFailedOne(key: string): void {
+    const prev = sendFailSet.get(key);
+    const tries = (prev?.tries ?? 0) + 1;
+    const delays = PRETRANSLATE_DEFAULTS.retryDelaysMs;
+    const delay = Math.min(delays[Math.min(tries - 1, delays.length - 1)], SEND_FAIL_MAX_MS);
+    sendFailSet.set(key, { tries, nextAt: Date.now() + delay });
+    emptySet.delete(key);
+    failedSet.delete(key);
+  }
+
+  /**
    * 视同已处理（不进退避、下轮不再送译）。
    * ⚠️ 必须记状态：光「不注入」而不记账，这段中文每轮翻页都会被重新送去翻译，
    * 反而比原来更烧额度。
@@ -149,6 +182,7 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
     skippedSet.add(key);
     failedSet.delete(key);
     emptySet.delete(key);
+    sendFailSet.delete(key);
   }
 
   /**
@@ -238,6 +272,7 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
           skippedSet.delete(seg.locatorKey);
           failedSet.delete(seg.locatorKey);
           emptySet.delete(seg.locatorKey);
+          sendFailSet.delete(seg.locatorKey);
           if (opts.showAiRedo && opts.onAiRedo) bindAiRedoDelegation(doc, opts.onAiRedo);
           if (opts.showHideSegment && opts.onHideSegment) {
             const onHide = opts.onHideSegment;
@@ -289,6 +324,13 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
       skippedSet.clear();
       nodesByKey.clear();
       looseDivsByKey.clear();
+      // 2026-11-21：退避两本账必须一起清。此前只清「已注入/跳过」，失败退避与空译冷却
+      // 留到下次 —— 用户关掉双语再打开（本该是「重来一遍」的手动重试入口）却发现
+      // 那一页仍然一段都不出，因为 collectPending 的 isBlocked 还在挡，
+      // 而且被挡时界面上什么提示都没有。
+      failedSet.clear();
+      emptySet.clear();
+      sendFailSet.clear();
     },
     retryableKeys(now = Date.now()): string[] {
       const out: string[] = [];
@@ -297,15 +339,51 @@ export function createInjector(opts: InjectorOptions = {}): Injector {
       }
       return out;
     },
+    markSendFailed(locatorKeys: string[]): void {
+      for (const key of locatorKeys) markSendFailedOne(key);
+    },
     isBlocked(key: string, now = Date.now()): boolean {
       const failed = failedSet.get(key);
       if (failed && (failed.tries > maxRetries() || failed.nextAt > now)) return true;
       // 空译文只看冷却时间（长冷却结束后仍可再试，不会永久拉黑）
       const empty = emptySet.get(key);
-      return !!empty && empty.nextAt > now;
+      if (!!empty && empty.nextAt > now) return true;
+      const send = sendFailSet.get(key);
+      return !!send && send.nextAt > now;
+    },
+    blockedSummary(keys: string[], now = Date.now()): { blocked: number; maxLeftMs: number } {
+      let blocked = 0;
+      let maxLeftMs = 0;
+      for (const key of keys) {
+        const failed = failedSet.get(key);
+        let left = 0;
+        if (failed) {
+          if (failed.tries > maxRetries()) left = Number.MAX_SAFE_INTEGER;
+          else left = failed.nextAt - now;
+        }
+        if (left <= 0) {
+          const empty = emptySet.get(key);
+          if (empty) left = empty.nextAt - now;
+        }
+        if (left <= 0) {
+          const send = sendFailSet.get(key);
+          if (send) left = send.nextAt - now;
+        }
+        if (left > 0) {
+          blocked++;
+          if (left > maxLeftMs) maxLeftMs = left;
+        }
+      }
+      return { blocked, maxLeftMs };
     },
     stats() {
-      return { injected: injectedSet.size, failed: failedSet.size };
+      return {
+        injected: injectedSet.size,
+        failed: failedSet.size,
+        empty: emptySet.size,
+        skipped: skippedSet.size,
+        sendFailed: sendFailSet.size,
+      };
     },
   };
 }

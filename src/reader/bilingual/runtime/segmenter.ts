@@ -251,6 +251,51 @@ function follows(a: Node, b: Element): boolean {
   return (pos & 4) === 4; // DOCUMENT_POSITION_FOLLOWING
 }
 
+/** 一个文档在「窗口漏斗」里的可观测计数（只读，不改 DOM） */
+export interface DocDiagnostic {
+  /** BLOCK / LEAF_DIV / CELL 结构命中数；0 = 这个文档里根本没有可切的正文块 */
+  blocks: number;
+  /** segmentDocument 实际切出的段数（已扣掉闸门 / 隐藏 / 已注入） */
+  segments: number;
+  /** 裸文本候选数（方案 A 扫到的直属文本块） */
+  looseRuns: number;
+  /** DOM 里已存在的译文块数；>0 而界面看不到 = 排版问题，不是翻译问题 */
+  marks: number;
+  /** 已打 data-reword-translated 的原文元素数 */
+  tagged: number;
+  /** body 文本长度；0 = 文档还没填进内容 */
+  chars: number;
+}
+
+/**
+ * 诊断用（2026-11-21）：「整页无译文」时把切分链路各环节摊开。
+ * 定位完这段问题就可以撤掉，不参与任何生产判定。
+ */
+export function diagnoseDoc(
+  doc: Document,
+  sectionIndex: number,
+  opts: SegmenterOptions = {},
+): DocDiagnostic {
+  const count = (sel: string): number => {
+    try {
+      return doc && typeof doc.querySelectorAll === "function"
+        ? doc.querySelectorAll(sel).length
+        : -1;
+    } catch {
+      return -1;
+    }
+  };
+  const body = (doc as Document & { body?: Element | null }).body;
+  return {
+    blocks: count(`${BLOCK}, ${LEAF_DIV}, ${CELL}`),
+    segments: segmentDocument(doc, sectionIndex, opts.isSegmentHidden, opts.targetLang).length,
+    looseRuns: collectLooseRuns(doc).length,
+    marks: count(".reword-bilingual"),
+    tagged: count("[data-reword-translated]"),
+    chars: (body?.textContent || "").replace(/\s+/g, " ").trim().length,
+  };
+}
+
 export interface SegmenterOptions {
   /** 判定段落指纹是否被用户隐藏（隐藏集合沿用 segHash，兼容已持久化数据） */
   isSegmentHidden?: (hash: string) => boolean;

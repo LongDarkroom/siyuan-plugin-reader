@@ -8,6 +8,12 @@
  * 相比 v1 的接口变化：
  *  - 移除 `retranslateConcise()`（v1 的「简洁版重译」按钮功能已废弃，v2 唯一 literal 模式）。
  */
+/** 已加载的一个分节：真实节号 + 已挂载的 Document */
+export interface SectionEntry {
+  index: number;
+  doc: Document;
+}
+
 /** 书籍元数据（注入翻译 system prompt，提升专有名词/语境准确性） */
 export interface BilingualBookMeta {
   title?: string;
@@ -120,8 +126,17 @@ export interface BilingualOptions {
    * 当前所在分节（0-based，R6 新增）。
    * 注入闸门「当前位置 + aheadSections」与渐进式取段都以它为基准；
    * 不提供时按 0 处理。
+   * ⚠️ 必须是「正在读的那一节」，不是「第一个已加载的分节」—— foliate 会在当前节
+   * 前后各挂几节备用，用后者会让基准随加载状态漂移（2026-11-21 整页无译文的根因）。
    */
   getCurrentSection?: () => number;
+  /**
+   * 已加载分节 + 各自的真实节号（2026-11-21 新增）。
+   * foliate 的 `renderer.getContents()` 本来就带 `index`；加载中的 view 会被它自己
+   * 过滤掉，于是「数组下标 + 起始节号」猜出来的节号会和真实节号错位，
+   * 同一段落的定位键跟着抖。提供这个回调后，切分与闸门都按每项自带节号走。
+   */
+  getSectionEntries?: () => SectionEntry[];
   /** 节号回调（1-based）：每当一批段落翻译并成功入缓存后，回传本次涉及的书「节」序号，用于 UI「第 X-Y 页缓存成功」 */
   onSectionsCached?: (bookId: string, sections: number[]) => void;
   /**

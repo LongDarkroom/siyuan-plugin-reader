@@ -20,7 +20,7 @@ import type {
   SegmenterLike,
   VisibilityLike,
 } from "../core/types.ts";
-import type { PretranslateScan } from "../../bilingual-types.ts";
+import type { PretranslateScan, SectionEntry } from "../../bilingual-types.ts";
 import { PRETRANSLATE_DEFAULTS } from "../core/types.ts";
 import type { Injector } from "./injector.ts";
 
@@ -37,6 +37,12 @@ export interface PretranslateDeps {
   injector: Injector;
   /** 当前已加载内容文档（progressive 模式取段用） */
   getContents: () => Document[];
+  /**
+   * 已加载分节 + 各自真实节号（2026-11-21）。提供时窗口取段以它为准，
+   * 不再用「起始节号 + 数组下标」猜节号：foliate 的 `getContents()` 会跳过还没
+   * 解析完的 view，一跳过，下标和真实节号就整体错位，定位键跟着漂。
+   */
+  getEntries?: () => SectionEntry[];
   /** 全书分节（full 模式枚举用；PDF/漫画等无分节时可不提供） */
   getSections?: () => SectionSource[];
   /** 当前所在分节（0-based） */
@@ -183,10 +189,24 @@ export function createPretranslateQueue(deps: PretranslateDeps): PretranslateQue
 
   /** progressive：取当前窗口内的段 */
   function windowSegments(aheadSections: number): Segment[] {
+    const segs = windowAllSegments();
+    return segs.filter((s) => deps.visibility.withinInjectGate(s.sectionIndex, { aheadSections }));
+  }
+
+  /**
+   * 已加载分节的全部段。有真实节号（getEntries）就用真实节号；
+   * 没有才退回「起始节号 + 下标」的旧口径（单测与无节号来源的调用方）。
+   */
+  function windowAllSegments(): Segment[] {
+    const entries = deps.getEntries?.();
+    if (entries?.length) {
+      const out: Segment[] = [];
+      for (const e of entries) out.push(...deps.segmenter.segmentsOf(e.doc, e.index));
+      return out;
+    }
     const docs = deps.getContents?.() ?? [];
     const cur = deps.getCurrentSection?.() ?? 0;
-    const segs = deps.segmenter.segmentsOfDocs(docs, cur);
-    return segs.filter((s) => deps.visibility.withinInjectGate(s.sectionIndex, { aheadSections }));
+    return deps.segmenter.segmentsOfDocs(docs, cur);
   }
 
   return {
