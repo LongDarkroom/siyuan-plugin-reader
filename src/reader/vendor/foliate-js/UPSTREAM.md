@@ -40,6 +40,14 @@ tts.js、view-light.js、view.js、footnotes.js（1 处）。
 - search.js：`collectBefore` / `collectAfter`
 - mobi.js / view-light.js 等含 `transformTarget` 上游代码（来自 052123be，非本地补丁）
 
+**2026-11-21 本地补丁（升级时须保留）**：三处内容 iframe 不再设置
+`sandbox="allow-same-origin allow-scripts"`（paginator.js `#iframe`、
+fixed-layout.js 两处）。上游原意是绕 WebKit bug 218086，但该组合本身等价于无沙箱，
+Chromium 直接在 DevTools 打印 "can escape its sandboxing" 警告；此警告由浏览器内核
+输出，不经过页面 `console.warn`，RE 的 console-filter 拦截无效。srcdoc iframe 默认
+继承宿主 origin，移除属性后取 `contentDocument` / 脚本事件行为不变。
+升级上游时若这三行回来，需重新移除（标记：`RE 本地补丁 2026-11-21`）。
+
 ## cherry-pick 记录
 
 | 上游提交 | 日期 | 合入方式 | 本地落点 |

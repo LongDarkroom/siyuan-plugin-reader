@@ -13426,7 +13426,11 @@ import { getLogger } from "../core/logger.ts";
    */
   function getContentDocs(): Document[] {
     try {
-      const raw = (view?.renderer?.getContents?.() as any[]) || [];
+      // 2026-11-21：换书 / 首次打开时 view 还没挂载（或旧 view 已清空），
+      // 自动版式与语言识别都会提前取样正文 —— 这是正常时序，不是双语故障。
+      // 静默返回空数组即可；只有「view 已就绪却取不到 doc」才值得告警。
+      if (!view?.renderer) return [];
+      const raw = (view.renderer.getContents?.() as any[]) || [];
       const mapped = raw.map((c) => c?.doc).filter(Boolean) as Document[];
       if (mapped.length === 0) {
         console.warn("[REword] 双语 getContents: 返回空文档数组", {
@@ -15247,6 +15251,7 @@ import { getLogger } from "../core/logger.ts";
   class:re-narrow={isNarrowVp}
   class:re-tiny={isTinyVp}
   class:kb-open={kbOpen}
+  class:chrome-revealed={bottomBarRevealed}
   class:sidebar-docked={anyDockPanel()}
   style="--re-sidebar-w:{sidebarWidth}px;--re-kb:{kbInset}px"
 >
@@ -18559,6 +18564,13 @@ import { getLogger } from "../core/logger.ts";
     gap: 10px;
   }
   /* 2026-11-03：error 类提示（失败/异常）加红色描边，与普通 info 提示一眼可分。 */
+  /* 2026-11-22 浏览器实测：底栏显现时（bottom:8px / 高约 58px，z-5），
+     toast 仍在 bottom:16px / z-3，结果只露出黑色一角、文案被完全盖住。
+     用根节点状态类（与底栏同一个 bottomBarRevealed）把 toast 抬到栏上方；
+     底栏收起时保持原位，桌面/手机共用一条规则。 */
+  .reader-view.chrome-revealed .reader-toast {
+    bottom: calc(8px + 58px + env(safe-area-inset-bottom, 0px) + 12px);
+  }
   .reader-toast--error {
     border: 1px solid rgba(255, 120, 120, 0.85);
     color: #ffd9d9;

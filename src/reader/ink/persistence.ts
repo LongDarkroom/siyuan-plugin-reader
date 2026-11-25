@@ -86,6 +86,11 @@ export class InkSaver {
   private readonly loadData: () => Promise<unknown>;
   /** 是否已 seed 过 store（attach 内部用，避免多 Tab 重复 seed） */
   private seeded = false;
+  /**
+   * 上次「已落盘 / 已排队落盘」的内容指纹（JSON 串）。
+   * 与当前 store 内容一致时**不再写盘** —— 写盘会让思源重载整个插件（见 attach 注释）。
+   */
+  private lastSavedKey: string | null = null;
 
   constructor(
     save: (data: unknown) => Promise<void>,
@@ -109,10 +114,13 @@ export class InkSaver {
     try {
       const raw = await this.loadData();
       this.current = parseInkPersisted(raw);
+      // 磁盘内容 = 当前内容：记下指纹，后续没有真改动就不写盘
+      this.lastSavedKey = JSON.stringify(serializeInkPersisted(this.current));
       getLogger().info(`[REword-Ink] 墨迹加载完成（${this.current.length} 笔）`);
     } catch (e) {
       getLogger().warn("[REword-Ink] 墨迹加载失败，从空集合启动:", { error: e });
       this.current = [];
+      this.lastSavedKey = JSON.stringify(serializeInkPersisted(this.current));
     }
     return this.current;
   }
@@ -141,11 +149,29 @@ export class InkSaver {
       this.seeded = true;
       inkStrokes.set([...this.current]);
     }
+    // 2026-11-25 无限重载修复 —— 两处保险，缺一不可：
+    //  ① svelte/store 的 subscribe 会**同步回调一次当前值**（正是上面 seed 进去的那份），
+    //     它不是用户改动。旧代码把它当成改动 → update → 400ms 后写 hiword-ink.json。
+    //  ② 思源（3.8.x）把「插件 petal 写盘」当作插件重载信号（内核 push_reload：
+    //     `dataChanges=[siyuan-plugin-reader]` → 所有前端重新加载该插件）。于是：
+    //       插件加载 → attach 误判一次改动 → 写盘 → 内核广播重载 → 插件再加载 → …
+    //     实测每秒 1 次，症状：顶栏图标反复消失、页签内容被反复清空（UI 像被压扁/半渲染）、
+    //     控制台刷 `WebSocket is closed. Reconnect will be attempted…`。
+    //     所以「内容与上次落盘一致」时不写盘（用序列化结果比对，比引用比对更稳）。
+    let primed = false;
     return inkStrokes.subscribe((v) => {
+      if (!primed) {
+        primed = true;
+        return;
+      }
       // 同样的 v 引用 → current 已经是这个值 → 跳过 save
       if (v === this.current) return;
+      const payload = serializeInkPersisted(v);
+      const key = JSON.stringify(payload);
+      if (key === this.lastSavedKey) return;
+      this.lastSavedKey = key;
       this.current = [...v];
-      this.store.update(serializeInkPersisted(this.current));
+      this.store.update(payload);
     });
   }
 

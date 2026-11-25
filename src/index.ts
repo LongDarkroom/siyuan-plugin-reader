@@ -17,6 +17,10 @@
  *  · 页签 init 闭包捕获 plugin 引用；
  *  · window/document 级监听器保留引用，onunload 摘除。
  */
+/* 必须是第一条 import：foliate 各模块在顶层直接 customElements.define("reword-foliate-*")，
+ * 与 siyuan-plugin-reword 同名。谁后加载谁抛 NotSupportedError，整个插件 eval 失败、
+ * 图标与页签全部消失（热重载 / 两个插件同时启用时必现）。垫片把 define 包成「已存在则跳过」。 */
+import "./reader/foliate-shim.ts";
 import { Plugin, openTab, showMessage, Dialog } from "siyuan";
 import { t, initI18n, saveLang } from "./i18n/index.ts";
 import { ReaderDockController } from "./reader/reader-dock.ts";
@@ -73,6 +77,8 @@ import {
 // hardenDialogBody 硬修；且 Dialog 自带标题栏 chrome、书架/阅读两层叠加。
 // 调研与证据：docs/手机端适配对标思阅-调研与方案-2026-10-26.md
 import { isMobile } from "./core/env.ts";
+// 【临时诊断 · 验完即删】iPad 环境探测命令
+import { openDiag } from "./core/diag.ts";
 import { mobileOverlay } from "./core/mobile-overlay-host.ts";
 import "./index.less";
 
@@ -221,6 +227,14 @@ export class ReaderPlugin extends Plugin {
       langKey: "openShelf",
       hotkey: "",
       callback: () => plugin.openShelfTab(),
+    });
+
+    /* 【临时诊断 · 验完即删】iPad 环境探测：命令面板搜「环境诊断」 */
+    this.addCommand({
+      langKey: "ipadEnvDiag",
+      langText: "RE 阅读器：环境诊断（iPad）",
+      hotkey: "",
+      callback: () => openDiag(),
     });
 
     /* Console 过滤（降级 iframe sandbox / ResizeObserver loop 噪音） */
@@ -444,7 +458,7 @@ export class ReaderPlugin extends Plugin {
    * 那是**主插件 dock 的内容容器**；本插件没有 dock，故直接传宿主元素，
    * 由 `shelfHost()` 提供等价容器。
    */
-  private mountShelf(host: HTMLElement): void {
+  private mountShelf(host: HTMLElement, onClose?: () => void): void {
     try {
       host.innerHTML = "";
       host.style.display = "flex";
@@ -459,7 +473,7 @@ export class ReaderPlugin extends Plugin {
           `${t("阅读器初始化失败，请查看插件日志")}</div>`;
         return;
       }
-      this.readerDock.render(host);
+      this.readerDock.render(host, { onClose });
       this.shelfMounted = true;
     } catch (e) {
       getLogger().error("[RE 阅读器] 挂载书架失败", { error: e });
@@ -512,7 +526,10 @@ export class ReaderPlugin extends Plugin {
       mobileOverlay.open("shelf", {
         key: "shelf",
         mount: (el) => {
-          plugin.mountShelf(el);
+          // 2026-11-22：✕ 是浮层里唯一的显式退出入口（思阅同款思路：
+          // 阅读器工具栏留 ✕ 发 reader:mobile-close）。这里直接关书架层，
+          // 宿主会销毁 Svelte 组件并把历史哨兵退回去。
+          plugin.mountShelf(el, () => mobileOverlay.close("shelf"));
           return {
             destroy: () => {
               try {
@@ -848,6 +865,52 @@ export class ReaderPlugin extends Plugin {
       await this.readerDock?.tabController?.focusAnnotation(bookId, cfi);
     } catch (e) {
       getLogger().warn("[RE 阅读器] 跳转到阅读批注失败", { data: { bookId, cfi }, error: e });
+    }
+  }
+
+  /**
+   * 思源 3.8 的插件生命周期：onload → onLayoutReady → mount。冷启动时 onload 可能
+   * 早于顶栏容器就绪 —— addTopBar 会登记成功但元素没进 DOM，之后也没有第二次补挂，
+   * 表现就是「刚启动有图标，随后消失」。这里在布局就绪后核对一次并补挂。
+   */
+  onLayoutReady(): void {
+    this.ensureTopBarMounted(0);
+  }
+
+  /** 顶栏图标 id（onload 与自愈共用，避免两处字面量漂移） */
+  private static readonly TOPBAR_ID = "re-reader-open";
+
+  private ensureTopBarMounted(attempt: number): void {
+    const id = ReaderPlugin.TOPBAR_ID;
+    const find = (): HTMLElement | undefined =>
+      this.topBarIcons.find(
+        (e) => !!e && typeof e.getAttribute === "function" && e.getAttribute("data-id") === id
+      ) as HTMLElement | undefined;
+
+    let el = find();
+    if (!el) {
+      // 被思源从 topBarIcons 里摘掉了（插件菜单会剔除不在 DOM 中的条目）→ 重新登记
+      el = (this.addTopBar({
+        id,
+        icon: "iconREReader",
+        title: t("打开 RE 阅读器"),
+        callback: () => this.openShelfTab(),
+      }) as HTMLElement | undefined) || find();
+    }
+    if (el && !el.isConnected) {
+      // 用户手动「取消固定」的不抢回来 —— 那是插件菜单里的合法入口
+      const unpinned = (window as any)?.siyuan?.storage?.["local-plugintopunpin"];
+      const isUnpinned = Array.isArray(unpinned) && unpinned.includes(el.id);
+      if (!isUnpinned) {
+        const host =
+          document.getElementById("barPlugins") ||
+          document.querySelector("#toolbar #drag") ||
+          document.querySelector("#toolbar #barMore");
+        if (host) host.before(el);
+      }
+    }
+    if ((!el || !el.isConnected) && attempt < 8) {
+      window.setTimeout(() => this.ensureTopBarMounted(attempt + 1), 250 * (attempt + 1));
     }
   }
 

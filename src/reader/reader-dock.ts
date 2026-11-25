@@ -76,8 +76,11 @@ export class ReaderDockController {
     this.settingsStore.resetAll();
   }
 
-  /** 渲染书架面板（组合栏 Tab / 独立 Dock 共用入口） */
-  render(dockElement: HTMLElement): void {
+  /**
+   * 渲染书架面板（组合栏 Tab / 独立 Dock / 移动端浮层共用入口）。
+   * 2026-11-22：`onClose` 只在移动端浮层里传 —— 书架顶栏据此显示 ✕。
+   */
+  render(dockElement: HTMLElement, opts?: { onClose?: () => void }): void {
     const contentEl = dockElement.querySelector(
       "#hiword-dock-content"
     ) as HTMLElement | null;
@@ -88,7 +91,7 @@ export class ReaderDockController {
     } catch (__swallowErr) { logSwallow(__swallowErr, "reader-dock.ts · render", "debug"); }
     this.comp = null;
     target.innerHTML = "";
-    this.mountShelf(target);
+    this.mountShelf(target, opts?.onClose);
   }
 
   /**
@@ -104,11 +107,12 @@ export class ReaderDockController {
   }
 
   /** 书架视图（点书 → 打开独立阅读 Tab） */
-  private mountShelf(target: HTMLElement): void {
+  private mountShelf(target: HTMLElement, onClose?: () => void): void {
     this.comp = new BookshelfView({
       target,
       props: {
         store: this.store,
+        onClose,
         onOpen: (bookId: string) => {
           const meta = this.store.get(bookId);
           void this.tabs.openBookTab(bookId, meta?.title);

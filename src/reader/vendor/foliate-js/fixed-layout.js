@@ -547,7 +547,9 @@ export class FixedLayout extends HTMLElement {
         })
         // `allow-scripts` is needed for events because of WebKit bug
         // https://bugs.webkit.org/show_bug.cgi?id=218086
-        iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
+        // [RE 本地补丁 2026-11-21] 同 paginator.js：不设 sandbox，消除 Chromium
+        // 内核的 "can escape its sandboxing" 警告（不经过页面 console.warn）。
+        // iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
         this.#root.append(element)
@@ -1055,7 +1057,8 @@ export class FixedLayout extends HTMLElement {
             display: 'none',
             overflow: 'hidden',
         })
-        iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
+        // [RE 本地补丁 2026-11-21] 同 paginator.js：不设 sandbox。
+        // iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
         iframe.setAttribute('scrolling', 'no')
         iframe.setAttribute('part', 'filter')
         // Place directly in the placeholder — no root append + reparent

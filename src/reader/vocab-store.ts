@@ -60,6 +60,18 @@ export class ReaderVocabStore {
   private words = new Map<string, VocabEntry>();
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private loaded = false;
+  /**
+   * 是否有「还没落盘的变更」。
+   *
+   * 2026-11-25 无限重载修复：思源（3.8.x）把「插件 petal 数据写盘」当作插件重载信号
+   * （内核 push_reload：`dataChanges=[siyuan-plugin-reader]` → 所有前端重新加载该插件）。
+   * 而 unload 时若**无条件**写盘，就会形成自激回路：
+   *   重载 → 旧实例 onunload → flush 写盘 → 内核广播重载 → 重载 → …
+   * 实测频率约 1 次/秒，症状是顶栏图标反复消失、页签内容被反复清空（UI 像被压扁/半渲染）、
+   * 控制台刷 `WebSocket is closed. Reconnect will be attempted…`。
+   * 因此写盘必须由脏标记门控：没变过就一个字节都不写。
+   */
+  private dirty = false;
   private listeners = new Set<() => void>();
 
   constructor(
@@ -114,6 +126,7 @@ export class ReaderVocabStore {
       this.words.clear();
     }
     this.loaded = true;
+    this.dirty = false; // 刚读进来的内容与磁盘一致
     this.emit();
   }
 
@@ -178,6 +191,7 @@ export class ReaderVocabStore {
   }
 
   private scheduleSave(): void {
+    this.dirty = true;
     if (this.saveTimer) clearTimeout(this.saveTimer);
     this.saveTimer = setTimeout(() => {
       this.saveTimer = null;
@@ -191,9 +205,13 @@ export class ReaderVocabStore {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
+    // 没变过 → 不写。写了会让思源把这当成「插件数据变更」并重载整个插件，
+    // unload 又回到这里，形成每秒一次的无限重载（见 dirty 字段注释）。
+    if (!this.dirty) return;
     const data: VocabFile = { version: 1, words: [...this.words.values()] };
     try {
       await this.io.save(FILE_KEY, data);
+      this.dirty = false;
     } catch {
       /* 写盘失败不打断阅读；下次有变更会再试 */
     }

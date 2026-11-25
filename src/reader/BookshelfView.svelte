@@ -42,6 +42,13 @@
   export let store: BookshelfStore;
   export let onOpen: (bookId: string) => void;
   /**
+   * 移动端全屏浮层模式的退出入口（2026-11-22）。
+   * 由 `index.ts` → `ReaderDockController.render()` 注入：桌面页签 / 主插件 dock
+   * 里不传（思源自己有关闭页签的按钮），只有浮层里才显示顶栏 ✕。
+   * 未注入时按钮完全不渲染 —— 组件本身不认识 mobileOverlay，保持依赖倒置。
+   */
+  export let onClose: (() => void) | undefined = undefined;
+  /**
    * 打开「选择笔记发送目标」弹窗（2026-10-09 新增）。
    *
    * 由宿主（`reader-dock.ts`）注入 —— 书架本身不加载思源 API，
@@ -105,6 +112,9 @@
         { label: t("在线书源（OPDS）"), icon: SEL_ICONS.globe, onClick: () => (showOpds = true) },
         { label: t("云端书库（WebDAV / S3）"), icon: SEL_ICONS.cloudShelf, onClick: () => (showCloud = true) },
         { label: t("阅读知识图谱"), icon: SEL_ICONS.graph, onClick: () => (showGraph = true) },
+        // 2026-11-22 浏览器实测：390px 屏顶栏 scrollWidth 442，「导入」被裁掉 42px。
+        // 与上面 4 个入口同理收进 ⋯；header 里的按钮只在手机档隐藏，fileInput 仍复用。
+        { label: t("导入书架"), icon: SEL_ICONS.add, onClick: () => fileInput?.click() },
       ],
     };
   }
@@ -1549,6 +1559,8 @@
   class:re-phone={$viewport.breakpoint === "phone"}
   class:re-large-phone={$viewport.breakpoint === "largePhone"}
   class:re-tablet={$viewport.breakpoint === "tablet"}
+  class:re-narrow={$viewport.width <= BREAKPOINTS.narrowPhone}
+  class:re-tiny={$viewport.width <= BREAKPOINTS.tinyPhone}
   on:dragenter={onDragEnter}
   on:dragover={onDragOver}
   on:dragleave={onDragLeave}
@@ -1556,6 +1568,17 @@
   on:drop={onDrop}
 >
   <div class="bookshelf-header">
+    <!-- 2026-11-22 移动端浮层的唯一「回到思源」入口。思阅的做法是阅读器
+         工具栏末尾放 ✕（handleClose → reader:mobile-close）；我们这里书架
+         本身就是最外层，所以 ✕ 放在顶栏第一颗，任何断点都不会被横滑藏掉。 -->
+    {#if onClose}
+      <button
+        class="shelf-icon-btn shelf-close-btn"
+        title={t("退出书架")}
+        aria-label={t("退出书架")}
+        on:click={() => onClose?.()}
+      ><span class="reword-shelf-ico reword-shelf-ico--btn">{@html SEL_ICONS.cancel}</span></button>
+    {/if}
     <button
       class="shelf-icon-btn shelf-sb-toggle-btn"
       class:active={sidebarOpen}
@@ -2718,6 +2741,20 @@
     border-bottom: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.1));
     flex-shrink: 0;
   }
+  /* 2026-11-23：360dp 顶栏实测 scrollWidth 392 / 宽 360 —— 溢 32px，
+     最右侧的 ⋯ 被裁出屏幕（手机上这一段还没有 overflow-x，直接看不见），
+     也就是「进得去、退不出、也点不到更多」。
+     触屏档的 40px 是可达性下限，不能再缩，只能从间距里扣：
+     gap 10 → 4 省 42px，padding 10 → 8 再省 4px ⇒ 346/360，余 14。
+     320dp 再让出「29 本」这颗计数（31 + gap ≈ 35）⇒ 311/320，余 9。
+     计数只是信息，不是操作 —— 窄屏优先保按钮。 */
+  .bookshelf-view.re-narrow .bookshelf-header {
+    gap: 4px;
+    padding: 8px;
+  }
+  .bookshelf-view.re-tiny .bookshelf-count {
+    display: none;
+  }
   .bookshelf-title {
     font-size: 14px;
     font-weight: 500;
@@ -2959,8 +2996,12 @@
   /* 容器查询：右侧主区域变窄时自动缩小封面，避免 1–2 列被拉得很大 */
   /* 2026-11-19 P2-16：88px 档的断点从 360 收到 320。
      360px 手机（iPhone 12/13/14 竖屏主区就是 360）原本落进 88px 档，
-     每卡约 104px，书名只放得下 3–4 个字；它其实够用 (361–520) 档的 112px。
+     每卡约 104px，书名只放得下 3–4 个字；它其实够用 (321–520) 档的 112px。
      320 以下才是真的放不下（折叠机半屏 / SE 分屏）。 */
+  /* ⚠️ 2026-11-23：112 档的下界原本写 361，与上面的 320 **中间空出 321–360**。
+     容器查询不连续 = 这一段直接回落到基础规则的 200px 档：
+     360dp 安卓（主流机型）auto-fill 只算得出 1 列，一屏一本书、封面 324×482。
+     现在 321 接上 320，两档无缝。改这里必须同步 test/smoke-shelf-tokens 的断言。 */
   @container shelf-main (max-width: 320px) {
     .bookshelf-grid {
       grid-template-columns: repeat(auto-fill, minmax(88px, 1fr));
@@ -2974,14 +3015,18 @@
       border-radius: 8px;
     }
   }
-  @container shelf-main (min-width: 361px) and (max-width: 520px) {
+  @container shelf-main (min-width: 321px) and (max-width: 520px) {
     .bookshelf-grid {
       grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+      /* 14 → 12（2026-11-23）：390dp 时可用宽 362，而 3 列需要 112×3+28 = 364，
+         差 2px 掉成 2 列 174px 的大封面 —— 与 320/420/458 的 3 列不一致，
+         越宽的屏封面反而越大。padding 收到 12 后 390 得 366 ⇒ 稳进 3 列 112.7px；
+         360 仍是 2 列（336 < 364），不受影响。 */
       gap: 14px;
-      padding: 14px;
+      padding: 12px;
     }
     .shelf-chips {
-      padding: 8px 14px 0;
+      padding: 8px 12px 0;
     }
   }
   .book-card {
@@ -3975,6 +4020,14 @@
   .shelf-hdr-more {
     display: none;
   }
+  /* 移动端浮层的 ✕：header 在手机上仍可横向滚动，这里钉在左侧，
+     保证「退出」永远不会因为误滑顶栏而滚出屏幕（2026-11-22）。 */
+  .shelf-close-btn {
+    position: sticky;
+    left: 0;
+    z-index: 2;
+    background: var(--b3-theme-background);
+  }
   /* 2026-11-19 P1-8：手机上 header 从「横滑找按钮」改成「4 个入口收进 ⋯」。
      仍在横滑的只剩 续读 / 多选 / 导入 三个，360px 屏基本不用滑。
      ⋯ 本身只在手机档出现 —— 桌面上 4 个图标直接摆得下，不需要多一层。 */
@@ -3986,10 +4039,16 @@
   .bookshelf-view.re-large-phone .shelf-hdr-more {
     display: inline-flex;
   }
-  /* 2026-11-19 P2-15：360px 屏的工具栏折行。
-     桌面值「搜索 min 140 + 排序 110 + 升降序 + 视图切换 2 颗」已经 300+，
-     触屏档按钮又长大到 40px ⇒ 必然折成两行、第二行只剩一颗孤零零的图标。
-     这一档把搜索下限压到 100、排序上限压到 88，实测 360px 刚好一行放下。 */
+  /* 2026-11-22：导入按钮 77px，390px 屏实测顶栏总宽 442px（右裁 52px）。
+     只隐藏 header 里这一颗；空状态/弹窗里的同名按钮不受影响。
+     入口移到 ⋯ 底部 action sheet（openHeaderOverflow）。 */
+  .bookshelf-view.re-phone .bookshelf-header .bookshelf-import-btn,
+  .bookshelf-view.re-large-phone .bookshelf-header .bookshelf-import-btn {
+    display: none;
+  }
+  /* 2026-11-19 P2-15：手机档把搜索下限压到 100、排序上限压到 88。
+     ⚠️ 2026-11-23 更正：这条**只在 421–480 真能放下一行**（480 时合计 ≈372）。
+     401–480 实测单行、搜索框撑到 228，是这一档的最佳区间。 */
   .bookshelf-view.re-phone .shelf-search {
     flex: 1 1 120px;
     min-width: 100px;
@@ -3998,6 +4057,30 @@
   .bookshelf-view.re-phone .shelf-select {
     max-width: 88px;
     min-width: 0;
+  }
+  /* 2026-11-23：≤420dp（.re-narrow）工具栏改成「搜索独占一行」。
+     ----------------------------------------------------------------
+     触屏能力档把图标按钮从 28 放大到 40 之后，一行需要：
+     搜索(100) + 排序(88) + 升降序(40) + 视图切换(86) + gap 18 + padding 20 = 372px，
+     而 360dp 屏只有 360 ⇒ 必然折行。但折出来的样子很难看：
+     第一行是「搜索 + 排序 + 升降序」，第二行只剩一颗视图切换孤零零贴在左边
+     （实测 toolbar 高 103px，切换控件的 y 比同行其它项低 46px）。
+     改法：搜索独占第一行并拉满（404/360 全宽），
+     第二行 排序 + 升降序 + 切换，切换靠 margin-left:auto 贴右。
+     搜索是这块界面上最高频的操作，值得一整行。
+     ⚠️ 选择器必须带 `.bookshelf-view`（0,3,0）且**排在 .re-phone 那条之后**：
+     两条同权重，按文件顺序后者胜 —— 写在前面会被 `.re-phone` 的 1 1 120px 盖回单行。 */
+  .bookshelf-view.re-narrow .shelf-toolbar {
+    padding: 6px 8px;
+  }
+  .bookshelf-view.re-narrow .shelf-search {
+    /* 100% 的 basis 配 `flex: 1 1` 没用 —— 收缩系数会把它拉回和排序挤一行
+       （390 实测仍是单行 57px）。要「独占一行」必须连 shrink 一起归零。 */
+    flex: 0 0 100%;
+    max-width: none;
+  }
+  .bookshelf-view.re-narrow .shelf-view-toggle {
+    margin-left: auto;
   }
   .bookshelf-view.re-phone .bookshelf-header::-webkit-scrollbar,
   .bookshelf-view.re-large-phone .bookshelf-header::-webkit-scrollbar {
@@ -4475,6 +4558,23 @@
       width: 40px;
       height: 40px;
     }
+    /* 2026-11-23：上面这条是给**方形图标按钮**的，可 `.shelf-continue`（续读）
+       也带 `.shelf-icon-btn` 类 —— 它靠基础规则里的 `width:auto` 长成胶囊，
+       而这条触屏规则写在文件更后面、同权重 ⇒ auto 被覆盖成 40px。
+       实测盒子 40 / 内容 47，「续读」两个字被切掉右边一截（360dp 真机可见）。
+       这里显式还原 auto，并给一个下限防止文字再被压。 */
+    .shelf-continue {
+      width: auto;
+      /* 72 → 80：给「续读」胶囊留出稳定宽度。scrollWidth 比 clientWidth 大 2px
+         是上面 ::after 的 -2px 命中区扩边造成的（不是文字溢出），可以忽略。 */
+      min-width: 80px;
+    }
+    /* 分段控件的滑块宽度必须跟按钮同步。--vt-cell 的基础值是 28px（配 28px 按钮），
+       触屏按钮长到 40 后滑块仍只盖 28、位移仍按 30 算 ⇒ 蓝块压在图标左边半个身位，
+       右边那颗「列表」图标只露出一条边。 */
+    .shelf-view-toggle {
+      --vt-cell: 40px;
+    }
     .shelf-icon-btn::after {
       content: "";
       position: absolute;
@@ -4907,6 +5007,25 @@
     }
     .row-cover {
       width: 24px;
+    }
+    /* 2026-11-23：620 档的 `26 minmax(140,1fr) 62 auto` + gap 36 + padding 20 ≈ 364px，
+       而 360dp 屏可用只有 348（320 屏只有 308）⇒ 行内容溢 8 / 48px，
+       右侧「续读」与 ⋯ 直接被裁到屏幕外（实测 360：行 348 / 内容 356）。
+       这一档三处一起收：
+        · 书名下限 140 → 0（minmax(0,1fr)：宁可出省略号，也不许撑破行）
+        · 进度列整列下线 —— 只留 40px 也救不了书名：320 屏算下来书名只剩 140，
+          再装下「在读」标签就只剩 60px，退化成一个字 + 省略号（实测截图）。
+          3px 高的进度条在这一档表达的信息，远不如多两个字书名。
+        · gap 12 → 8
+       固定部分 ≈ 24+动作区80+gap16+padding12 = 132 ⇒ 320 屏书名 176、360 屏 216。 */
+    .shelf-lhead,
+    .shelf-row {
+      grid-template-columns: 24px minmax(0, 1fr) auto;
+      gap: 8px;
+    }
+    .lh-progress,
+    .row-pbar {
+      display: none;
     }
   }
 

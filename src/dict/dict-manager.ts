@@ -31,6 +31,26 @@ const PLUGIN_NAME = "siyuan-plugin-reader";
 const DICT_MANIFEST_KEY = "hiword-dicts.json";
 
 /**
+ * 稳定序列化：递归按 key 排序后再 JSON.stringify。
+ *
+ * 用途只有一个 —— 判断「这份清单和上次落盘的是不是同一份」（见 saveManifest）。
+ * 直接用 JSON.stringify 会被对象字面量顺序影响（迁移时给条目补 `type` 字段就会变序），
+ * 从而误判成「变了」并白写一次盘，又触发一次插件重载。
+ */
+function stableKey(v: unknown): string {
+  const walk = (x: any): any => {
+    if (Array.isArray(x)) return x.map(walk);
+    if (x && typeof x === "object") {
+      const out: Record<string, any> = {};
+      for (const k of Object.keys(x).sort()) out[k] = walk(x[k]);
+      return out;
+    }
+    return x;
+  };
+  return JSON.stringify(walk(v));
+}
+
+/**
  * 内置词典（ncecd）。
  *
  * 决策 G 之后发版包**不含**词典实包 ⇒ 多数用户的 dict/ 里没有这个文件。
@@ -138,6 +158,11 @@ export interface DictManifest {
 export class DictManager {
   private manifest: DictManifest = { active: "", actives: [], dicts: [] };
   private ready = false;
+  /**
+   * 上次落盘的清单指纹（见 saveManifest 注释）。
+   * null = 未知/磁盘内容与内存不一致 → 下一次 saveManifest 照常写。
+   */
+  private lastSavedKey: string | null = null;
 
   constructor(private plugin: any) {}
 
@@ -212,9 +237,16 @@ export class DictManager {
    */
   private async loadManifest(): Promise<DictManifest> {
     let m: DictManifest | null = null;
+    /** 磁盘原文的指纹：读完后与归一化结果比对，相同则不必回写 */
+    let rawKey: string | null = null;
     try {
       const raw = await this.plugin.loadData(DICT_MANIFEST_KEY);
-      if (raw && Array.isArray(raw.dicts) && raw.dicts.length) {
+      // 只有「文件不存在 / 结构不是清单」才算首次运行。
+      // 注意**不能**用 `raw.dicts.length` 判断：清单元信息为 `{"dicts":[]}` 是合法状态
+      // （用户所有词典文件都不在了），把它当成「首次运行」会每次加载都重走一遍默认
+      // 清单→剔除→落盘，落盘又触发插件重载，形成每秒一次的自激重载（2026-11-25 事故）。
+      if (raw && typeof raw === "object" && Array.isArray((raw as any).dicts)) {
+        rawKey = stableKey(raw);
         m = raw as DictManifest;
         // 迁移：旧版以 .sqlite/.db 注册的词典自动指向同名 .mdx 原包
         for (const d of m.dicts) {
@@ -274,12 +306,30 @@ export class DictManager {
     }
 
     this.manifest = m;
+    // 归一化没改写任何东西（原文 == 内存）→ 视为「已落盘」，启动流程里的
+    // saveManifest() 就不会白写一次盘。若迁移改过内容，rawKey 与当前指纹不等，
+    // 留给下一次 saveManifest 落盘（一次性，不会循环）。
+    this.lastSavedKey = rawKey === stableKey(m) ? rawKey : null;
     return m;
   }
 
   private async saveManifest(): Promise<void> {
+    // 2026-11-25 无限重载修复：没变过就不写盘。
+    //
+    // 思源（3.8.x）把「插件 petal 写盘」当成插件重载信号：内核 push_reload 收到
+    // `dataChanges=[siyuan-plugin-reader]` 就通知所有前端重新加载该插件。
+    // 而本插件的词典初始化路径里有一句**无条件** saveManifest（加载完 actives 之后），
+    // 于是形成自激回路：
+    //   插件加载 → 词典初始化写 hiword-dicts.json → 内核广播重载 →
+    //   插件再加载 → 再写 → …（实测约每秒 1 次）
+    // 症状：顶栏图标反复消失、页签内容被反复清空（书架像被压成窄条、封面溢出），
+    // 控制台刷 `WebSocket is closed. Reconnect will be attempted…`。
+    // 现在用「清单内容指纹」门控：内容与上次落盘一致就一个字节都不写。
+    const key = stableKey(this.manifest);
+    if (key === this.lastSavedKey) return;
     try {
       await this.plugin.saveData(DICT_MANIFEST_KEY, this.manifest);
+      this.lastSavedKey = key;
     } catch (e) {
       getLogger().warn("[RE 阅读器] 词典清单落盘失败", { error: e });
     }

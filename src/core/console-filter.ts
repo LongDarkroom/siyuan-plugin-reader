@@ -8,7 +8,11 @@
  *     sandbox="allow-scripts allow-same-origin",Chrome 出于安全考虑
  *     对该组合输出 warning("An iframe which has both allow-scripts and
  *     allow-same-origin for its sandbox attribute can escape its sandboxing.")。
- *     源头在 foliate vendor + 思源内核,不可改;只在显示层降级。
+ *     ⚠️ 2026-11-21 更正：这条是 Chromium **渲染内核直接写进 DevTools** 的，
+ *     不经过页面 console.warn / console.error —— 本文件的 patch 拦不住它。
+ *     foliate 侧已从源头移除 sandbox 属性（见 UPSTREAM.md 本地补丁）；
+ *     思源内核侧的 iframe 我们改不了，仍会显示，属无害提示。
+ *     下面保留该 pattern 仅用于拦 iframe 内部脚本主动 console.warn 的同类文本。
  *  2. ResizeObserver loop 异常 — 浏览器已知良性循环(observer
  *     回调里修改了观察元素尺寸),svelte runtime 误报为 unhandled
  *     error(`emit @ plugin:siyuan-plugin-reword:4`)。源头在 copilot-src
@@ -18,8 +22,9 @@
  * 不动 logger.ts 已有结构;本模块只覆盖 console.error + console.warn + window.onerror。
  * 真实错误/警告(不匹配 pattern)全部透传。
  *
- * 2026-08-23 扩展:Chrome 的 iframe sandbox 警告经 console.warn 路径派发
- *   (不是 console.error),所以必须同时拦截 console.warn 才能屏蔽。
+ * 2026-08-23 扩展:同时拦截 console.warn 与 console.error。
+ *   2026-11-21 注:当初以为 iframe sandbox 警告走 console.warn,实测不成立
+ *   (DevTools 仍显示),该警告只能从 iframe 源头消除。
  */
 
 import { getLogger } from "./logger.ts";

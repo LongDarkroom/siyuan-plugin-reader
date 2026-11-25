@@ -742,7 +742,12 @@ class View {
         })
         // `allow-scripts` is needed for events because of WebKit bug
         // https://bugs.webkit.org/show_bug.cgi?id=218086
-        this.#iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
+        // [RE 本地补丁 2026-11-21] 不再设置 sandbox：
+        // allow-same-origin + allow-scripts 的组合本就等价于无沙箱，Chromium 会
+        // 直接在 DevTools 打印 "can escape its sandboxing" 安全警告 —— 这条是
+        // 浏览器内核输出，不经过页面 console.warn，插件的 console-filter 拦不住。
+        // srcdoc iframe 默认继承宿主 origin，去掉属性后脚本/取 doc 的行为完全一致。
+        // this.#iframe.setAttribute('sandbox', 'allow-same-origin allow-scripts')
         this.#iframe.setAttribute('scrolling', 'no')
     }
     get element() {
