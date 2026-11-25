@@ -2460,10 +2460,10 @@
         />
         {#if refError}<div class="ref-error">{refError}</div>{/if}
         <div class="edit-actions">
+          <button class="import-fail-close" disabled={refBusy} on:click={() => (refDialogOpen = false)}>{t("取消")}</button>
           <button class="bookshelf-import-btn" disabled={refBusy} on:click={submitRefImport}>
             {refBusy ? t("读取中…") : t("引用")}
           </button>
-          <button class="import-fail-close" disabled={refBusy} on:click={() => (refDialogOpen = false)}>{t("取消")}</button>
         </div>
       </div>
     </div>
