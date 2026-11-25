@@ -5,16 +5,24 @@ import { isValidBookMeta, isValidBookGroup } from "./library/library-types.ts";
  * 阅读器 - 书架存储
  * ---------------------------------------------------------------
  * - 书架索引持久化到插件数据 hiword-bookshelf.json（loadData/saveData）
- * - 书籍文件本体存思源 data 的插件私有目录 /data/plugins/<name>/books/，
- *   卸载插件即整体移除，符合「卸载无残留」原则。
+ * - 书籍文件本体存 /data/storage/petal/<name>/books/（思源插件数据目录）。
+ *   商店更新/覆盖安装会整目录替换 /data/plugins/<name>/，旧方案把书放那里，
+ *   每更新一次书就丢一次；petal 不在替换范围内。代价是卸载插件后书还在，
+ *   需要「清空书库」显式删除。旧路径的书在首次加载时后台迁移过来。
  */
 
-import { putFile, getFileBlob, removeFile } from "../siyuan/api";
+import { putFile, getFileBlob, removeFile, renameFile } from "../siyuan/api";
 import { unzipSync } from "fflate";
 import { writable } from "svelte/store";
 import { bookFingerprint } from "./book-fingerprint.ts";
 import { type BookType } from "./reader-mode.ts";
 import { isMobile } from "../core/env.ts";
+import { parseContainerXml, parseOpf, coverExtOf, coverMimeOf } from "./epub-opf.ts";
+import { extractEpubMetaRemote } from "./epub-meta-remote.ts";
+import {
+  parseBookRef, bookRefUrl, bookRefExt, bookRefName, bookRefKey, isSupportedRef,
+} from "./book-ref.ts";
+import { loadRefBlob } from "./book-ref-load.ts";
 
 /*
  * 类型与常量已原位抽取到 library/ 层（library-types.ts / library-persist.ts），
@@ -34,6 +42,9 @@ export type {
   BookSortKey, SortDir, BookFilter, BookMark, BookMeta,
 } from "./library/library-types.ts";
 const BOOKS_DIR = (pluginName: string) =>
+  `/data/storage/petal/${pluginName}/books`;
+/** 旧版存放位置：插件安装目录，商店更新会被整目录替换（仅用于一次性迁移） */
+const LEGACY_BOOKS_DIR = (pluginName: string) =>
   `/data/plugins/${pluginName}/books`;
 
 /** 本地日期键 YYYY-MM-DD（按用户时区，非 UTC） */
@@ -70,11 +81,24 @@ export class BookshelfStore {
   private fileCache = new Map<string, Blob>();
   private fileCacheBytes = 0;
 
+  /** 文件已确认丢失的书籍 id（书架据此给「重新导入」入口） */
+  private missingSet = new Set<string>();
+  private _missing = writable<Set<string>>(new Set());
+  /** 目录清单缓存：迁移/缺失探测按目录批量判断，避免逐本发请求 */
+  private dirCache = new Map<string, Set<string>>();
+  /** 探测期间发生导入/删除/读成功时递增，旧探测结果作废 */
+  private presenceEpoch = 0;
+
   constructor(private plugin: any) {}
 
   /** 实现 Svelte store 契约：返回退订函数 */
   subscribe(run: (value: BookMeta[]) => void, invalidate?: (value?: BookMeta[]) => void): () => void {
     return this._store.subscribe(run, invalidate as any);
+  }
+
+  /** 文件缺失集合（只读订阅） */
+  get missing() {
+    return this._missing;
   }
 
   get list(): BookMeta[] {
@@ -105,6 +129,238 @@ export class BookshelfStore {
       await this.saveGroups();
     }
     this._store.set([...this.books]);
+    // 迁移旧目录 + 探测缺失文件：都要读目录/拷文件，放后台，不阻塞书架首屏
+    void this.afterLoad();
+  }
+
+  private async afterLoad(): Promise<void> {
+    // Node 测试环境没有思源的文件 API，跳过所有磁盘探测
+    if (typeof document === "undefined") return;
+    try {
+      await this.migrateLegacyBooks();
+    } catch (e) {
+      logSwallow(e, "bookshelf-store.ts · migrateLegacyBooks", "warn");
+    }
+    try {
+      await this.refreshMissing();
+    } catch (e) {
+      logSwallow(e, "bookshelf-store.ts · refreshMissing", "warn");
+    }
+  }
+
+  /**
+   * 一次性把旧目录（/data/plugins/<name>/books）里的书搬到 petal 目录。
+   * 幂等且可断点续跑：目标是「存在就只改索引、不存在就搬」，索引只写一次；
+   * 中途崩溃下次按同一规则补上。
+   *
+   * 优先用内核 rename（同盘秒级、不占内存）；
+   * 失败场景（跨盘/权限）再退化为「读成 Blob 再上传」。
+   *
+   * 2026-11-25 修：rename 前必须先建目标目录 —— 内核的 renameFile 不会
+   * 自动创建 newPath 的父目录，petal/<name>/books 不存在时每次 rename 都失败，
+   * 于是每本书都退化成「整本读进内存再上传」（292 MB 书库的迁移会变成内存事故）。
+   *
+   * 迁移结果写 `storage-migration.json`（不是逻辑门，纯排障用）：
+   * 出问题能一眼看出「跑过没、搬了几本、几个字节、失败了几个」。
+   */
+  private async migrateLegacyBooks(): Promise<void> {
+    const legacyPrefix = `${LEGACY_BOOKS_DIR(this.plugin.name)}/`;
+    const dir = BOOKS_DIR(this.plugin.name);
+    // 封面单独判断：书搬成功但封面失败时，下次仍要为封面重试
+    const pending = this.books.filter(
+      (b) => b.path?.startsWith(legacyPrefix) || b.cover?.startsWith(legacyPrefix)
+    );
+    if (!pending.length) return;
+
+    // 目标目录先就位（renameFile 不会替我们建父目录）
+    let dirReady = false;
+    const ensureDir = async (target: string): Promise<boolean> => {
+      if (dirReady && target === dir) return true;
+      const ok = await putFile(target, true, null);
+      this.dirCache.delete(target);
+      if (target === dir) dirReady = !!ok;
+      return !!ok;
+    };
+    await ensureDir(dir);
+
+    const stale: string[] = [];
+    const stat = { files: 0, covers: 0, bytes: 0, renamed: 0, copied: 0, failed: 0 };
+    let changed = false;
+    for (const meta of pending) {
+      try {
+        if (meta.path?.startsWith(legacyPrefix)) {
+          const oldPath = meta.path;
+          const name = oldPath.slice(legacyPrefix.length);
+          const dest = `${dir}/${name}`;
+          const destState = await this.fileExists(dest);
+          if (destState === null) continue; // 目录读不出来：别改索引，下次再试
+          if (!destState) {
+            if (await renameFile(oldPath, dest)) {
+              stat.renamed++;
+            } else {
+              // 退路：读原文件再写目标（跨盘/权限差异时 rename 会失败）
+              const blob = await getFileBlob(oldPath);
+              if (!blob) {
+                if (!(await this.listFiles(dir, true))?.has(name)) {
+                  // rename 与旧文件都失败：保留原路径，交给 refreshMissing 标「已丢失」
+                  stat.failed++;
+                  continue;
+                }
+              } else {
+                if (!(await putFile(dest, false, blob))) {
+                  stat.failed++;
+                  continue;
+                }
+                stat.copied++;
+              }
+            }
+          }
+          meta.path = dest;
+          stale.push(oldPath);
+          stat.files++;
+          stat.bytes += meta.size || 0;
+          changed = true;
+        }
+        if (meta.cover?.startsWith(legacyPrefix)) {
+          const oldCover = meta.cover;
+          const coverName = oldCover.slice(legacyPrefix.length);
+          const coverDest = `${dir}/${coverName}`;
+          if ((await this.fileExists(coverDest)) === false) {
+            // covers/ 子目录同样要先生成
+            if (coverName.includes("/")) await ensureDir(`${dir}/${coverName.slice(0, coverName.lastIndexOf("/"))}`);
+            if (!(await renameFile(oldCover, coverDest))) {
+              const coverBlob = await getFileBlob(oldCover);
+              if (coverBlob) await putFile(coverDest, false, coverBlob);
+            }
+          }
+          if (await this.fileExists(coverDest)) {
+            meta.cover = coverDest;
+            stale.push(oldCover);
+            stat.covers++;
+            changed = true;
+          }
+        }
+      } catch (e) {
+        stat.failed++;
+        logSwallow(e, `bookshelf-store.ts · migrate ${meta.id}`, "warn");
+      }
+    }
+    if (!changed) return;
+    this.dirCache.clear();
+    await this.save();
+    this._store.set([...this.books]);
+    // rename 成功后旧路径已不存在，removeFile 只是兜底清掉「复制」路径留下的原件
+    for (const p of stale) {
+      try {
+        await removeFile(p);
+      } catch (__swallowErr) {
+        logSwallow(__swallowErr, "bookshelf-store.ts · migrate rmOld", "debug");
+      }
+    }
+    await this.writeMigrationMarker(stat);
+  }
+
+  /**
+   * 写迁移标记（诊断用，最多保留最近 10 次）。
+   *
+   * 为什么单独一个文件而不是塞进书架索引：索引是「用户数据」，标记是「运维记录」，
+   * 混在一起会让索引 schema 变动、也会被导出/同步当成书单处理。
+   */
+  private async writeMigrationMarker(stat: {
+    files: number; covers: number; bytes: number;
+    renamed: number; copied: number; failed: number;
+  }): Promise<void> {
+    const path = `/data/storage/petal/${this.plugin.name}/storage-migration.json`;
+    try {
+      const prevBlob = await getFileBlob(path);
+      let runs: unknown[] = [];
+      if (prevBlob) {
+        const prev = JSON.parse(await prevBlob.text());
+        if (Array.isArray(prev?.runs)) runs = prev.runs;
+      }
+      runs.push({
+        at: Date.now(),
+        from: LEGACY_BOOKS_DIR(this.plugin.name),
+        to: BOOKS_DIR(this.plugin.name),
+        ...stat,
+      });
+      const body = JSON.stringify({ v: 1, runs: runs.slice(-10) }, null, 2);
+      await putFile(path, false, new Blob([body], { type: "application/json" }));
+    } catch (e) {
+      logSwallow(e, "bookshelf-store.ts · writeMigrationMarker", "debug");
+    }
+  }
+
+  /** 目录内文件清单；目录不存在返回空集；无法判断返回 null */
+  private async listFiles(dir: string, fresh = false): Promise<Set<string> | null> {
+    if (!fresh) {
+      const hit = this.dirCache.get(dir);
+      if (hit) return hit;
+    }
+    try {
+      const res = await fetch("/api/file/readDir", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: dir }),
+      });
+      if (res.status === 404) {
+        this.dirCache.set(dir, new Set());
+        return new Set();
+      }
+      if (!res.ok) return null;
+      const json = await res.json().catch(() => null);
+      if (json?.code === 0 && Array.isArray(json.data)) {
+        const names = new Set<string>(
+          json.data.filter((x: any) => x && !x.isDir).map((x: any) => String(x.name))
+        );
+        this.dirCache.set(dir, names);
+        return names;
+      }
+      if (json?.code === 404) {
+        this.dirCache.set(dir, new Set());
+        return new Set();
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** 文件是否在位：true 在 / false 不在 / null 无法判断 */
+  private async fileExists(path: string): Promise<boolean | null> {
+    if (!path) return false;
+    const slash = path.lastIndexOf("/");
+    const files = await this.listFiles(path.slice(0, slash));
+    if (!files) return null;
+    return files.has(path.slice(slash + 1));
+  }
+
+  /** 重新探测所有书籍文件是否在位（书架加载后调用一次） */
+  async refreshMissing(): Promise<void> {
+    if (typeof document === "undefined") return;
+    const epoch = this.presenceEpoch;
+    const next = new Set<string>();
+    for (const b of this.books) {
+      // 引用式书源没有本地副本，`fileExists("")` 必然为 false ⇒ 直接跳过，
+      // 改由真正打开失败时标 missing（远端可用性只能靠实际访问判断）
+      if (b.src) continue;
+      if ((await this.fileExists(b.path)) === false) next.add(b.id);
+    }
+    // 探测期间有导入/删除/成功读文件：结果可能已过期，丢弃
+    if (epoch !== this.presenceEpoch) return;
+    const changed =
+      next.size !== this.missingSet.size ||
+      [...next].some((id) => !this.missingSet.has(id));
+    this.missingSet = next;
+    if (changed) this._missing.set(new Set(next));
+  }
+
+  private setMissing(id: string, missing: boolean): void {
+    this.presenceEpoch++;
+    if (this.missingSet.has(id) === missing) return;
+    if (missing) this.missingSet.add(id);
+    else this.missingSet.delete(id);
+    this._missing.set(new Set(this.missingSet));
   }
 
   private async save(): Promise<void> {
@@ -218,10 +474,20 @@ export class BookshelfStore {
   }
 
   /**
-   * 从 EPUB 中解析元数据与封面（一次解压）
+   * 从 EPUB 中解析元数据与封面（**按需解压**，三趟点名）
    * - 元数据：OPF 的 dc:title / dc:creator / dc:language
    * - 封面：container.xml → OPF → meta[name=cover] → manifest item
+   *
+   * 2026-11-25 内存优化：此前 `unzipSync(buf)` 不带 filter，会把整本全部条目
+   * （实测 809 个，含图片与字体）一次性 inflate 进内存，只为读三样小东西。
+   * 实测 27.3 MB 的 EPUB：读入 +27 MB、全量解压再 +57 MB，RSS 峰值 +84 MB（≈3.1×）。
+   * 批量导入时每本都来一次这种尖峰，是「导入多本书内存膨胀」的直接来源。
+   *
+   * 现在每趟只解压点名的那几个条目：解压量从「整本」降到「几十 KB + 一张封面」，
+   * 且封面超过 EPUB_COVER_MAX 时直接放弃（封面只是书架缩略图，不值得为它换内存）。
    */
+  private static readonly EPUB_COVER_MAX = 8 * 1024 * 1024;
+
   private async extractEpubMeta(file: File): Promise<{
     title?: string;
     author?: string;
@@ -231,60 +497,51 @@ export class BookshelfStore {
   }> {
     try {
       const buf = new Uint8Array(await file.arrayBuffer());
-      const files = unzipSync(buf);
-      const decode = (name: string): string | null => {
-        const b = files[name];
-        return b ? new TextDecoder().decode(b) : null;
+      /** 只解压点名条目（fflate 的 filter 在 inflate 之前就拦掉，其余条目零成本） */
+      const pick = (names: string[], maxSize?: number): Record<string, Uint8Array> => {
+        const want = new Set(names);
+        return unzipSync(buf, {
+          filter: (f) => want.has(f.name) && (maxSize === undefined || f.originalSize <= maxSize),
+        });
       };
-      // 1. container.xml → OPF 路径
-      const containerXml = decode("META-INF/container.xml");
+      const decode = (bytes: Uint8Array | undefined): string | null =>
+        bytes ? new TextDecoder().decode(bytes) : null;
+      // 1. container.xml → OPF 路径（通常几百字节）
+      const containerXml = decode(pick(["META-INF/container.xml"])["META-INF/container.xml"]);
       if (!containerXml) return {};
-      const containerDoc = new DOMParser().parseFromString(containerXml, "text/xml");
-      const rootfile = Array.from(containerDoc.getElementsByTagName("rootfile"))[0]?.getAttribute("full-path");
+      const rootfile = parseContainerXml(containerXml);
       if (!rootfile) return {};
-      // 2. OPF → 元数据 + 封面
-      const opfXml = decode(rootfile);
+      // 2. OPF → 元数据 + 封面（通常几十 KB）
+      const opfXml = decode(pick([rootfile])[rootfile]);
       if (!opfXml) return {};
-      const opfDoc = new DOMParser().parseFromString(opfXml, "text/xml");
-      const dir = rootfile.includes("/") ? rootfile.slice(0, rootfile.lastIndexOf("/") + 1) : "";
-      const q = (local: string): string | undefined => {
-        const el = opfDoc.getElementsByTagNameNS("*", local)[0];
-        return el?.textContent?.trim() || undefined;
-      };
-      const title = q("title");
-      const author = q("creator");
-      const language = q("language");
-      const identifier = q("identifier");
-      // 封面
+      // 解析与远端引用共用一份实现（epub-opf.ts），保证两条路径字段一致
+      const info = parseOpf(opfXml, rootfile);
+      // 3. 封面：只解压这一张（超 EPUB_COVER_MAX 直接跳过 ⇒ cover 不设）
+      //    OPF 里偶有 URL 编码的 href（空格写成 %20），按原名取不到再试解码一次
       let cover: { blob: Blob; ext: string } | undefined;
-      let coverId = "";
-      for (const meta of Array.from(opfDoc.getElementsByTagName("meta"))) {
-        if (meta.getAttribute("name") === "cover") {
-          coverId = meta.getAttribute("content") ?? "";
-          break;
+      if (info.cover) {
+        const clean = info.cover.href;
+        let data = pick([info.dir + clean], BookshelfStore.EPUB_COVER_MAX)[info.dir + clean];
+        if (!data) {
+          try {
+            const decoded = info.dir + decodeURIComponent(clean);
+            data = pick([decoded], BookshelfStore.EPUB_COVER_MAX)[decoded];
+          } catch { /* 非法编码：保持原样 */ }
+        }
+        if (data) {
+          const ext = coverExtOf(clean);
+          // 复制一次（≤8 MB）：既满足 BlobPart 的 ArrayBuffer 约束，
+          // 也让封面不再挂着整份 zip 输入缓冲（否则封面 Blob 会把书本体钉在内存里）
+          cover = { blob: new Blob([new Uint8Array(data)], { type: coverMimeOf(ext, info.cover.mediaType) }), ext };
         }
       }
-      if (coverId) {
-        let href = "";
-        let mediaType = "";
-        for (const item of Array.from(opfDoc.getElementsByTagName("item"))) {
-          if (item.getAttribute("id") === coverId) {
-            href = item.getAttribute("href") ?? "";
-            mediaType = item.getAttribute("media-type") ?? "";
-            break;
-          }
-        }
-        if (href) {
-          const clean = href.split("#")[0].split("?")[0];
-          const data = files[dir + clean];
-          if (data) {
-            const ext = (clean.match(/\.(jpe?g|png|gif|webp)$/i)?.[1] ?? "jpg").toLowerCase();
-            const type = mediaType || `image/${ext === "jpg" ? "jpeg" : ext}`;
-            cover = { blob: new Blob([data], { type }), ext };
-          }
-        }
-      }
-      return { title, author, language, identifier, cover };
+      return {
+        title: info.title,
+        author: info.author,
+        language: info.language,
+        identifier: info.identifier,
+        cover,
+      };
     } catch {
       return {}; // 解析失败不阻断导入
     }
@@ -298,11 +555,12 @@ export class BookshelfStore {
     await this.load();
     const ext = (file.name.match(/\.([a-z0-9]+)$/i)?.[1] ?? "epub").toLowerCase();
     const nameBase = file.name.replace(/\.(epub|mobi|azw3|fb2|cbz|pdf|txt|md|markdown)$/i, "") || file.name;
-    // 去重：同名(去扩展名)+同大小视为重复
+    // 去重：同名(去扩展名)+同大小视为重复；但文件已确认丢失时不算重复，
+    // 走下面的「恢复到原书目」流程（用户重导同一本书即可找回进度/批注）
     const dup = this.books.find(
       (b) => b.title.toLowerCase() === nameBase.toLowerCase() && b.size === file.size
     );
-    if (dup) return null;
+    if (dup && (await this.fileExists(dup.path)) !== false) return null;
 
     // 先提取元数据（EPUB/PDF），以便用「内容指纹」生成稳定 bookId
     let title: string | undefined;
@@ -335,22 +593,45 @@ export class BookshelfStore {
       size: file.size,
       format: ext === "markdown" ? "md" : ext,
     });
-    // 指纹级去重：书架已存在同指纹书则跳过重复导入（直接复用既有缓存）
-    if (this.books.some((b) => b.id === id)) return null;
+    // 指纹级去重：文件还在就跳过；文件已确认丢失则复用原书目（进度/批注自动接回）
+    const existing = this.books.find((b) => b.id === id);
+    if (existing && (await this.fileExists(existing.path)) !== false) return null;
+    const restore = existing ?? dup ?? null;
+    // 恢复时沿用原书目 id 命名文件：dup 命中的旧 id 未必等于本次指纹 id
+    const fileId = restore?.id ?? id;
 
     const dir = BOOKS_DIR(this.plugin.name);
-    const path = `${dir}/${id}.${ext}`;
+    const path = `${dir}/${fileId}.${ext}`;
+    try {
+      await putFile(dir, true, null);
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "bookshelf-store.ts · importBook mkdir books", "debug");
+    }
     const ok = await putFile(path, false, file);
     if (!ok) throw new Error(`书籍上传失败: ${file.name}`);
+    this.dirCache.delete(dir);
 
     let cover: string | undefined;
     if (coverBlob) {
       try {
         await putFile(`${dir}/covers`, true, null);
       } catch (__swallowErr) { logSwallow(__swallowErr, "bookshelf-store.ts · importBook mkdir covers", "debug"); }
-      const coverPath = `${dir}/covers/${id}.${coverBlob.ext}`;
+      const coverPath = `${dir}/covers/${fileId}.${coverBlob.ext}`;
       const coverOk = await putFile(coverPath, false, coverBlob.blob);
       if (coverOk) cover = coverPath;
+      this.dirCache.delete(`${dir}/covers`);
+    }
+    if (restore) {
+      this.forgetFile(id);
+      restore.path = path;
+      restore.size = file.size;
+      // 原本是引用式书源：现在有了副本，指针必须清掉（否则 getBlob 仍按引用取）
+      delete restore.src;
+      if (cover) restore.cover = cover;
+      this.setMissing(id, false);
+      await this.save();
+      this._store.set([...this.books]);
+      return restore;
     }
     const book: BookMeta = {
       id,
@@ -370,6 +651,112 @@ export class BookshelfStore {
     return book;
   }
 
+  /**
+   * 引用式导入（2026-11-25 C 期）：只登记指针，**不复制文件**。
+   *
+   * 与 `importBook` 的区别：
+   *  - 书还在原处（思源资源 / public / http 直链），书库里没有副本 ⇒ 不占双份磁盘、
+   *    不把整本塞进同步、导入瞬间完成；
+   *  - 元数据优先走 Range 只读三个条目（container/OPF/封面），**不下载整本**；
+   *    服务器不支持 Range 时退化为「只放指针、标题用文件名」，绝不为了书名搬 148 MB；
+   *  - `path` 留空串，`src` 记引用；`getBlob` 打开时按引用取。
+   *
+   * @returns 新书 meta；返回 null 表示该引用已在架上（判重跳过）
+   */
+  async importByRef(input: string): Promise<BookMeta | null> {
+    await this.load();
+    const ref = parseBookRef(input);
+    // ⚠️ 文案里不要出现双斜杠：测试 loader 会把 `//` 之后当注释抹掉（含字符串内），
+    //    这类文件（带 constructor 参数属性）一旦命中，import 直接语法错误。
+    if (!ref) throw new Error("无法识别的书源（支持 assets/… 、/data/… 、http 或 https 链接）");
+    if (!isSupportedRef(ref)) throw new Error("不支持的文件类型");
+
+    const key = bookRefKey(ref);
+    const dup = this.books.find((b) => b.src && bookRefKey(b.src) === key);
+    if (dup) return null;
+
+    const ext = bookRefExt(ref);
+    const name = bookRefName(ref);
+    const nameBase = name.replace(/\.(epub|mobi|azw3|fb2|cbz|pdf|txt|md|markdown)$/i, "") || name;
+
+    let title: string | undefined;
+    let author: string | undefined;
+    let language: string | undefined;
+    let identifier: string | undefined;
+    let coverBlob: { blob: Blob; ext: string } | undefined;
+    let size = 0;
+
+    const url = bookRefUrl(ref);
+    if (url) {
+      // 先探大小（HEAD / Range 0-0）：失败说明引用不可达，直接报错而不是建一条死记录
+      const { RangeZip } = await import("./zip-range.ts");
+      size = await RangeZip.probeSize(url);
+      if (ext === "epub") {
+        const remote = await extractEpubMetaRemote(url, size);
+        if (remote) {
+          title = remote.title;
+          author = remote.author;
+          language = remote.language;
+          identifier = remote.identifier;
+          coverBlob = remote.cover;
+        }
+      }
+    } else {
+      // 内核路径（/data/… 但不在 public 下）：只能整本读一次
+      const blob = await getFileBlob(ref.uri);
+      if (!blob) throw new Error("引用文件不存在或不可读");
+      size = blob.size;
+      if (ext === "epub") {
+        const meta = await this.extractEpubMeta(new File([blob], name, { type: "application/epub+zip" }));
+        title = meta.title;
+        author = meta.author;
+        language = meta.language;
+        identifier = meta.identifier;
+        coverBlob = meta.cover;
+      }
+    }
+
+    const id = bookFingerprint({
+      identifier,
+      title: title || nameBase,
+      author,
+      size,
+      format: ext === "markdown" ? "md" : ext,
+    });
+    // 与已有书库副本同一个实体书 ⇒ 视为重复（宁可让用户用副本，也不建两份进度）
+    if (this.books.some((b) => b.id === id)) return null;
+
+    const dir = BOOKS_DIR(this.plugin.name);
+    let cover: string | undefined;
+    if (coverBlob) {
+      try {
+        await putFile(`${dir}/covers`, true, null);
+      } catch (__swallowErr) { logSwallow(__swallowErr, "bookshelf-store.ts · importByRef mkdir covers", "debug"); }
+      const coverPath = `${dir}/covers/${id}.${coverBlob.ext}`;
+      if (await putFile(coverPath, false, coverBlob.blob)) {
+        cover = coverPath;
+        this.dirCache.delete(`${dir}/covers`);
+      }
+    }
+
+    const book: BookMeta = {
+      id,
+      title: title || nameBase,
+      author,
+      language,
+      format: ext === "markdown" ? "md" : ext,
+      path: "",
+      src: { kind: ref.kind, uri: ref.uri },
+      cover,
+      size,
+      addedAt: Date.now(),
+      lastReadAt: Date.now(),
+    };
+    this.books.push(book);
+    await this.save();
+    this._store.set([...this.books]);
+    return book;
+  }
   /**
    * 2026-10-15 OPDS 书源元数据补全（参照 readest #5270：目录源元数据优先）：
    * 导入后用书源提供的 title/author 覆盖文件内嵌缺省值；封面 dataURL 落盘 covers
@@ -500,7 +887,7 @@ export class BookshelfStore {
     return getFileBlob(meta.cover);
   }
 
-  /** 读取书籍文件为 Blob（命中文件缓存时不再走磁盘） */
+  /** 读取书籍文件为 Blob（命中文件缓存时不再走磁盘；引用式书源按引用取） */
   async getBlob(id: string): Promise<Blob | null> {
     await this.load();
     const meta = this.get(id);
@@ -512,8 +899,14 @@ export class BookshelfStore {
       this.fileCache.set(id, cached);
       return cached;
     }
-    const blob = await getFileBlob(meta.path);
-    if (blob) this.rememberFile(id, blob);
+    const blob = meta.src ? await loadRefBlob(meta.src.uri, meta.src.kind) : await getFileBlob(meta.path);
+    if (blob) {
+      this.setMissing(id, false);
+      this.rememberFile(id, blob);
+    } else {
+      // 文件确实读不到：标「已丢失」，书架给出重新导入入口
+      this.setMissing(id, true);
+    }
     return blob;
   }
 
@@ -550,6 +943,21 @@ export class BookshelfStore {
   }
 
   /**
+   * 关闭阅读页签时释放该书的文件缓存（2026-11-25 内存水位修复）。
+   *
+   * 此前 `fileCache` 只在删除/重导入时清理，**关书不释放**：桌面端上限 320 MB，
+   * 于是「读得越多、水位越高」，读五六本大书后进程常驻几百 MB 且不再回落 ——
+   * 这正是用户感受到的「多本书内存膨胀」。
+   *
+   * 现在语义改成「缓存跟着打开的书走」：页签销毁即释放，重开时重新读一次磁盘
+   * （本地 30 MB 约 0.2 s，比长期常驻 320 MB 划算；大书重开本来就要等）。
+   * 注意只摘缓存条目、不打断仍持有该 Blob 的其他页签（它们各自握着引用）。
+   */
+  releaseFileCache(id: string): void {
+    this.forgetFile(id);
+  }
+
+  /**
    * 从书架移除书籍
    * - 默认只移除索引（源文件保留在插件目录，便于重新导入/回收）
    * - deleteFile=true 时同时删除源文件与封面
@@ -561,9 +969,13 @@ export class BookshelfStore {
       // 2026-11-15：先清文件缓存，防止「删了还能从缓存里打开」
       this.forgetFile(id);
       if (opts.deleteFile) {
-        try {
-          await removeFile(meta.path);
-        } catch (__swallowErr) { logSwallow(__swallowErr, "bookshelf-store.ts · removeBook", "warn"); }
+        // 引用式书源没有副本：绝不能 removeFile("")，更不能去删用户的源文件
+        // （引用语义 = 删除书目只解除登记，不动原处文件）
+        if (meta.path) {
+          try {
+            await removeFile(meta.path);
+          } catch (__swallowErr) { logSwallow(__swallowErr, "bookshelf-store.ts · removeBook", "warn"); }
+        }
         if (meta.cover) {
           try {
             await removeFile(meta.cover);
@@ -571,6 +983,8 @@ export class BookshelfStore {
         }
       }
       this.books = this.books.filter((b) => b.id !== id);
+      this.setMissing(id, false);
+      this.dirCache.clear();
       await this.save();
       this._store.set([...this.books]);
     }
@@ -1217,6 +1631,7 @@ export class BookshelfStore {
     const path = `${dir}/covers/${id}-${Date.now().toString(36)}.${safeExt}`;
     const ok = await putFile(path, false, file);
     if (!ok) return null;
+    this.dirCache.delete(`${dir}/covers`);
     const old = meta.cover;
     meta.cover = path;
     await this.save();

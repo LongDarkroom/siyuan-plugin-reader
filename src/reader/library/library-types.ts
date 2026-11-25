@@ -151,8 +151,23 @@ export interface BookMeta {
   language?: string;
   /** epub / mobi / azw3 / fb2 / cbz / pdf / txt / md */
   format: string;
-  /** 思源 data 内路径 */
+  /**
+   * 思源 data 内路径（书库副本）。
+   *
+   * ⚠️ 引用式书源（`src` 存在）时这里是**空串**：书不在书库里，只存指针。
+   * 判断「书在哪」请用 `src` 而不是 `path` 是否为空 —— 空 path 的唯一含义
+   * 就是「这本书没有副本」。
+   */
   path: string;
+  /**
+   * 引用式书源（2026-11-25 C 期）：只存引用不复制文件。
+   * 缺省 = 老数据（书库副本，见 `path`）。
+   */
+  src?: {
+    kind: "asset" | "http" | "path";
+    /** asset: 相对 data/assets；http: 完整 URL；path: /data/ 开头的工作区路径 */
+    uri: string;
+  };
   /** 封面图路径（EPUB 提取；TXT/MD 无） */
   cover?: string;
   size: number;
@@ -229,6 +244,15 @@ export function isValidBookMeta(x: unknown): x is BookMeta {
   if (typeof m.title !== "string") return false;
   if (typeof m.format !== "string") return false;
   if (typeof m.path !== "string") return false;
+  // 引用式书源：path 为空串、src 必须形状合法（老数据无 src，此路不进）
+  if (m.src !== undefined) {
+    const s = m.src as Record<string, unknown> | null;
+    if (!s || typeof s !== "object") return false;
+    if (s.kind !== "asset" && s.kind !== "http" && s.kind !== "path") return false;
+    if (typeof s.uri !== "string" || !s.uri) return false;
+  } else if (!m.path) {
+    return false; // 既没有副本也没有引用 ⇒ 这条记录没法打开，隔离掉
+  }
   if (typeof m.size !== "number") return false;
   if (typeof m.addedAt !== "number") return false;
   // bookmarks：若提供则必须是数组（非数组视为损坏，整条隔离）；老数据多为 undefined，安全放行

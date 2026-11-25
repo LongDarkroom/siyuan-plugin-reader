@@ -71,6 +71,7 @@
   export let onAutoBind: ((bookId: string, done: (ok: boolean) => void) => void) | null = null;
 
   let books: BookMeta[] = [];
+  let missingIds = new Set<string>();
   let fileInput: HTMLInputElement;
   let importing = false;
   let importError = "";
@@ -115,6 +116,8 @@
         // 2026-11-22 浏览器实测：390px 屏顶栏 scrollWidth 442，「导入」被裁掉 42px。
         // 与上面 4 个入口同理收进 ⋯；header 里的按钮只在手机档隐藏，fileInput 仍复用。
         { label: t("导入书架"), icon: SEL_ICONS.add, onClick: () => fileInput?.click() },
+        // 2026-11-25 C 期：引用式导入（只存指针，不复制文件）
+        { label: t("引用导入…"), icon: SEL_ICONS.cloudFile, onClick: () => (refDialogOpen = true) },
       ],
     };
   }
@@ -661,7 +664,11 @@
 
   // 分组管理弹窗
   let groupDialogOpen = false;
-  let newGroupName = "";
+  /* 2026-11-25 C 期：引用式导入（只存指针，不复制文件） */
+  let refDialogOpen = false;
+  let refInput = "";
+  let refBusy = false;
+  let refError = "";  let newGroupName = "";
   let renamingGroupId = "";
   let renamingGroupName = "";
   let renamingInput: HTMLInputElement;
@@ -744,6 +751,20 @@
     }, ms);
   }
 
+  /**
+   * 打开书籍的唯一入口：文件已丢失时不开阅读器（只会报「书籍不存在」），
+   * 直接把文件选择器递给用户，选原文件后按内容指纹恢复到原书目 ——
+   * 进度、批注、笔记绑定都还在。
+   */
+  function openBook(bookId: string) {
+    if (missingIds.has(bookId)) {
+      showToast(t("书籍文件已丢失，选择原文件重新导入即可恢复阅读进度"));
+      fileInput?.click();
+      return;
+    }
+    onOpen(bookId);
+  }
+
   /** 批量导入核心（文件列表 → 逐本导入，推进进度） */
   async function runImport(files: File[]) {
     const list = Array.from(files);
@@ -791,6 +812,38 @@
     const files = fileInput?.files;
     if (!files || !files.length) return;
     void runImport(Array.from(files));
+  }
+
+  /**
+   * 引用式导入（2026-11-25 C 期）：只登记指针，不复制文件。
+   *
+   * 为什么值得单独一个入口：书架上的书默认都要「上传一份副本」到 petal，
+   * 一本 100 MB 的书就变成磁盘两份、同步两份。引用式导入让书留在原处
+   * （思源资源 / public / 直链），书架只记 `{kind, uri}`，打开时按引用取。
+   *
+   * 元数据优先走 Range 只读三个小条目（container/OPF/封面），所以
+   * 引用一本 148 MB 的书也**不会为了书名下载整本**。
+   */
+  async function submitRefImport() {
+    const input = refInput.trim();
+    if (!input || refBusy) return;
+    refBusy = true;
+    refError = "";
+    try {
+      const meta = await store.importByRef(input);
+      if (!meta) {
+        refError = t("该书源已在书架上");
+        return;
+      }
+      refDialogOpen = false;
+      refInput = "";
+      await refresh();
+      showToast(t("已引用《{title}》", { title: meta.title }));
+    } catch (e: any) {
+      refError = e?.message || String(e);
+    } finally {
+      refBusy = false;
+    }
   }
 
   /** 失败项重试 */
@@ -979,7 +1032,7 @@
       {
         icon: b.progress?.fraction ? SEL_ICONS.bookFallback : SEL_ICONS.play,
         label: b.progress?.fraction ? t("续读") : t("开始阅读"),
-        onClick: () => onOpen(b.id),
+        onClick: () => openBook(b.id),
       },
       { divider: true },
       // 2026-10-09：本书的笔记发送目标（per-book 绑定的主入口）。
@@ -1412,6 +1465,7 @@
 
   /** 书架 store 订阅句柄（阅读器保存进度/时长后书架自动同步） */
   let unsubStore: (() => void) | null = null;
+  let unsubMissing: (() => void) | null = null;
   /** 2026-10-10：快捷键提示面板（与 ReaderView 共享，按 ? 唤出） */
   let showHint = false;
   let disposeHintBind: (() => void) | null = null;
@@ -1438,6 +1492,9 @@
       books = [...list];
       loadCovers(books);
     });
+    unsubMissing = store.missing.subscribe((set) => {
+      missingIds = set instanceof Set ? set : new Set();
+    });
     // [2026-08-29] P2 抛光:全局 Esc 关闭任意弹窗/菜单(N1)
     window.addEventListener("keydown", onGlobalKeydown);
     // 2026-10-10：注册 ? 提示面板 toggle 到顶层。
@@ -1455,6 +1512,12 @@
       // ignore
     }
     unsubStore = null;
+    try {
+      unsubMissing?.();
+    } catch {
+      // ignore
+    }
+    unsubMissing = null;
     // 回收封面 objectURL，防内存泄漏
     for (const url of Object.values(coverUrls)) {
       try {
@@ -1539,7 +1602,7 @@
       scrollRowIntoView(rowFocusIdx);
     } else if (e.key === "Enter" && rowFocusIdx >= 0 && rowFocusIdx < visible.length) {
       e.preventDefault();
-      onOpen(visible[rowFocusIdx].id);
+      openBook(visible[rowFocusIdx].id);
     }
   }
 
@@ -1595,7 +1658,7 @@
       <button
         class="shelf-icon-btn shelf-continue"
         title={t("继续读 · {title}", { title: continueReadTitle })}
-        on:click={() => continueReadId && onOpen(continueReadId)}
+        on:click={() => continueReadId && openBook(continueReadId)}
       ><span class="reword-shelf-ico reword-shelf-ico--btn reword-shelf-ico--t">{@html SEL_ICONS.play}</span>{t("续读")}</button>
     {/if}
     <button
@@ -1632,6 +1695,14 @@
       aria-haspopup="menu"
       on:click={openHeaderOverflow}
     ><span class="reword-shelf-ico reword-shelf-ico--btn"><svg viewBox="0 0 24 24" aria-hidden="true">{@html ICONS.more}</svg></span></button>
+    <button
+      class="bookshelf-import-btn shelf-hdr-ref"
+      title={t("引用导入：书留在原处，不复制文件")}
+      on:click={() => (refDialogOpen = true)}
+    >
+      <span class="reword-shelf-ico reword-shelf-ico--btn reword-shelf-ico--t">{@html SEL_ICONS.cloudFile}</span>
+      {t("引用")}
+    </button>
     <button
       class="bookshelf-import-btn"
       disabled={importing}
@@ -2112,6 +2183,7 @@
               <div
                 class="book-card"
                 class:selected={selectedIds.includes(book.id)}
+                class:missing={missingIds.has(book.id)}
                 style="--i:{bi < 18 ? bi : 18}"
                 draggable={!touchUI}
                 on:dragstart={(e) => onBookDragStart(e, book.id)}
@@ -2124,7 +2196,7 @@
                 <div class="book-cover-wrap">
                   <button
                     class="book-cover"
-                    on:click={() => (selectMode ? toggleSelect(book.id) : onOpen(book.id))}
+                    on:click={() => (selectMode ? toggleSelect(book.id) : openBook(book.id))}
                   >
                     {#if coverUrls[book.id]}
                       <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
@@ -2132,6 +2204,9 @@
                       <span class="book-cover-text">{book.title.slice(0, 2)}</span>
                     {/if}
                   </button>
+                  {#if missingIds.has(book.id)}
+                    <span class="book-missing-badge" title={t("文件已丢失，点此重新导入")}>{t("文件丢失")}</span>
+                  {/if}
                   {#if selectMode}
                     <button
                       class="book-sel"
@@ -2166,12 +2241,12 @@
                   <div
                     class="book-cover-overlay"
                     aria-hidden="true"
-                    on:click={() => onOpen(book.id)}
+                    on:click={() => openBook(book.id)}
                   >
                     <button
                       class="book-overlay-primary"
                       title={book.progress?.fraction ? t("继续阅读") : t("开始阅读")}
-                      on:click|stopPropagation={() => onOpen(book.id)}
+                      on:click|stopPropagation={() => openBook(book.id)}
                     >
                       {book.progress?.fraction ? t("续读") : t("开始")}
                     </button>
@@ -2266,7 +2341,7 @@
                 </div>
                 <!-- 第 2 列「书名」：小封面 + 标题行 + 副行（分组/大小/标签） -->
                 <div class="row-title-line">
-                  <button class="row-cover" title={book.title} on:click={() => onOpen(book.id)}>
+                  <button class="row-cover" title={book.title} on:click={() => openBook(book.id)}>
                     {#if coverUrls[book.id]}
                       <img class="book-cover-img" draggable="false" loading="lazy" decoding="async" src={coverUrls[book.id]} alt={book.title} />
                     {:else}
@@ -2276,6 +2351,9 @@
                   <div class="row-titlecol">
                     <div class="row-title-row">
                       <span class="row-title" title={book.title}>{book.title}</span>
+                      {#if missingIds.has(book.id)}
+                        <span class="row-missing-chip" title={t("文件已丢失，点此重新导入")}>{t("文件丢失")}</span>
+                      {/if}
                       <button
                         class="row-status-chip"
                         class:reading={(book.status ?? "unread") === "reading"}
@@ -2323,7 +2401,7 @@
                 <!-- 缺「最近阅读」显示 —，不退化成「添加时间」也不显示 0 -->
                 <span class="row-lastread">{fmtDate(book.lastReadAt) || "—"}</span>
                 <div class="row-actions">
-                  <button class="row-btn primary" on:click={() => onOpen(book.id)}>
+                  <button class="row-btn primary" on:click={() => openBook(book.id)}>
                     {book.progress?.fraction ? t("续读") : t("开始")}
                   </button>
                   <div class="row-actions-extra" aria-hidden="true">
@@ -2364,6 +2442,33 @@
     </div>
   {/if}
 
+  {#if refDialogOpen}
+    <div class="edit-mask" on:click|self={() => !refBusy && (refDialogOpen = false)}>
+      <div class="edit-panel ref-panel">
+        <div class="edit-title">{t("引用导入")}</div>
+        <div class="ref-hint">
+          {t("书留在原处，书架只记引用，不复制文件。支持思源资源 assets/…、/data/public/…、http 或 https 直链。")}
+        </div>
+        <!-- svelte-ignore a11y-autofocus -->
+        <input
+          class="ref-input"
+          bind:value={refInput}
+          autofocus
+          disabled={refBusy}
+          placeholder={t("assets/books/书名.epub 或 https 链接")}
+          on:keydown={(e) => e.key === "Enter" && submitRefImport()}
+        />
+        {#if refError}<div class="ref-error">{refError}</div>{/if}
+        <div class="edit-actions">
+          <button class="bookshelf-import-btn" disabled={refBusy} on:click={submitRefImport}>
+            {refBusy ? t("读取中…") : t("引用")}
+          </button>
+          <button class="import-fail-close" disabled={refBusy} on:click={() => (refDialogOpen = false)}>{t("取消")}</button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   {#if removeTarget}
     <div class="edit-mask" on:click|self={() => (removeTarget = null)}>
       <div class="edit-panel">
@@ -2371,7 +2476,9 @@
         <div class="remove-desc">{t("确定将《{title}》从书架移除？", { title: removeTarget.title })}</div>
         <label class="remove-check">
           <input type="checkbox" bind:checked={removeWithFile} />
-          <span>{t("同时删除插件目录中的源文件（不可恢复）")}</span>
+          <span>{removeTarget.src
+            ? t("同时删除封面（引用的源文件不会被删除）")
+            : t("同时删除插件目录中的源文件（不可恢复）")}</span>
         </label>
         <div class="edit-actions">
           <button class="bookshelf-import-btn remove-danger" on:click={confirmRemove}>{t("移除")}</button>
@@ -3339,6 +3446,34 @@
     font-size: 13px;
     color: var(--b3-theme-on-background, #333);
   }
+  /* 2026-11-25 C 期：引用导入弹窗（书留在原处，只记指针） */
+  .ref-hint {
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--b3-theme-on-surface-light, #888);
+    margin: 2px 0 10px;
+  }
+  .ref-input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 7px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--b3-border-color, rgba(0, 0, 0, 0.15));
+    background: var(--b3-theme-surface, #fff);
+    color: var(--b3-theme-on-surface, #333);
+    font-size: 13px;
+  }
+  .ref-input:focus {
+    outline: none;
+    border-color: var(--b3-theme-primary, #4285f4);
+  }
+  .ref-error {
+    margin-top: 8px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--b3-theme-error, #e24b4a);
+    word-break: break-all;
+  }
   .remove-check {
     display: flex;
     align-items: center;
@@ -3414,6 +3549,40 @@
   }
   .shelf-swatch-clear:hover {
     background: var(--b3-list-hover, rgba(0, 0, 0, 0.05));
+  }
+
+  /* ---- 文件丢失标记（更新/覆盖安装后旧书可能落空） ---- */
+  .book-missing-badge {
+    position: absolute;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: calc(100% - 16px);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    line-height: 16px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    color: #fff;
+    background: var(--b3-theme-error, #d23f31);
+    z-index: 3;
+    pointer-events: none;
+  }
+  .book-card.missing .book-cover-img {
+    opacity: 0.45;
+    filter: grayscale(0.6);
+  }
+  .row-missing-chip {
+    flex: none;
+    padding: 0 5px;
+    border-radius: 4px;
+    font-size: 11px;
+    line-height: 16px;
+    color: #fff;
+    background: var(--b3-theme-error, #d23f31);
+    cursor: default;
   }
 
   /* ---- 网格卡片色点(左下) ---- */
@@ -4045,6 +4214,11 @@
   .bookshelf-view.re-phone .bookshelf-header .bookshelf-import-btn,
   .bookshelf-view.re-large-phone .bookshelf-header .bookshelf-import-btn {
     display: none;
+  }
+  /* 引用按钮与导入按钮同档：手机上一并收进 ⋯（它同时带 .bookshelf-import-btn，
+     上面那条已覆盖；这里显式写一遍，防以后有人把 class 换掉） */
+  .shelf-hdr-ref {
+    white-space: nowrap;
   }
   /* 2026-11-19 P2-15：手机档把搜索下限压到 100、排序上限压到 88。
      ⚠️ 2026-11-23 更正：这条**只在 421–480 真能放下一行**（480 时合计 ≈372）。

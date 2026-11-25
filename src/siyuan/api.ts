@@ -654,11 +654,24 @@ export const getFileBlob = async (path: string): Promise<Blob | null> => {
 }
 
 
+/**
+ * 当前前端实例的 appId。
+ *
+ * 写 `data/storage/petal/<plugin>/` 会触发内核 push_reload，不带 app 时连发起方
+ * 自己也会被重载（siyuan-note/siyuan#19187）。带上它，内核 excludeApp 只通知
+ * 其他前端。取不到（非思源环境/测试）时返回空串，等价于旧行为。
+ */
+function frontendAppId(): string {
+    return String((globalThis as any)?.siyuan?.appId ?? "");
+}
+
 export async function putFile(path: string, isDir: boolean, file: any) {
     let form = new FormData();
     form.append('path', path);
     form.append('isDir', isDir.toString());
     form.append('file', file);
+    const app = frontendAppId();
+    if (app) form.append('app', app);
 
     // 使用 fetch 直接发送 FormData，避免 fetchSyncPost 可能的 JSON 处理问题
     try {
@@ -679,11 +692,19 @@ export async function putFile(path: string, isDir: boolean, file: any) {
 }
 
 export async function removeFile(path: string) {
-    let data = {
+    let data: Record<string, any> = {
         path: path
     }
+    const app = frontendAppId();
+    if (app) data.app = app;
     let url = '/api/file/removeFile';
     return request(url, data);
+}
+
+/** 工作空间内移动/改名；失败（如跨盘）返回 false，调用方自行退化为读+写 */
+export async function renameFile(path: string, newPath: string): Promise<boolean> {
+    const res: any = await request('/api/file/renameFile', { path, newPath }, 'response');
+    return res?.code === 0;
 }
 
 export async function removeSkill(name: string) {

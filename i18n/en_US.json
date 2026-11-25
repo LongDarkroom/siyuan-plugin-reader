@@ -2100,6 +2100,9 @@
   "跳转路径（点击层级回跳）": "Jump path (click a level to go back)",
   "跳过已缓存": "Skip cached",
   "跳过重复 {n} 本": "Skipped {n} duplicates",
+  "文件丢失": "File missing",
+  "文件已丢失，点此重新导入": "File missing — click to re-import",
+  "书籍文件已丢失，选择原文件重新导入即可恢复阅读进度": "The book file is missing. Re-import the original file to restore your reading progress.",
   "输入": "Input",
   "输入 tokens": "Input tokens",
   "输入关键词搜索，留空显示当前文档": "Type keywords to search; leave empty for the current document",
@@ -3388,5 +3391,13 @@
   "没有匹配的生词": "No matching words",
   "换个关键词，或切到「全部」。": "Try another keyword, or switch to All.",
   "已移出「{word}」": "Removed “{word}”",
-  "生词本不内置复习队列；需要复习时导出到 Anki / 思源": "Vocabulary has no built-in review queue; export to Anki / SiYuan when you need to review."
+  "生词本不内置复习队列；需要复习时导出到 Anki / 思源": "Vocabulary has no built-in review queue; export to Anki / SiYuan when you need to review.",
+  "引用导入": "Import by reference",
+  "引用导入…": "Import by reference…",
+  "引用": "Reference",
+  "引用导入：书留在原处，不复制文件": "Import by reference: the book stays where it is, no copy is made",
+  "书留在原处，书架只记引用，不复制文件。支持思源资源 assets/…、/data/public/…、http 或 https 直链。": "The book stays where it is; the shelf only stores a pointer. Supports SiYuan assets (assets/…), /data/public/…, and http/https links.",
+  "assets/books/书名.epub 或 https 链接": "assets/books/name.epub or an https link",
+  "该书源已在书架上": "This source is already on the shelf",
+  "已引用《{title}》": "Referenced “{title}”"
 }

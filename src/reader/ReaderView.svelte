@@ -15094,6 +15094,14 @@ import { getLogger } from "../core/logger.ts";
     cancelPendingClose(); // pendingCloseRaf：收起动画的到点帧
     detachBookTransform(); // 书内资源 "data" 钩子（换书后旧 target 上的监听）
     revokeHostFontBlobs(); // 宿主字体 blob URL（不 revoke 会常驻进程内存）
+    // 2026-11-25 内存水位：关书即释放该书的文件缓存。
+    // 此前 fileCache 只删书/重导入时清，关页签不清 ⇒ 读得越多水位越高（桌面封顶 320 MB），
+    // 是「打开多本大书后内存不回落」的主因。重开时重读一次磁盘即可。
+    try {
+      store?.releaseFileCache?.(bookId);
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "ReaderView.svelte · onDestroy releaseFileCache", "debug");
+    }
     if (timeTimer) clearInterval(timeTimer);
     if (attachTimer1) clearTimeout(attachTimer1);
     if (attachTimer2) clearTimeout(attachTimer2);
