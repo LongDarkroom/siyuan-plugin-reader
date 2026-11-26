@@ -23,6 +23,7 @@ import {
   parseBookRef, bookRefUrl, bookRefExt, bookRefName, bookRefKey, isSupportedRef,
 } from "./book-ref.ts";
 import { loadRefBlob } from "./book-ref-load.ts";
+import { listDirNames } from "./file-probe.ts";
 
 /*
  * 类型与常量已原位抽取到 library/ 层（library-types.ts / library-persist.ts），
@@ -291,39 +292,19 @@ export class BookshelfStore {
     }
   }
 
-  /** 目录内文件清单；目录不存在返回空集；无法判断返回 null */
+  /**
+   * 目录内文件清单；目录不存在返回空集；无法判断返回 null。
+   * 底层只读目录（file-probe.ts，字体那边共用），缓存留在这一层：
+   * 书架一次要探几十本，同一目录重复问内核没有意义。
+   */
   private async listFiles(dir: string, fresh = false): Promise<Set<string> | null> {
     if (!fresh) {
       const hit = this.dirCache.get(dir);
       if (hit) return hit;
     }
-    try {
-      const res = await fetch("/api/file/readDir", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: dir }),
-      });
-      if (res.status === 404) {
-        this.dirCache.set(dir, new Set());
-        return new Set();
-      }
-      if (!res.ok) return null;
-      const json = await res.json().catch(() => null);
-      if (json?.code === 0 && Array.isArray(json.data)) {
-        const names = new Set<string>(
-          json.data.filter((x: any) => x && !x.isDir).map((x: any) => String(x.name))
-        );
-        this.dirCache.set(dir, names);
-        return names;
-      }
-      if (json?.code === 404) {
-        this.dirCache.set(dir, new Set());
-        return new Set();
-      }
-      return null;
-    } catch {
-      return null;
-    }
+    const names = await listDirNames(dir);
+    if (names) this.dirCache.set(dir, names);
+    return names;
   }
 
   /** 文件是否在位：true 在 / false 不在 / null 无法判断 */

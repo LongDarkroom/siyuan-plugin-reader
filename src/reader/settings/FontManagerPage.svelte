@@ -26,9 +26,12 @@
 
   - fontStore 缺失（宿主未注入 / 单测）→ 降级为只读提示，不崩。
   - 删除正被使用的字体 → 由宿主决定回落，本页只负责触发并刷新列表。
+  - 字体文件存在**插件数据目录**（petal，2026-11-26 起）：商店更新整目录替换
+    插件目录，放那里会「文件被删、注册表还在」。文件真丢了时 FontStore 会探测
+    出来并推 `missing`，本页把条目标成「文件缺失」、「使用」置灰。
 -->
 <script lang="ts">
-  import { createEventDispatcher, onMount } from "svelte";
+  import { createEventDispatcher, onMount, onDestroy } from "svelte";
   import { t } from "../../i18n/index.ts";
   import { getLogger } from "../../core/logger.ts";
 
@@ -53,6 +56,9 @@
 
   /** 当前正在使用的字体 id（settings 里读；容错为 null） */
   $: activeId = (settings && typeof settings === "object" ? settings.customFontId : "") || "";
+  /** 文件已确认丢失的字体 id（FontStore 探测；迁移不来/被清理时会出现） */
+  let missingIds: Set<string> = new Set();
+  let unsubMissing: (() => void) | null = null;
 
   /** 字体格式化：ttf/otf/woff/woff2 + 可选字重 + 大小 */
   function metaOf(f: any): string {
@@ -81,6 +87,22 @@
 
   onMount(() => {
     void refresh();
+    // 缺失状态由 FontStore 在加载后探测并推送（读不到文件 → 这里标「文件缺失」），
+    // 页面不自己发探测请求：字体清单很短，但探测要走内核 readDir，没必要重复。
+    const sub = fontStore?.missing;
+    if (sub && typeof sub.subscribe === "function") {
+      unsubMissing = sub.subscribe((set: any) => {
+        missingIds = set instanceof Set ? set : new Set();
+      });
+    }
+  });
+
+  onDestroy(() => {
+    try {
+      unsubMissing?.();
+    } catch {
+      /* 退订失败不影响页面销毁 */
+    }
   });
 
   function say(msg: string, isErr = false) {
@@ -166,7 +188,7 @@
     const wasActive = f.id === activeId;
     if (
       !window.confirm(
-        t("确定删除字体「{name}」？\n（同时会删除插件目录下的字体文件，不可撤销）").replace(
+        t("确定删除字体「{name}」？\n（同时会删除插件数据目录里的字体文件，不可撤销）").replace(
           "{name}",
           f.name || f.id,
         ),
@@ -204,10 +226,20 @@
             选中态 = customFontId 指向本条（settings 是唯一真源，
             不用组件内局部 state —— 否则会出现「界面选了、正文没变」）。
           -->
-          <li class="rwd-dict-item" class:on={f.id === activeId}>
+          <li
+            class="rwd-dict-item"
+            class:on={f.id === activeId}
+            class:missing={missingIds.has(f.id)}
+          >
             <div class="rwd-dict-info">
               <span class="rwd-dict-name">{f.name || f.id}</span>
               <span class="rwd-dict-tags">
+                {#if missingIds.has(f.id)}
+                  <span
+                    class="rwd-dict-tag rwd-dict-tag-warn"
+                    title={t("字体文件已丢失，重新导入同一个文件即可恢复")}
+                  >{t("文件缺失")}</span>
+                {/if}
                 {#if f.family && f.family !== f.name}
                   <span class="rwd-dict-tag">{f.family}</span>
                 {/if}
@@ -219,7 +251,13 @@
               {#if f.id === activeId}
                 <span class="rwd-dict-tag rwd-dict-tag-on">{t("使用中")}</span>
               {:else}
-                <button type="button" class="rwd-dict-btn" on:click={() => pick(f.id)}>
+                <button
+                  type="button"
+                  class="rwd-dict-btn"
+                  disabled={missingIds.has(f.id)}
+                  title={missingIds.has(f.id) ? t("文件已丢失，请先重新导入") : ""}
+                  on:click={() => pick(f.id)}
+                >
                   {t("使用")}
                 </button>
               {/if}

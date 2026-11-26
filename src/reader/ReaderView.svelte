@@ -233,7 +233,7 @@ import { getLogger } from "../core/logger.ts";
   } from "../ai/ai-settings";
   // 2026-08-28：连续朗读控制器（参考 Readest：多引擎 system/youdao/edge + 句子高亮 + 控制条）
   import { ReaderTtsController, DEFAULT_REWORD_TTS, type RewordTtsSettings, type TtsState } from "./reader-tts";
-  import { getFileBlob, putFile, removeFile } from "../siyuan/api";
+  import { putFile, removeFile } from "../siyuan/api";
   // 2026-11-17：PDF 整本翻译 → 双语对照 PDF（静态 import：catch 块里要用 PdfTranslateError）
   import { runPdfBilingualTranslate, PdfTranslateError } from "./pdf-translate-pipeline.ts";
   // 2026-09-09 P1：矩形框选标注默认色
@@ -7526,10 +7526,15 @@ import { getLogger } from "../core/logger.ts";
 
   async function loadFontBlob(f: CustomFont) {
     try {
-      const blob = await getFileBlob(f.path);
+      // 经 store 取：读不到会把该字体标成「文件缺失」（设置页据此提示重导），
+      // 这里则退回字体链，正文照常排版 —— 不让一个死掉的 @font-face 卡住阅读。
+      const blob = await fontStore.getBlob(f);
       if (blob) {
         if (fontBlobUrl) URL.revokeObjectURL(fontBlobUrl);
         fontBlobUrl = URL.createObjectURL(blob);
+      } else {
+        if (fontBlobUrl) URL.revokeObjectURL(fontBlobUrl);
+        fontBlobUrl = "";
       }
     } catch (__swallowErr) { logSwallow(__swallowErr, "ReaderView.svelte · loadFontBlob", "debug"); }
   }

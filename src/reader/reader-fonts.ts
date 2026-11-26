@@ -6,12 +6,18 @@ import { logSwallow } from "../core/safe.ts";
  * 1. 「跟随思源」：扫描宿主页面的 @font-face（CSSFontFaceRule，src 转绝对 URL）
  *    + 取 document.body 计算后的字体栈，一并注入阅读器 iframe；
  *    思源主题/字体插件换字体，阅读器自动跟随。
- * 2. 「自定义导入」：用户上传 ttf/otf/woff/woff2，存 /data/plugins/<name>/fonts/，
+ * 2. 「自定义导入」：用户上传 ttf/otf/woff/woff2，存 /data/storage/petal/<name>/fonts/，
  *    注册表持久化 hiword-reader-fonts.json；生成 @font-face 注入。
+ *
+ * 2026-11-26：字体文件此前存在 /data/plugins/<name>/fonts/ —— 商店更新会整目录
+ * 替换插件目录，字体文件被删而注册表（loadData 本来就落在 petal）还在，界面上
+ * 就剩一排永远加载不出来的名字。现在与书库同一套：petal 存放 + 首次加载迁移 +
+ * 迁移标记 + 缺失可见。
  */
 
-import { putFile, getFileBlob, removeFile } from "../siyuan/api";
+import { putFile, getFileBlob, removeFile, renameFile } from "../siyuan/api";
 import { writable } from "svelte/store";
+import { probeFile } from "./file-probe.ts";
 
 export interface CustomFont {
   id: string;
@@ -34,13 +40,23 @@ export interface CustomFont {
 }
 
 const FONTS_KEY = "hiword-reader-fonts.json";
-const FONTS_DIR = (pluginName: string) => `/data/plugins/${pluginName}/fonts`;
+/** 字体文件落点：插件数据目录（不被商店更新整目录替换） */
+const FONTS_DIR = (pluginName: string) => `/data/storage/petal/${pluginName}/fonts`;
+/** 旧版存放位置（安装目录内，仅用于一次性迁移） */
+const LEGACY_FONTS_DIR = (pluginName: string) => `/data/plugins/${pluginName}/fonts`;
+/** 迁移标记（纯排障：跑过没、搬了几个、几个字节、失败几个） */
+const FONT_MIGRATION_KEY = "font-storage-migration.json";
 
 export class FontStore {
   private fonts: CustomFont[] = [];
   private loaded = false;
   /** 内部 Svelte store：让消费者可订阅字体列表变化（导入/删除后自动刷新） */
   private _store = writable<CustomFont[]>([]);
+  /** 文件已确认丢失的字体 id（设置页据此标「文件缺失」并要求重新导入） */
+  private missingSet = new Set<string>();
+  private _missing = writable<Set<string>>(new Set());
+  /** 迁移/探测只跑一次（load 会被设置页、ReaderView 多处调用） */
+  private afterLoadStarted = false;
   // 显式字段声明（避免 constructor parameter property，Node 24 strip-types 不支持）
   private plugin: any;
 
@@ -55,6 +71,15 @@ export class FontStore {
 
   get list(): CustomFont[] {
     return [...this.fonts].sort((a, b) => b.addedAt - a.addedAt);
+  }
+
+  /** 文件缺失集合（只读订阅） */
+  get missing() {
+    return this._missing;
+  }
+
+  isMissing(id: string): boolean {
+    return this.missingSet.has(id);
   }
 
   /** 插件名（内置字体要把 `assets/fonts/*` 拼成 `/plugins/<name>/...` 取回） */
@@ -79,6 +104,26 @@ export class FontStore {
     }
     this.loaded = true;
     this._store.set([...this.fonts]);
+    // 迁移旧目录 + 探测缺失：都是磁盘往返，放后台，不拖慢启动与设置页首屏
+    if (!this.afterLoadStarted) {
+      this.afterLoadStarted = true;
+      void this.afterLoad();
+    }
+  }
+
+  private async afterLoad(): Promise<void> {
+    // Node 测试环境没有思源的文件 API，跳过所有磁盘探测（用例自行调用）
+    if (typeof document === "undefined") return;
+    try {
+      await this.migrateLegacyFonts();
+    } catch (e) {
+      logSwallow(e, "reader-fonts.ts · migrateLegacyFonts", "warn");
+    }
+    try {
+      await this.refreshMissing();
+    } catch (e) {
+      logSwallow(e, "reader-fonts.ts · refreshMissing", "warn");
+    }
   }
 
   private async save(): Promise<void> {
@@ -89,6 +134,144 @@ export class FontStore {
     }
   }
 
+  /**
+   * 一次性把旧目录（/data/plugins/<name>/fonts）里的字体搬到 petal。
+   *
+   * 与书库迁移同一套规则，理由也相同：
+   *  - 目标目录必须先建：内核 renameFile 不会替我们建父目录；
+   *  - 优先 rename（同盘秒级、不读文件内容），失败再退化为「读成 Blob 再上传」；
+   *  - 幂等可断点续跑：目标已在就只改注册表，索引只写一次；
+   *  - 迁移结果写 font-storage-migration.json，出问题不用靠猜。
+   *
+   * ⚠️ 已经装过旧版、且商店更新把旧目录清掉的用户，这一步搬不到任何东西 ——
+   * 文件在安装时就被删了。那种情况由 refreshMissing 标成「文件缺失」，
+   * 让用户重新导入，而不是留一个点不动又看不出原因的名字。
+   */
+  private async migrateLegacyFonts(): Promise<void> {
+    const legacyPrefix = `${LEGACY_FONTS_DIR(this.plugin.name)}/`;
+    const dir = FONTS_DIR(this.plugin.name);
+    const pending = this.fonts.filter((f) => f.path?.startsWith(legacyPrefix));
+    if (!pending.length) return;
+
+    await putFile(dir, true, null);
+
+    const stat = { fonts: 0, bytes: 0, renamed: 0, copied: 0, failed: 0 };
+    let changed = false;
+    for (const font of pending) {
+      try {
+        const oldPath = font.path;
+        const name = oldPath.slice(legacyPrefix.length);
+        const dest = `${dir}/${name}`;
+        const destState = await probeFile(dest);
+        if (destState === null) continue; // 目录读不出来：别改注册表，下次再试
+        let viaCopy = false;
+        if (!destState) {
+          if (await renameFile(oldPath, dest)) {
+            stat.renamed++;
+          } else {
+            const blob = await getFileBlob(oldPath);
+            if (!blob) {
+              // rename 与旧文件都读不到：保留原路径，交给 refreshMissing 标缺失
+              stat.failed++;
+              continue;
+            }
+            if (!(await putFile(dest, false, blob))) {
+              stat.failed++;
+              continue;
+            }
+            stat.copied++;
+            viaCopy = true;
+          }
+        }
+        font.path = dest;
+        stat.fonts++;
+        stat.bytes += font.size || 0;
+        changed = true;
+        // rename 成功后旧路径已不存在；这一步只兜底清掉「复制」路径留下的原件
+        if (viaCopy) {
+          try {
+            await removeFile(oldPath);
+          } catch (__swallowErr) {
+            logSwallow(__swallowErr, "reader-fonts.ts · migrate rmOld", "debug");
+          }
+        }
+      } catch (e) {
+        stat.failed++;
+        logSwallow(e, `reader-fonts.ts · migrate ${font.id}`, "warn");
+      }
+    }
+    if (!changed) return;
+    await this.save();
+    this._store.set([...this.fonts]);
+    await this.writeMigrationMarker(stat);
+  }
+
+  /** 迁移标记（诊断用，保留最近 10 次）；与注册表分开，避免污染用户数据 */
+  private async writeMigrationMarker(stat: {
+    fonts: number; bytes: number; renamed: number; copied: number; failed: number;
+  }): Promise<void> {
+    const path = `/data/storage/petal/${this.plugin.name}/${FONT_MIGRATION_KEY}`;
+    try {
+      const prevBlob = await getFileBlob(path);
+      let runs: unknown[] = [];
+      if (prevBlob) {
+        // 标记文件被人手改坏也不该让整次迁移「无记录」：解析失败就从空历史开始
+        try {
+          const prev = JSON.parse(await prevBlob.text());
+          if (Array.isArray(prev?.runs)) runs = prev.runs;
+        } catch {
+          runs = [];
+        }
+      }
+      runs.push({
+        at: Date.now(),
+        from: LEGACY_FONTS_DIR(this.plugin.name),
+        to: FONTS_DIR(this.plugin.name),
+        ...stat,
+      });
+      const body = JSON.stringify({ v: 1, runs: runs.slice(-10) }, null, 2);
+      await putFile(path, false, new Blob([body], { type: "application/json" }));
+    } catch (e) {
+      logSwallow(e, "reader-fonts.ts · writeMigrationMarker", "debug");
+    }
+  }
+
+  /** 重新探测所有字体文件是否在位（加载后一次；导入/删除后局部刷新） */
+  async refreshMissing(): Promise<void> {
+    if (typeof document === "undefined") return;
+    const next = new Set<string>();
+    for (const f of this.fonts) {
+      if ((await probeFile(f.path)) === false) next.add(f.id);
+    }
+    const changed =
+      next.size !== this.missingSet.size || [...next].some((id) => !this.missingSet.has(id));
+    this.missingSet = next;
+    if (changed) this._missing.set(new Set(next));
+  }
+
+  private setMissing(id: string, missing: boolean): void {
+    if (this.missingSet.has(id) === missing) return;
+    if (missing) this.missingSet.add(id);
+    else this.missingSet.delete(id);
+    this._missing.set(new Set(this.missingSet));
+  }
+
+  /**
+   * 取字体文件内容（@font-face 用）。
+   * 读不到就标缺失并返回 null —— 调用方（ReaderView）此时会退回字体链，
+   * 正文继续按可用的字体排版，不会因为一个死掉的 @font-face 卡住。
+   */
+  async getBlob(font: CustomFont): Promise<Blob | null> {
+    let blob: Blob | null = null;
+    try {
+      blob = await getFileBlob(font.path);
+    } catch (e) {
+      logSwallow(e, "reader-fonts.ts · getBlob", "warn");
+    }
+    this.setMissing(font.id, !blob);
+    return blob;
+  }
+
   /** 导入自定义字体文件 */
   async importFont(file: File): Promise<CustomFont> {
     await this.load();
@@ -97,7 +280,14 @@ export class FontStore {
       throw new Error("仅支持 ttf / otf / woff / woff2 字体文件");
     }
     const id = `f${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`;
-    const path = `${FONTS_DIR(this.plugin.name)}/${id}.${ext}`;
+    const dir = FONTS_DIR(this.pluginName);
+    const path = `${dir}/${id}.${ext}`;
+    // 目标目录先就位：putFile 不会替我们建父目录
+    try {
+      await putFile(dir, true, null);
+    } catch (__swallowErr) {
+      logSwallow(__swallowErr, "reader-fonts.ts · importFont mkdir", "debug");
+    }
     const ok = await putFile(path, false, file);
     if (!ok) throw new Error("字体文件上传失败");
     // 2026-09-29 P1：解析字体二进制元数据（真实族名/字重/斜体/可变轴），
@@ -138,6 +328,7 @@ export class FontStore {
         await removeFile(font.path);
       } catch (__swallowErr) { logSwallow(__swallowErr, "reader-fonts.ts · removeFont", "warn"); }
       this.fonts = this.fonts.filter((f) => f.id !== id);
+      this.setMissing(id, false);
       await this.save();
       this._store.set([...this.fonts]);
     }

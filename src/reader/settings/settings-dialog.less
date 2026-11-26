@@ -1478,6 +1478,22 @@ body.re-w720 {
 }
 .rwd-dict-tag-on { background: var(--b3-theme-primary, #5b7cfa); color: #fff; }
 
+/* 文件缺失态（2026-11-26）：字体文件没搬过来、或被清理掉时，条目灰掉 +
+   红色标签，「使用」同时 disabled。选一个读不出来的字体只会静默回落到
+   字体链 —— 看起来「选了没反应」，不如在列表里直说。 */
+.rwd-dict-item.missing .rwd-dict-name {
+  color: var(--b3-theme-on-surface-light, #9a9aa0);
+}
+.rwd-dict-tag-warn {
+  background: rgba(229, 100, 110, 0.16);
+  color: #e5646e;
+}
+.rwd-dict-btn[disabled] {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.rwd-dict-btn[disabled]:hover { background: rgba(255, 255, 255, 0.05); }
+
 /*
  * 语种标签做成按钮（2026-10-07）：导入时语种只能按文件名正则猜
  * （「新世纪英汉大词典」含「英」→ 被猜成 en，但它其实中英都能查），
