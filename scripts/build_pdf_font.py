@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """构建 PDF 用的 TrueType 字体（2026-11-17，双语对照 PDF 导出）。
 
-产物（随插件分发，见 assets/fonts/）：
+产物：
     REwordSerifSC-PDF.ttf     思源宋体 → TrueType(glyf) 轮廓、pin wght=400
+
+⚠️ 2026-11-26 起**不再随安装包分发**：文件留在仓库 assets/fonts/ 里（打包脚本
+make_release.py 的 EXCLUDE_FILES 排除），运行时首次导出时从 CDN 下载并缓存到
+data/public/<插件>/fonts/。改了字体重新生成后，记得让新文件进仓库 + 新 tag。
 
 ## 为什么需要单独一个 TTF
 生成 PDF 时字体必须嵌进 PDF。pdf-lib + fontkit 对**输入格式**有硬要求：

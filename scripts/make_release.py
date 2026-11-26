@@ -5,10 +5,12 @@
   - zip 解压后必须【直接】是插件根文件，不能有外层父目录。
   - 必需：plugin.json, index.js, index.css, icon.png, 预览图（plugin.json 的 preview 字段，≤512KB）, README.md, i18n/（多语言时）。
   - 体积建议 < 10MB：词典(dict/，约 64MB) 与废弃 sql.js 资源不随包，运行时按需下载。
-    当前实际约 9MB：主包 index.js 之外，cmaps/(1.6M) + standard_fonts/(800K)
+    当前实际约 8MB：主包 index.js 之外，cmaps/(1.6M) + standard_fonts/(800K)
     为 PDF CJK 渲染必需；assets/fonts/ 内置中文字体子集共 4.3MB
     （思源宋体 2.36MB + 思源黑体 1.95MB，构建见 scripts/build_builtin_fonts.py）
     —— 删掉它们，中文字体就会退回「23 个选项却是同一种观感」的旧状态。
+    [2026-11-26] PDF 导出用的 TrueType 字体（5.27MB）改成首次导出时下载，见
+    EXCLUDE_FILES；仓库里保留，CDN 从仓库取。
 
 用法：先 `npm run build`，再 `python scripts/make_release.py`（或 `npm run make`）。
 产物：仓库根目录 package.zip
@@ -98,6 +100,14 @@ EXCLUDE = {
     "package.zip",
 }
 
+# 一律排除的【具体文件】（按包内相对路径匹配，正斜杠）
+EXCLUDE_FILES = {
+    # 2026-11-26：5.27MB 的 PDF 导出字体。只有「PDF 整本翻译 → 导出双语 PDF」用到，
+    # 绝大多数用户一次都不会触发；包里不带，首次导出时下载并缓存到
+    # data/public/<插件>/fonts/（src/reader/pdf-font.ts）。仓库里保留，CDN 按 tag 取。
+    "assets/fonts/REwordSerifSC-PDF.ttf",
+}
+
 
 def is_backup(name: str) -> bool:
     """本地历史快照（*.bak*），一律不进发布包。
@@ -130,6 +140,8 @@ def collect_paths():
                     continue
                 fp = os.path.join(cur, f)
                 arc = os.path.relpath(fp, ROOT)
+                if arc.replace(os.sep, "/") in EXCLUDE_FILES:
+                    continue
                 paths.append((fp, arc))
     return paths
 

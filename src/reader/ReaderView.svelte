@@ -497,8 +497,12 @@ import { getLogger } from "../core/logger.ts";
    * 2026-11-17：取 PDF 用中文字体字节（TrueType/glyf）。
    * ⚠️ 必须是 glyf 轮廓的 TTF——pdf-lib 遇到 CFF 会嵌成 CIDFontType0，
    *    Chrome 画不出来（文本能提取但页面空白）。
+   * 2026-11-26：字体不再随包分发，首次调用可能触发一次下载（约 5MB），
+   *   此时会回调 `onDownload` 让界面给个「正在下载」的提示；命中缓存不回调。
    */
-  export let onGetPdfFont: (() => Promise<Uint8Array | null>) | undefined = undefined;
+  export let onGetPdfFont:
+    | ((opts?: { onDownload?: () => void }) => Promise<Uint8Array | null>)
+    | undefined = undefined;
   /** 2026-08-30 详细翻译（回传 provider/fromCache），供成本与引擎统计；未提供时回落 onTranslateBatch
    *  2026-08-30 修复：ctxBefore/meta 透传（语义同 onTranslateBatch） */
   export let onTranslateBatchDetailed:
@@ -13822,9 +13826,20 @@ import { getLogger } from "../core/logger.ts";
       toast(t("读不到 PDF 文件"), 2600, "error");
       return;
     }
-    const fontBytes = onGetPdfFont ? await onGetPdfFont() : null;
+    // 中文字体不随包分发（5.27MB，只有 PDF 翻译用得上）：首次导出时下载一次并缓存。
+    // 下载可能几秒到几十秒，先给提示，否则用户只看到「翻译中」不动会以为卡死。
+    const fontBytes = onGetPdfFont
+      ? await onGetPdfFont({
+          onDownload: () =>
+            toast(t("首次导出需下载 PDF 中文字体（约 5 MB），完成前请勿关闭页面"), 8000, "info"),
+        })
+      : null;
     if (!fontBytes) {
-      toast(t("缺少 PDF 中文字体，无法生成译文页"), 3200, "error");
+      toast(
+        t("PDF 中文字体下载失败：请检查网络后重试（离线环境可手动放入插件数据目录 fonts/）"),
+        5200,
+        "error",
+      );
       return;
     }
 
