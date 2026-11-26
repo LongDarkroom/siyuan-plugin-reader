@@ -163,6 +163,8 @@ export class DictManager {
    * null = 未知/磁盘内容与内存不一致 → 下一次 saveManifest 照常写。
    */
   private lastSavedKey: string | null = null;
+  /** 旧目录→public 的迁移只尝试一次（loadManifest/init 都可能触发） */
+  private dictMigrationDone = false;
 
   constructor(private plugin: any) {}
 
@@ -171,10 +173,41 @@ export class DictManager {
     return this.ready;
   }
 
-  /** 插件内 dict/ 目录绝对路径；取不到返回 null */
+  /**
+   * 词典目录绝对路径：`<工作区>/data/public/<插件名>/dict`。
+   *
+   * 为什么不再放 `plugins/<name>/dict`：商店更新会整目录替换插件目录，
+   * 用户导入的词典每次更新都被删（发布包还显式排除 dict/）。
+   * 为什么不是 petal：思源 v3.1.8 起写 petal 会广播插件重载（push_reload.go），
+   * 且 petal 参与云端同步，上百 MB 词典会把同步打爆。public 不触发重载、不进同步。
+   */
   private dictDir(): string | null {
-    // resolvePluginPathWithFs 接收「运行时环境快照」而非插件实例（便于单测注入），
-    // 构造方式对齐主插件 index.ts 的 resolvePluginPath()。
+    const ws = this.workspaceRoot();
+    if (ws) return path.join(ws, "data", "public", PLUGIN_NAME, "dict");
+    // 回退：插件根是 <ws>/data/plugins/<name>，往上两级即 data/
+    const root = this.pluginRoot();
+    if (!root) return null;
+    return path.join(path.dirname(path.dirname(root)), "public", PLUGIN_NAME, "dict");
+  }
+
+  /** 旧落点：插件安装目录内（仅迁移/回退用） */
+  private legacyDictDir(): string | null {
+    const root = this.pluginRoot();
+    return root ? path.join(root, "dict") : null;
+  }
+
+  /** 工作区根（思源运行时注入；取不到返回空串） */
+  private workspaceRoot(): string {
+    try {
+      const sys = (globalThis as any)?.window?.siyuan?.config?.system;
+      const ws: string | undefined = sys?.workspaceDir;
+      if (ws && !/app\.asar/i.test(ws)) return ws;
+    } catch { /* 沙箱/单测拿不到 window.siyuan */ }
+    return "";
+  }
+
+  /** 插件根目录；取不到返回空串 */
+  private pluginRoot(): string {
     let homedir = "";
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -195,15 +228,75 @@ export class DictManager {
       pluginName: PLUGIN_NAME,
     };
     const root = resolvePluginPathWithFs(env);
-    if (!root || !isPluginRootWithFs(root, PLUGIN_NAME)) return null;
-    return path.join(root, "dict");
+    if (!root || !isPluginRootWithFs(root, PLUGIN_NAME)) return "";
+    return root;
   }
 
-  /** 词典文件的绝对路径 */
+  /**
+   * 一次性把插件目录里的词典搬到 public（同步 fs，同盘 rename 秒级）。
+   *
+   * 幂等：目标已存在同名文件就跳过；中途中断下次接着搬。
+   * 标记写到 public 根（不写 petal —— 写 petal 会触发插件重载，可能打断迁移）。
+   * 迁移失败不删旧文件：resolveDictPath 会回退到旧路径，词典照样能用。
+   */
+  private migrateLegacyDictDir(): void {
+    if (this.dictMigrationDone) return;
+    this.dictMigrationDone = true;
+    try {
+      const dest = this.dictDir();
+      const legacy = this.legacyDictDir();
+      if (!dest || !legacy || dest === legacy || !fs.existsSync(legacy)) return;
+      const names = fs.readdirSync(legacy).filter((n) => !n.startsWith("."));
+      if (!names.length) return;
+      fs.mkdirSync(dest, { recursive: true });
+      const stat = { files: 0, bytes: 0, renamed: 0, copied: 0, failed: 0 };
+      for (const name of names) {
+        const from = path.join(legacy, name);
+        const to = path.join(dest, name);
+        try {
+          if (!fs.statSync(from).isFile()) continue;
+          if (fs.existsSync(to)) continue;
+          try {
+            fs.renameSync(from, to);
+            stat.renamed++;
+          } catch {
+            fs.copyFileSync(from, to);
+            fs.unlinkSync(from);
+            stat.copied++;
+          }
+          stat.files++;
+          stat.bytes += fs.statSync(to).size;
+        } catch {
+          stat.failed++;
+        }
+      }
+      if (!stat.files && !stat.failed) return;
+      const marker = path.join(dest, "..", "dict-storage-migration.json");
+      fs.writeFileSync(marker, JSON.stringify({
+        v: 1,
+        at: Date.now(),
+        from: legacy,
+        to: dest,
+        ...stat,
+      }, null, 2));
+      getLogger().info(`[RE 阅读器] 词典迁移到 public：${stat.files} 个文件 / ${stat.bytes} 字节（失败 ${stat.failed}）`);
+    } catch (e) {
+      logSwallow(e, "dict-manager.ts · migrateLegacyDictDir", "warn");
+    }
+  }
+
+  /** 词典文件的绝对路径（新目录优先；迁移失败时回退旧目录，保证还能查词） */
   private resolveDictPath(file: string): string | null {
     const dir = this.dictDir();
     if (!dir) return null;
-    return path.join(dir, file);
+    const next = path.join(dir, file);
+    if (fs.existsSync(next)) return next;
+    const legacy = this.legacyDictDir();
+    if (legacy) {
+      const old = path.join(legacy, file);
+      if (fs.existsSync(old)) return old;
+    }
+    return next;
   }
 
   /** 语种分组（用于界面分组与「默认词典」的同语种重选） */
@@ -236,6 +329,9 @@ export class DictManager {
    *   3) 激活项必须指向真实存在的文件，否则回退内置。
    */
   private async loadManifest(): Promise<DictManifest> {
+    // 必须先搬目录再读清单：清单加载完会按 fileExists() 清理「文件已丢失」的条目，
+    // 目录还没搬就清理 = 把用户导入的词典从清单里删干净。
+    this.migrateLegacyDictDir();
     let m: DictManifest | null = null;
     /** 磁盘原文的指纹：读完后与归一化结果比对，相同则不必回写 */
     let rawKey: string | null = null;

@@ -255,7 +255,7 @@ export async function initDict(
     // "Invalid package …electron.asar"（令人困惑且无法定位是插件目录没找着）。
     if (!fsPath || /electron\.asar/i.test(fsPath)) {
       throw new Error(
-        T("词典路径无效：无法定位插件目录或路径指向 SiYuan 程序目录(electron.asar)。请确认插件安装在工作空间 data/plugins/siyuan-plugin-reader/ 下且含 dict/ 目录。")
+        T("词典路径无效：无法定位词典目录，或路径指向了 SiYuan 程序目录(electron.asar)。词典应存放在工作空间 data/public/siyuan-plugin-reader/dict/ 下；缺失时请在设置里重新导入。")
       );
     }
 
@@ -421,7 +421,7 @@ export async function initStarDict(
     // 纵深防御：路径无效或指向 SiYuan 程序目录时，抛清晰错误而非底层解析异常
     if (!ifoPath || /electron\.asar/i.test(ifoPath)) {
       throw new Error(
-        T("词典路径无效：无法定位插件目录或路径指向 SiYuan 程序目录(electron.asar)。请确认插件安装在工作空间 data/plugins/siyuan-plugin-reader/ 下且含 dict/ 目录。")
+        T("词典路径无效：无法定位词典目录，或路径指向了 SiYuan 程序目录(electron.asar)。词典应存放在工作空间 data/public/siyuan-plugin-reader/dict/ 下；缺失时请在设置里重新导入。")
       );
     }
     const sd = new StarDict(ifoPath, idxPath, dictPath);

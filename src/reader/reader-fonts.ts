@@ -6,13 +6,14 @@ import { logSwallow } from "../core/safe.ts";
  * 1. 「跟随思源」：扫描宿主页面的 @font-face（CSSFontFaceRule，src 转绝对 URL）
  *    + 取 document.body 计算后的字体栈，一并注入阅读器 iframe；
  *    思源主题/字体插件换字体，阅读器自动跟随。
- * 2. 「自定义导入」：用户上传 ttf/otf/woff/woff2，存 /data/storage/petal/<name>/fonts/，
+ * 2. 「自定义导入」：用户上传 ttf/otf/woff/woff2，存 /data/public/<name>/fonts/，
  *    注册表持久化 hiword-reader-fonts.json；生成 @font-face 注入。
  *
  * 2026-11-26：字体文件此前存在 /data/plugins/<name>/fonts/ —— 商店更新会整目录
  * 替换插件目录，字体文件被删而注册表（loadData 本来就落在 petal）还在，界面上
- * 就剩一排永远加载不出来的名字。现在与书库同一套：petal 存放 + 首次加载迁移 +
- * 迁移标记 + 缺失可见。
+ * 就剩一排永远加载不出来的名字。现在与书库同一套：public 存放 + 首次加载迁移 +
+ * 迁移标记 + 缺失可见。放 public 而不是 petal：写 petal 会广播插件重载
+ * （内核 push_reload.go），public 不会，还能用 /public/… 直接 GET。
  */
 
 import { putFile, getFileBlob, removeFile, renameFile } from "../siyuan/api";
@@ -40,10 +41,23 @@ export interface CustomFont {
 }
 
 const FONTS_KEY = "hiword-reader-fonts.json";
-/** 字体文件落点：插件数据目录（不被商店更新整目录替换） */
-const FONTS_DIR = (pluginName: string) => `/data/storage/petal/${pluginName}/fonts`;
-/** 旧版存放位置（安装目录内，仅用于一次性迁移） */
-const LEGACY_FONTS_DIR = (pluginName: string) => `/data/plugins/${pluginName}/fonts`;
+/** 字体文件落点：思源静态资源目录（不触发插件重载、不随同步、不被商店更新替换） */
+const FONTS_DIR = (pluginName: string) => `/data/public/${pluginName}/fonts`;
+/**
+ * 历史存放位置（仅用于一次性迁移，按新→旧顺序）：
+ * 1. petal/fonts —— 0.11.5 曾用过（未发版），写盘会触发插件重载；
+ * 2. 安装目录 fonts —— ≤0.11.4，商店更新整目录替换时被删。
+ */
+const LEGACY_FONTS_DIRS = (pluginName: string) => [
+  `/data/storage/petal/${pluginName}/fonts`,
+  `/data/plugins/${pluginName}/fonts`,
+];
+const legacyFontSourceOf = (pluginName: string, p?: string): string | null => {
+  for (const dir of LEGACY_FONTS_DIRS(pluginName)) {
+    if (p?.startsWith(`${dir}/`)) return dir;
+  }
+  return null;
+};
 /** 迁移标记（纯排障：跑过没、搬了几个、几个字节、失败几个） */
 const FONT_MIGRATION_KEY = "font-storage-migration.json";
 
@@ -135,7 +149,7 @@ export class FontStore {
   }
 
   /**
-   * 一次性把旧目录（/data/plugins/<name>/fonts）里的字体搬到 petal。
+   * 一次性把历史目录里的字体搬到 public。
    *
    * 与书库迁移同一套规则，理由也相同：
    *  - 目标目录必须先建：内核 renameFile 不会替我们建父目录；
@@ -148,9 +162,9 @@ export class FontStore {
    * 让用户重新导入，而不是留一个点不动又看不出原因的名字。
    */
   private async migrateLegacyFonts(): Promise<void> {
-    const legacyPrefix = `${LEGACY_FONTS_DIR(this.plugin.name)}/`;
-    const dir = FONTS_DIR(this.plugin.name);
-    const pending = this.fonts.filter((f) => f.path?.startsWith(legacyPrefix));
+    const pluginName = this.plugin.name;
+    const dir = FONTS_DIR(pluginName);
+    const pending = this.fonts.filter((f) => legacyFontSourceOf(pluginName, f.path));
     if (!pending.length) return;
 
     await putFile(dir, true, null);
@@ -160,7 +174,9 @@ export class FontStore {
     for (const font of pending) {
       try {
         const oldPath = font.path;
-        const name = oldPath.slice(legacyPrefix.length);
+        const src = legacyFontSourceOf(pluginName, oldPath);
+        if (!src) continue;
+        const name = oldPath.slice(src.length + 1);
         const dest = `${dir}/${name}`;
         const destState = await probeFile(dest);
         if (destState === null) continue; // 目录读不出来：别改注册表，下次再试
@@ -206,11 +222,11 @@ export class FontStore {
     await this.writeMigrationMarker(stat);
   }
 
-  /** 迁移标记（诊断用，保留最近 10 次）；与注册表分开，避免污染用户数据 */
+  /** 迁移标记（诊断用，保留最近 10 次）；写 public 而不是 petal：写 petal 会触发插件重载 */
   private async writeMigrationMarker(stat: {
     fonts: number; bytes: number; renamed: number; copied: number; failed: number;
   }): Promise<void> {
-    const path = `/data/storage/petal/${this.plugin.name}/${FONT_MIGRATION_KEY}`;
+    const path = `/data/public/${this.plugin.name}/${FONT_MIGRATION_KEY}`;
     try {
       const prevBlob = await getFileBlob(path);
       let runs: unknown[] = [];
@@ -225,7 +241,7 @@ export class FontStore {
       }
       runs.push({
         at: Date.now(),
-        from: LEGACY_FONTS_DIR(this.plugin.name),
+        from: LEGACY_FONTS_DIRS(this.plugin.name),
         to: FONTS_DIR(this.plugin.name),
         ...stat,
       });

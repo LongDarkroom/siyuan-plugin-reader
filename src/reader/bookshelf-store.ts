@@ -5,10 +5,14 @@ import { isValidBookMeta, isValidBookGroup } from "./library/library-types.ts";
  * 阅读器 - 书架存储
  * ---------------------------------------------------------------
  * - 书架索引持久化到插件数据 hiword-bookshelf.json（loadData/saveData）
- * - 书籍文件本体存 /data/storage/petal/<name>/books/（思源插件数据目录）。
- *   商店更新/覆盖安装会整目录替换 /data/plugins/<name>/，旧方案把书放那里，
- *   每更新一次书就丢一次；petal 不在替换范围内。代价是卸载插件后书还在，
- *   需要「清空书库」显式删除。旧路径的书在首次加载时后台迁移过来。
+ * - 书籍文件本体存 /data/public/<name>/books/（思源静态资源目录）。
+ *   为什么不放 /data/plugins/<name>/：商店更新整目录替换，书每更新一次丢一次。
+ *   为什么不放 /data/storage/petal/<name>/：思源 v3.1.8 起「写 petal → 广播
+ *   该插件重载」（内核 push_reload.go），且 petal 参与云端同步，几百 MB 书库
+ *   会把同步打爆。public 既不触发重载、也不进同步，还能用 /public/… 直接 GET（支持 Range）。
+ *   代价：public 不随思源同步，换设备/新工作空间只剩索引 —— 由 refreshMissing
+ *   标「已丢失」并在书卡上提示重新导入，记录与进度都还在。
+ *   旧路径（插件目录、petal）的书在首次加载时后台迁移过来。
  */
 
 import { putFile, getFileBlob, removeFile, renameFile } from "../siyuan/api";
@@ -43,10 +47,23 @@ export type {
   BookSortKey, SortDir, BookFilter, BookMark, BookMeta,
 } from "./library/library-types.ts";
 const BOOKS_DIR = (pluginName: string) =>
-  `/data/storage/petal/${pluginName}/books`;
-/** 旧版存放位置：插件安装目录，商店更新会被整目录替换（仅用于一次性迁移） */
-const LEGACY_BOOKS_DIR = (pluginName: string) =>
-  `/data/plugins/${pluginName}/books`;
+  `/data/public/${pluginName}/books`;
+/**
+ * 历史存放位置（仅用于一次性迁移，按新→旧顺序）：
+ * 1. petal —— 0.11.4/0.11.5 的落点，写盘会触发插件重载；
+ * 2. 插件安装目录 —— 0.11.3 及更早，商店更新会被整目录替换。
+ */
+const LEGACY_BOOKS_DIRS = (pluginName: string) => [
+  `/data/storage/petal/${pluginName}/books`,
+  `/data/plugins/${pluginName}/books`,
+];
+/** 旧路径相对 BOOKS_DIR 取文件名（covers/ 子目录同样适用） */
+const legacySourceOf = (pluginName: string, p?: string): string | null => {
+  for (const dir of LEGACY_BOOKS_DIRS(pluginName)) {
+    if (p?.startsWith(`${dir}/`)) return dir;
+  }
+  return null;
+};
 
 /** 本地日期键 YYYY-MM-DD（按用户时区，非 UTC） */
 function localDateKey(d: Date = new Date()): string {
@@ -150,7 +167,8 @@ export class BookshelfStore {
   }
 
   /**
-   * 一次性把旧目录（/data/plugins/<name>/books）里的书搬到 petal 目录。
+   * 一次性把历史目录里的书搬到 public 目录。
+   * 历史目录有两级：petal/books（0.11.4/0.11.5）与 plugins/books（≤0.11.3）。
    * 幂等且可断点续跑：目标是「存在就只改索引、不存在就搬」，索引只写一次；
    * 中途崩溃下次按同一规则补上。
    *
@@ -165,11 +183,11 @@ export class BookshelfStore {
    * 出问题能一眼看出「跑过没、搬了几本、几个字节、失败了几个」。
    */
   private async migrateLegacyBooks(): Promise<void> {
-    const legacyPrefix = `${LEGACY_BOOKS_DIR(this.plugin.name)}/`;
-    const dir = BOOKS_DIR(this.plugin.name);
+    const pluginName = this.plugin.name;
+    const dir = BOOKS_DIR(pluginName);
     // 封面单独判断：书搬成功但封面失败时，下次仍要为封面重试
     const pending = this.books.filter(
-      (b) => b.path?.startsWith(legacyPrefix) || b.cover?.startsWith(legacyPrefix)
+      (b) => legacySourceOf(pluginName, b.path) || legacySourceOf(pluginName, b.cover)
     );
     if (!pending.length) return;
 
@@ -189,9 +207,10 @@ export class BookshelfStore {
     let changed = false;
     for (const meta of pending) {
       try {
-        if (meta.path?.startsWith(legacyPrefix)) {
+        const pathSrc = legacySourceOf(pluginName, meta.path);
+        if (pathSrc && meta.path) {
           const oldPath = meta.path;
-          const name = oldPath.slice(legacyPrefix.length);
+          const name = oldPath.slice(pathSrc.length + 1);
           const dest = `${dir}/${name}`;
           const destState = await this.fileExists(dest);
           if (destState === null) continue; // 目录读不出来：别改索引，下次再试
@@ -222,9 +241,10 @@ export class BookshelfStore {
           stat.bytes += meta.size || 0;
           changed = true;
         }
-        if (meta.cover?.startsWith(legacyPrefix)) {
+        const coverSrc = legacySourceOf(pluginName, meta.cover);
+        if (coverSrc && meta.cover) {
           const oldCover = meta.cover;
-          const coverName = oldCover.slice(legacyPrefix.length);
+          const coverName = oldCover.slice(coverSrc.length + 1);
           const coverDest = `${dir}/${coverName}`;
           if ((await this.fileExists(coverDest)) === false) {
             // covers/ 子目录同样要先生成
@@ -271,7 +291,9 @@ export class BookshelfStore {
     files: number; covers: number; bytes: number;
     renamed: number; copied: number; failed: number;
   }): Promise<void> {
-    const path = `/data/storage/petal/${this.plugin.name}/storage-migration.json`;
+    // 标记也放 public：写 petal 会触发插件重载（内核 push_reload），迁移刚跑完
+    // 就被重载打断，下次又要从头探一遍。
+    const path = `/data/public/${this.plugin.name}/storage-migration.json`;
     try {
       const prevBlob = await getFileBlob(path);
       let runs: unknown[] = [];
@@ -281,7 +303,7 @@ export class BookshelfStore {
       }
       runs.push({
         at: Date.now(),
-        from: LEGACY_BOOKS_DIR(this.plugin.name),
+        from: LEGACY_BOOKS_DIRS(this.plugin.name),
         to: BOOKS_DIR(this.plugin.name),
         ...stat,
       });

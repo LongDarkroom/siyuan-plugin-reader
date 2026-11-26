@@ -609,11 +609,33 @@ export async function getSysFonts(): Promise<SysFontFace[]> {
 
 
 /**
+ * `/data/public/<插件>/…` → `/public/<插件>/…`（思源静态资源路由）。
+ * 非 public 路径返回 null。
+ */
+export const publicUrlOf = (path: string): string | null => {
+    if (!path.startsWith('/data/public/')) return null;
+    const rel = path.slice('/data/'.length);
+    return '/' + rel.split('/').map((seg) => encodeURIComponent(seg)).join('/');
+};
+
+/**
  * fetchPost will secretly convert data into json, this func merely return Blob
+ *
+ * `/data/public/**` 优先走静态 URL：支持 Range（大书/大字体不用整份过内核），
+ * 也不受 `/api/file/getFile` 对非存储目录的限制；静态路由不可用时再回退内核 API。
  * @param endpoint
  * @returns
  */
 export const getFileBlob = async (path: string): Promise<Blob | null> => {
+    const publicUrl = publicUrlOf(path);
+    if (publicUrl) {
+        try {
+            const res = await fetch(publicUrl, { method: 'GET' });
+            if (res.ok) return await res.blob();
+        } catch (e) {
+            getLogger().warn("getFileBlob public fetch failed, fallback to kernel", { path, error: e });
+        }
+    }
     const endpoint = '/api/file/getFile'
     try {
         let response = await fetch(endpoint, {

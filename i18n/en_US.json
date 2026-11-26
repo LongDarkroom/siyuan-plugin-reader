@@ -2001,7 +2001,7 @@
   "词典加载中...": "Loading dictionaries...",
   "词典数据尚未就绪": "Dictionary data is not ready yet",
   "词典管理": "Dictionary management",
-  "词典路径无效：无法定位插件目录或路径指向 SiYuan 程序目录(electron.asar)。请确认插件安装在工作空间 data/plugins/siyuan-plugin-reader/ 下且含 dict/ 目录。": "Invalid dictionary path: cannot locate the plugin directory or the path points to SiYuan's program directory (electron.asar). Please ensure the plugin is installed under the workspace data/plugins/siyuan-plugin-reader/ and contains a dict/ directory.",
+  "词典路径无效：无法定位词典目录，或路径指向了 SiYuan 程序目录(electron.asar)。词典应存放在工作空间 data/public/siyuan-plugin-reader/dict/ 下；缺失时请在设置里重新导入。": "Invalid dictionary path: cannot locate the dictionary folder, or the path points to SiYuan's program directory (electron.asar). Dictionaries live under data/public/siyuan-plugin-reader/dict/ in the workspace; re-import them from Settings if missing.",
   "词卡渲染失败": "Failed to render word card",
   "词库": "Vocabulary",
   "词库为空": "Library is empty",
