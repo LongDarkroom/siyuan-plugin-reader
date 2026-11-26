@@ -2179,7 +2179,6 @@
   "选择停靠位置": "Choose a dock position",
   "选择文件后在此预览内容": "Pick a file to preview its contents here",
   "选择文件后将自动写入插件": "Files are written to the plugin's",
-  "选择文件后将自动写入插件 dict/ 目录并立即建索引。": "Files are written to the plugin's dict/ folder and indexed immediately.",
   "选择模型": "Select model",
   "选择界面语言": "Select Interface Language",
   "选择翻译方式": "Choose translation mode",
@@ -3403,5 +3402,7 @@
   "书留在原处，书架只记引用，不复制文件。支持思源资源 assets/…、/data/public/…、http 或 https 直链。": "The book stays where it is; the shelf only stores a pointer. Supports SiYuan assets (assets/…), /data/public/…, and http/https links.",
   "assets/books/书名.epub 或 https 链接": "assets/books/name.epub or an https link",
   "该书源已在书架上": "This source is already on the shelf",
-  "已引用《{title}》": "Referenced “{title}”"
+  "已引用《{title}》": "Referenced “{title}”",
+  "未找到词典目录（data/public/<插件名>/dict），无法导入词典": "Cannot find the dictionary folder (data/public/<plugin>/dict); import aborted.",
+  "选择文件后将自动写入插件数据目录（public/<插件名>/dict）并立即建索引。": "The file is written to the plugin data folder (public/<plugin>/dict) and indexed immediately."
 }

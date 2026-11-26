@@ -174,6 +174,23 @@ export class DictManager {
   }
 
   /**
+   * 有没有 Node 运行时。
+   *
+   * 桌面端（Electron 渲染进程）有；移动端 WebView、浏览器访问
+   * （`http://127.0.0.1:6806` 用外部浏览器打开）都没有 —— 那里的
+   * `node:fs` 走 shims 惰性转发，`existsSync` 恒为 **false**。
+   * 这点很关键：**不能**把「读不到」当成「文件不存在」，否则一进浏览器
+   * 就会把整份词典清单清空（2026-11-26 事故，见 dictDirState 注释）。
+   */
+  private hasNodeRuntime(): boolean {
+    try {
+      return typeof process !== "undefined" && !!process.versions;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * 词典目录绝对路径：`<工作区>/data/public/<插件名>/dict`。
    *
    * 为什么不再放 `plugins/<name>/dict`：商店更新会整目录替换插件目录，
@@ -182,18 +199,28 @@ export class DictManager {
    * 且 petal 参与云端同步，上百 MB 词典会把同步打爆。public 不触发重载、不进同步。
    */
   private dictDir(): string | null {
-    const ws = this.workspaceRoot();
-    if (ws) return path.join(ws, "data", "public", PLUGIN_NAME, "dict");
-    // 回退：插件根是 <ws>/data/plugins/<name>，往上两级即 data/
-    const root = this.pluginRoot();
-    if (!root) return null;
-    return path.join(path.dirname(path.dirname(root)), "public", PLUGIN_NAME, "dict");
+    if (!this.hasNodeRuntime()) return null;
+    try {
+      const ws = this.workspaceRoot();
+      if (ws) return path.join(ws, "data", "public", PLUGIN_NAME, "dict");
+      // 回退：插件根是 <ws>/data/plugins/<name>，往上两级即 data/
+      const root = this.pluginRoot();
+      if (!root) return null;
+      return path.join(path.dirname(path.dirname(root)), "public", PLUGIN_NAME, "dict");
+    } catch {
+      return null;
+    }
   }
 
   /** 旧落点：插件安装目录内（仅迁移/回退用） */
   private legacyDictDir(): string | null {
-    const root = this.pluginRoot();
-    return root ? path.join(root, "dict") : null;
+    if (!this.hasNodeRuntime()) return null;
+    try {
+      const root = this.pluginRoot();
+      return root ? path.join(root, "dict") : null;
+    } catch {
+      return null;
+    }
   }
 
   /** 工作区根（思源运行时注入；取不到返回空串） */
@@ -208,12 +235,16 @@ export class DictManager {
 
   /** 插件根目录；取不到返回空串 */
   private pluginRoot(): string {
+    // ⚠️ 移动端 / 浏览器访问时 `process` 根本不存在。旧写法在 catch 分支里
+    // 又引用了一次 `process.env`，等于「兜底自己再抛一次」——ReferenceError
+    // 冒到 loadManifest，整条词典初始化链路直接崩掉。先挡掉再谈路径。
+    if (!this.hasNodeRuntime()) return "";
     let homedir = "";
     try {
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       homedir = (require("os").homedir && require("os").homedir()) || process.env.HOME || "";
     } catch {
-      homedir = process.env.HOME || process.env.USERPROFILE || "";
+      homedir = "";
     }
     const env = {
       dirname: typeof __dirname !== "undefined" ? __dirname : "",
@@ -304,6 +335,110 @@ export class DictManager {
     return meta.lang === "zh" ? "zh" : meta.lang === "idiom" ? "idiom" : "en";
   }
 
+  /**
+   * 目录能不能判定：`ok` 目录在（可判文件真假）、`missing` 目录确实没有、
+   * `unknown` 连目录路径都定位不到。
+   *
+   * 只有 `ok` 才允许把「文件不在」当成事实去删清单条目 —— `unknown` 时
+   * 任何删除都是在拿用户数据赌路径解析（2026-11-26 清单被清空的事故）。
+   */
+  private dictDirState(): "ok" | "missing" | "unknown" {
+    if (!this.hasNodeRuntime()) return "unknown"; // 浏览器/移动端读不到文件，不代表文件没了
+    const dir = this.dictDir();
+    if (!dir) return "unknown";
+    try {
+      if (fs.existsSync(dir)) return "ok";
+      // 迁移没做成时文件还在旧目录，一样算「能判定」
+      const legacy = this.legacyDictDir();
+      if (legacy && fs.existsSync(legacy)) return "ok";
+    } catch {
+      return "unknown";
+    }
+    return "missing";
+  }
+
+  /** 按文件名猜语种（与 importDictFile 共用一套规则，避免两处判断分叉） */
+  private guessLang(name: string): "en" | "zh" {
+    return /(英|english|ecdict|ncecd)/i.test(name) ? "en" : "zh";
+  }
+
+  /** 文件名 → 稳定 id：同一文件每次扫描得到同一个 id，不会来回换 */
+  private adoptId(name: string): string {
+    let h = 0x811c9dc5;
+    for (let i = 0; i < name.length; i++) {
+      h ^= name.charCodeAt(i);
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    return `scan-${h.toString(36)}`;
+  }
+
+  /**
+   * 把目录里「清单没登记」的词典文件补登记。
+   *
+   * 两个来源都要靠它：
+   *  1. 清单被清空过（见 `dictDirState` 的注释）—— 文件在、界面里没有，
+   *     不做这一步用户只能把上百 MB 的词典重新导入一遍；
+   *  2. 官方提示里那条「请手动放入 dict/ 目录」—— 光把文件拷进去，
+   *     以前是永远不会出现在列表里的，提示等于失效。
+   *
+   * 只认 `.mdx` 与成套的 starDict（.ifo + .idx + .dict/.dict.dz）；
+   * `.mdd` 作为同名伴生资源挂到 `.mdx` 上，`.bak` / `README.md` 一律跳过。
+   * 幂等：已登记（按文件名，忽略大小写）的不重复加入。
+   */
+  private adoptUnlistedDicts(m: DictManifest): DictMeta[] {
+    const dir = this.dictDir();
+    if (!dir) return [];
+    let names: string[] = [];
+    try {
+      if (!fs.existsSync(dir)) return [];
+      names = fs.readdirSync(dir).filter((n) => !n.startsWith("."));
+    } catch {
+      return [];
+    }
+    const lowerSet = new Set(names.map((n) => n.toLowerCase()));
+    const known = new Set(m.dicts.map((d) => path.basename(d.file).toLowerCase()));
+    const adopted: DictMeta[] = [];
+
+    for (const name of names) {
+      const lower = name.toLowerCase();
+      if (known.has(lower)) continue;
+
+      if (lower.endsWith(".ifo")) {
+        const base = name.slice(0, -4);
+        const has = (ext: string) => lowerSet.has(`${base}${ext}`.toLowerCase());
+        if (!has(".idx")) continue;
+        if (!has(".dict") && !has(".dict.dz")) continue; // 缺词表 = 半套，不入册
+        adopted.push({
+          id: this.adoptId(lower),
+          name: base,
+          file: name,
+          files: [".ifo", ".idx", ".dict", ".dict.dz"]
+            .map((ext) => `${base}${ext}`)
+            .filter((f) => lowerSet.has(f.toLowerCase())),
+          type: "stardict",
+          lang: this.guessLang(base),
+        });
+        known.add(lower);
+        continue;
+      }
+
+      if (!lower.endsWith(".mdx")) continue;
+      const mdd = names.find((n) => n.toLowerCase() === lower.replace(/\.mdx$/, ".mdd"));
+      adopted.push({
+        id: this.adoptId(lower),
+        name: name.replace(/\.mdx$/i, ""),
+        file: name,
+        ...(mdd ? { mdd } : {}),
+        type: "mdx",
+        lang: this.guessLang(name),
+      });
+      known.add(lower);
+    }
+
+    if (adopted.length) m.dicts.push(...adopted);
+    return adopted;
+  }
+
   /** 磁盘文件是否真实存在 */
   private fileExists(meta: DictMeta): boolean {
     try {
@@ -349,6 +484,14 @@ export class DictManager {
           if (/\.(sqlite|db)$/i.test(d.file)) {
             d.file = d.file.replace(/\.(sqlite|db)$/i, ".mdx");
           }
+          /**
+           * 迁移：更早的清单把路径写成 `dict/xxx.mdx`（相对插件根）。
+           * `DictMeta.file` 的语义是「相对 dict/ 目录的文件名」，现在 dictDir()
+           * 本身就是那个目录，保留前缀会拼成 `<dict>/dict/xxx.mdx` → fileExists
+           * 判否 → 整本被当成「文件已丢失」清掉。REword/hiword 时代落下来的
+           * 清单都是带前缀的，所以这一步必须做。
+           */
+          d.file = d.file.replace(/^dict[\\/]/i, "");
           if (!d.type) d.type = /\.ifo$/i.test(d.file) ? "stardict" : "mdx";
           if (!d.id) d.id = "dict-" + Math.random().toString(36).slice(2, 8);
         }
@@ -371,13 +514,40 @@ export class DictManager {
       m = { active: BUILTIN_DICT.id, actives: [BUILTIN_DICT.id], dicts: [{ ...BUILTIN_DICT }] };
     }
 
-    // 内置词典兜底补回
-    if (!m.dicts.some((d) => d.id === BUILTIN_DICT.id)) {
+    /** 目录可判定性：unknown 时既不补内置、也不清理，整份清单原样保留 */
+    const dirState = this.dictDirState();
+
+    // 内置词典兜底补回（判断不了目录时不补：补了也永远剔不掉，只会多一条点不动的幽灵条目）
+    if (dirState !== "unknown" && !m.dicts.some((d) => d.id === BUILTIN_DICT.id)) {
       m.dicts.unshift({ ...BUILTIN_DICT });
     }
-    // 清理文件已丢失的条目（内置同样清理：发版包不带词典实包，
-    // 留一条永不存在的内置词典只会让用户反复点开关、看不到任何效果）
-    m.dicts = m.dicts.filter((d) => this.fileExists(d));
+    /**
+     * 清理文件已丢失的条目（内置同样清理：发版包不带词典实包，
+     * 留一条永不存在的内置词典只会让用户反复点开关、看不到任何效果）。
+     *
+     * ⚠️ 只在「目录真实存在」时才清理。
+     *
+     * 2026-11-26 事故：`fileExists()` 对「文件不在」和「判断不了」返回同一个
+     * false。只要某次加载时 `dictDir()` 解析失败（浏览器模式拿不到
+     * `window.siyuan.config.system.workspaceDir`、插件根探测失败、目录还没建），
+     * 整份清单就会被就地清空并立刻落盘 —— 用户 134 MB 词典文件还在磁盘上，
+     * 但界面里一本都没有，只能看到一个「未加载到可用词典」的警告，且无从恢复。
+     * 现在把三态分开：**判断不了就一条都不删**。
+     */
+    if (dirState !== "unknown") {
+      const before = m.dicts.length;
+      m.dicts = m.dicts.filter((d) => this.fileExists(d));
+      const dropped = before - m.dicts.length;
+      if (dropped > 0) {
+        getLogger().warn(`[RE 阅读器] 有 ${dropped} 本词典的文件已不在磁盘上，已从清单移除`);
+      }
+    }
+
+    // 反向兜底：磁盘上有、清单里没有的词典文件补登记（清空事故与被清空的目录共用）
+    const adopted = this.adoptUnlistedDicts(m);
+    if (adopted.length) {
+      getLogger().info(`[RE 阅读器] 在 dict 目录发现 ${adopted.length} 个未登记的词典，已自动登记`);
+    }
     // 激活项必须真实存在
     const valid = new Set(m.dicts.map((d) => d.id));
     /**
@@ -485,14 +655,16 @@ export class DictManager {
 
     // 首次运行：给一个可用的起点，否则插件开箱无法查词。
     // `userDisabledAll` 存在说明是用户主动全关的 → 尊重，不再塞回内置。
-    if (
-      !m.actives.length &&
-      !m.active &&
-      m.userDisabledAll !== true &&
-      m.dicts.some((d) => d.id === BUILTIN_DICT.id)
-    ) {
-      m.actives = [BUILTIN_DICT.id];
-      m.active = BUILTIN_DICT.id;
+    //
+    // 2026-11-26：条件从「必须有内置词典」放宽到「目录里有任意一本」。
+    // 发版包从来不带内置词典实包，内置条目又会在清理时被剔掉，所以旧条件
+    // 实际上永远不成立 —— 清单被清空过的用户即使把词典文件捡回来，
+    // 也一直停在「未加载到可用词典」，划词只能走在线词典。
+    if (!m.actives.length && !m.active && m.userDisabledAll !== true && m.dicts.length) {
+      const pick = m.dicts.find((d) => this.langGroup(d) === "en") ?? m.dicts[0];
+      m.actives = [pick.id];
+      m.active = pick.id;
+      getLogger().info(`[RE 阅读器] 没有已启用的词典，自动启用「${pick.name}」`);
     }
 
     let loaded = 0;
@@ -783,7 +955,7 @@ export class DictManager {
     opts: { lang?: "zh" | "en" | "idiom"; name?: string; mddFile?: string; mddBytes?: ArrayBuffer | Uint8Array } = {},
   ): Promise<DictMeta> {
     const dir = this.dictDir();
-    if (!dir) throw new Error(t("未找到插件 dict/ 目录，无法导入词典"));
+    if (!dir) throw new Error(t("未找到词典目录（data/public/<插件名>/dict），无法导入词典"));
 
     const safeName = path.basename(fileName);
     if (!safeName || safeName.startsWith(".")) throw new Error(t("非法的词典文件名"));
@@ -878,7 +1050,7 @@ export class DictManager {
        * 所以猜错之后必须**能在界面上改**（见 `setLang()`），
        * 而不是想办法把正则写得更复杂（那只会把误判换成另一种误判）。
        */
-      lang: opts.lang || (/(英|english|ecdict|ncecd)/i.test(dictName) ? "en" : "zh"),
+      lang: opts.lang || this.guessLang(dictName),
       contentHash,
     };
 
